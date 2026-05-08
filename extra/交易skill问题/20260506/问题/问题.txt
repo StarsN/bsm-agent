@@ -1,0 +1,22 @@
+第一步（读数据）触发的：
+                                                                                                      - JSON 截断 — Agent 执行完 extract_market_data.py，想直接 Read 看 /tmp/market_data.json
+  里有哪些候选币，结果单行 JSON 被截断在 50 行处，只看到开头几个字段。                                - 候选总数在 stdout — Agent 要在报告里写"22 有快照 / 67 总ID"，翻遍 JSON
+  找不到这个数，最后发现藏在脚本的打印输出里。
+  - cd 路径 — Agent 抄了 skill 里的命令执行，报错找不到模块，试了几次才发现必须从 agent-trade
+  目录跑。
+
+  第二步（自主分析）触发的：
+
+  - snapshot_cn — Agent 遍历 candidates 时发现每个对象有英文顶层字段（c["oi_1h"]）和中文字段（c["sna
+  pshot_cn"]["OI1小时变化"]），不知道该读哪个，踩坑后确认英文才是实时数据。
+  - 数值 "?" — Agent 写分析脚本格式化候选数据，f"{c['funding']:.2f}" 报 ValueError，发现 BTC
+  的某些字段（24h、1h）无数据时是字符串 "?" 而非 null。后来发现是自己的 sf() 把 None → "?" 导致的。
+ （未解决） - positions token *** — Agent 想确认持仓币种名，读 positions[0]["token"] 拿到
+  ***，无法判断是哪个币。2026-05-06 轮次中的 ADA/TRX 出现过。
+  - action_type 为 None — Agent 想用 today_journal 的 action_type 区分开仓/平仓，发现全是 None，改用
+   reason 文本含"止损""买盘信号"等关键词判断。
+
+  第四步（写决策）触发的：
+
+  - write_decisions 格式 — Agent 写了 [] 或缺少 market_read 的 JSON
+  提交，脚本报错或者静默吞掉，反复排查才知道要信封格式。
