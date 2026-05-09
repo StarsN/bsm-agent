@@ -1,5 +1,33 @@
 # CHANGELOG v3.0
 
+## v3.1 — Mem0 记忆 + Agent 面板增强（2026-05-09）
+
+### Mem0 记忆系统
+
+- 新增 `sync_memory.py`：`record_open/record_close/search_similar`。交易全生命周期写入记忆。
+- `auto_trader.py` + `trade_logic.py`：开仓/平仓后同步写 Mem0，覆盖 Agent 平仓和系统平仓（止损/止盈/取消收藏）。
+- `config.py` 加 `MEM0_ENABLED/API_KEY/USER_ID`，`requirements.txt` 加 `mem0ai`。
+- 存中文原文（`infer=False`）+ metadata（token/pnl/result），搜索支持 metadata 过滤（按币种/盈亏）。
+- Agent 面板新增记忆搜索栏（`/api/agent/memory/search`），卡片式展示结果。
+
+### Agent 面板优化
+
+- 账户重排：上 4 格 2×2（总资产/可用、今日 PnL、胜率、资金利用率），下 6 格 3×2（今日开/平、待处理、今日被拒、总盈亏、最大回撤、胜/总）。
+- 最大回撤 1 小时缓存，避免扫全表。
+- 当前持仓加"持仓时间"列，面板溢出滑动。
+- 时间线/教训库/操作日志全部改分页：5 条/页 + 加载更多按钮，去掉定时刷新。
+- 时间线时间加年月日、展开状态保持、关仓 detail 格式优化。
+- Agent 触发由 worker 控制：每轮 market 后调 `hermes cron run`，配置 `AGENT_TRIGGER_INTERVAL` 控制频率。
+
+### 数据优化
+
+- 废弃 `round_candidates`，Agent 改读 `token_heat_history`。
+- worker 重启自动从 `token_heat_history` 续轮次。
+- `auto_trader.py` 过期清理移到决策扫描之前，避免积压的旧决策被错误执行。
+- 候选币加 `age` 字段（上币时长）、提取脚本加 BTC 走势 + 恐惧贪婪指数 + 交易时段。
+
+---
+
 ## v3.0 — Agent 自主交易 + 全栈重构（2026-05-08）
 
 ### Skill 重构

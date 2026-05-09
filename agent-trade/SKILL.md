@@ -52,7 +52,7 @@ python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.
 
 市场数据在候选对象的**顶层短英文 key**（`c["oi_1h"]`, `c["taker"]`, `c["funding"]` 等）。字段速查见 `references/snapshot字段说明.md`。
 
-**`c["analysis"]` 可能全为 `None`**，详见 `references/数据操作要点.md`。
+`verdict`/`direction`/`tags` 等分析字段可能为 `None`（worker 在 scraping 阶段时分析模块尚未运行），此时依赖原始市场数据自行判断。详情见 `references/数据操作要点.md`。
 
 缺失数值为 `null`/`None`，格式化前判断 `is not None`，不要把 `None` 转成字符串。安全转换模板见 `references/数据操作要点.md`。
 

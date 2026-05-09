@@ -379,7 +379,7 @@ def _migrate(conn):
 
 def init_db():
     with get_conn() as conn:
-        conn.execute("PRAGMA journal_mode = WAL")  # 并发读写友好
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA)
         _migrate(conn)

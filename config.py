@@ -211,3 +211,8 @@ MANUAL_BYPASS_SECTOR_LIMIT = True     # 手动开仓不受板块集中度限制
 MANUAL_BYPASS_COOLDOWN = False        # 手动开仓仍受止损冷却期约束（建议 False 保护）
 # 注意：日亏损熔断永远不豁免，这是最后的保命线
 
+# === Mem0 记忆系统 ===
+MEM0_ENABLED = True
+MEM0_API_KEY = "m0-HIUsZy7EVeLQCX92BpDF1Kt6rgIgf9QnyuR2bIE0"                     # 填入你的 API Key 生效
+MEM0_USER_ID = "bsm-agent"
+

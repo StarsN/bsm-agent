@@ -641,6 +641,17 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
             dimension_data=close_snap,
             hold_duration=_calc_hold(pos.get("created_at")),
         )
+        try:
+            import sync_memory
+            sync_memory.record_close(
+                token=token,
+                round_num=0,
+                pnl=pnl_pct_val,
+                close_reason="manual",
+                hold_duration=_calc_hold(pos.get("created_at")) or "",
+            )
+        except Exception:
+            pass
 
     return {
         "ok": closed > 0 or canceled > 0,
@@ -836,6 +847,17 @@ def update_paper_positions(conn):
                 close_reason="sl_hit", dimension_data=close_snap,
                 hold_duration=_calc_hold(pos.get("created_at")),
             )
+            try:
+                import sync_memory
+                sync_memory.record_close(
+                    token=pos["token"],
+                    round_num=0,
+                    pnl=_margin_pnl_pct(realized, 0, float(pos.get("margin_amount") or 1)),
+                    close_reason="sl_hit",
+                    hold_duration=_calc_hold(pos.get("created_at")) or "",
+                )
+            except Exception:
+                pass
             continue
 
         # ---- 止盈 TP1：达到 +1R，平 TP1_CLOSE_PCT%，止损移到保本 ----
@@ -907,6 +929,17 @@ def update_paper_positions(conn):
                     close_reason="tp_hit", dimension_data=close_snap,
                     hold_duration=_calc_hold(pos.get("created_at")),
                 )
+                try:
+                    import sync_memory
+                    sync_memory.record_close(
+                        token=pos["token"],
+                        round_num=0,
+                        pnl=_margin_pnl_pct(realized, 0, float(pos.get("margin_amount") or 1)),
+                        close_reason="tp_hit",
+                        hold_duration=_calc_hold(pos.get("created_at")) or "",
+                    )
+                except Exception:
+                    pass
                 continue
 
         unrealized = (price - entry) * open_qty

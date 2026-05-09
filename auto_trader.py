@@ -215,6 +215,20 @@ def execute_open(conn, decision: dict, settings: dict) -> dict:
             source_round=decision.get("source_round"),
             social_score=decision.get("social_score"),
         )
+        # Mem0 记忆：记录开仓
+        try:
+            import sync_memory
+            sync_memory.record_open(
+                token=token,
+                round_num=decision.get("source_round") or 0,
+                tier=tier,
+                reason=decision.get("reason", ""),
+                dimension_data=decision.get("dimension_data") or "",
+                market_overview=decision.get("market_overview") or "",
+            )
+        except Exception:
+            pass
+
         # 回填系统实际执行价到 pending_decisions
         dec_id = decision.get("id")
         if dec_id:
@@ -329,6 +343,19 @@ def execute_close(conn, decision: dict) -> dict:
                 "exit_price": price,
             }, default=str, ensure_ascii=False),
         })
+
+    # Mem0 记忆：记录平仓
+    try:
+        import sync_memory
+        sync_memory.record_close(
+            token=token,
+            round_num=decision.get("source_round") or 0,
+            pnl=pnl_pct_val,
+            close_reason=decision.get("close_reason") or "agent",
+            hold_duration=hold or "",
+        )
+    except Exception:
+        pass
 
     return {"ok": True}
 

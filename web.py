@@ -31,6 +31,7 @@ app = FastAPI(title="Binance Square Monitor")
 # ============================================================
 _cache = {}
 _cache_lock = threading.Lock()
+_max_dd_cache = {"value": 0.0, "time": 0}
 
 
 def _cached(key: str, ttl_seconds: float, fn):
@@ -573,14 +574,45 @@ def api_agent_overview():
                 "WHERE status='CLOSED' AND realized_pnl > 0"
             ).fetchone()[0]
 
+            # 最大回撤（1h 缓存）
+            global _max_dd_cache
+            now = time.time()
+            if _max_dd_cache["time"] and now - _max_dd_cache["time"] < 3600:
+                max_dd = _max_dd_cache["value"]
+            else:
+                running = float(initial or 0)
+                peak = running
+                max_dd = 0.0
+                for r in conn.execute("SELECT COALESCE(realized_pnl,0) FROM trade_positions WHERE status='CLOSED' ORDER BY closed_at").fetchall():
+                    running += float(r[0])
+                    if running > peak: peak = running
+                    if peak > 0:
+                        dd = (running - peak) / peak * 100
+                        if dd < max_dd: max_dd = dd
+                dd = (running + unrealized - peak) / peak * 100 if peak > 0 else 0
+                if dd < max_dd: max_dd = dd
+                _max_dd_cache = {"value": round(max_dd, 1), "time": time.time()}
+
         win_rate = round(total_wins / total_closed * 100, 1) if total_closed > 0 else 0
         today_wr = round(today_wins / today_closes * 100, 1) if today_closes > 0 else 0
 
+        # 风险敞口
+        try:
+            exposure = round(locked / equity * 100, 1) if equity > 0 else 0
+        except Exception:
+            exposure = 0
+        # 总盈亏
+        try:
+            total_pnl_pct = round((equity - initial) / initial * 100, 1) if initial > 0 else 0
+        except Exception:
+            total_pnl_pct = 0
         return {
             "equity": equity, "available": available,
             "initial": initial, "realized": round(realized, 2),
             "unrealized": round(unrealized, 2), "locked": round(locked, 2),
             "open_count": open_count,
+            "exposure": exposure, "total_pnl_pct": total_pnl_pct,
+            "max_drawdown": round(max_dd, 1) if max_dd is not None else 0.0,
             "today_opens": today_opens, "today_closes": today_closes,
             "today_wins": today_wins, "today_losses": today_losses,
             "today_pnl": round(today_pnl, 2), "today_win_rate": today_wr,
@@ -588,20 +620,24 @@ def api_agent_overview():
             "win_rate": win_rate,
             "pending_decisions": pending, "rejected_today": rejected_today,
         }
-    return _cached("agent_overview", 3.0, compute)
+    return _cached("agent_overview", 15.0, compute)
 
 
 @app.get("/api/agent/journal")
-def api_agent_journal(limit: int = 30):
-    """操作日志：仅 journal 表（已执行的交易），按时间倒排"""
+def api_agent_journal(limit: int = 5, offset: int = 0):
+    """操作日志：仅 journal 表（已执行的交易），按时间倒排，分页"""
     with storage.get_conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
         rows = conn.execute(
             "SELECT token, action, price, tier, pnl_pct, close_reason, "
             "hold_duration, reason, created_at "
-            "FROM journal ORDER BY id DESC LIMIT ?",
-            (limit,)
+            "FROM journal ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset)
         ).fetchall()
-    return {"journal": [dict(r) for r in rows]}
+    return {
+        "journal": [dict(r) for r in rows],
+        "has_more": (offset + limit) < total,
+    }
 
 
 @app.get("/api/agent/timeline")
@@ -642,6 +678,19 @@ def api_agent_timeline(limit: int = 30, offset: int = 0):
     timeline.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     has_more = (offset + limit) < max(journal_total, decision_total)
     return {"timeline": timeline[:limit], "has_more": has_more}
+
+
+@app.get("/api/agent/memory/search")
+def api_agent_memory_search(q: str = "", token: str = "", limit: int = 10):
+    """记忆搜索：调 Mem0 搜历史类似场景"""
+    if not q.strip():
+        return {"results": []}
+    try:
+        import sync_memory
+        results = sync_memory.search_similar(q.strip(), token=token.strip() or None, limit=limit)
+        return {"results": results, "query": q.strip()}
+    except Exception:
+        return {"results": [], "query": q.strip()}
 
 
 @app.get("/api/agent/lessons")
@@ -2092,29 +2141,43 @@ tr:hover { background: #1f2536; }
   <a href="/" class="nav-link">市场监控 →</a>
 </div>
 
+<!-- 记忆搜索 -->
+<div class="panel">
+  <div style="display:flex;align-items:center;gap:8px">
+    <span style="font-size:13px;font-weight:500;white-space:nowrap">🔍 记忆搜索</span>
+    <input id="mem-query" type="text" placeholder="OI涨 taker弱 sl_hit" style="flex:1;background:#0a0e15;color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 10px;font-size:13px" onkeydown="if(event.key==='Enter')searchMemory()">
+    <input id="mem-token" type="text" placeholder="限定币种(可选)" style="width:120px;background:#0a0e15;color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 10px;font-size:13px">
+    <button onclick="searchMemory()" style="background:var(--accent);color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:13px;font-weight:500">搜索</button>
+    <button onclick="closeMemorySearch()" style="background:transparent;color:var(--muted);border:none;cursor:pointer;font-size:18px" title="关闭">✕</button>
+  </div>
+  <div id="mem-results" style="display:none;margin-top:10px"></div>
+</div>
+
 <!-- 顶部：账户概览 + 持仓 -->
 <div class="grid-top">
   <div class="panel">
     <h2>账户</h2>
     <div class="stat-grid">
-      <div class="stat"><div class="stat-label">权益</div><div class="stat-value" id="equity">—</div></div>
-      <div class="stat"><div class="stat-label">可用</div><div class="stat-value" id="available">—</div></div>
+      <div class="stat"><div class="stat-label">总资产/可用</div><div class="stat-value" id="equity-avail">—</div></div>
       <div class="stat"><div class="stat-label">今日PnL</div><div class="stat-value" id="today-pnl">—</div></div>
-      <div class="stat"><div class="stat-label">总胜率</div><div class="stat-value" id="win-rate">—</div></div>
+      <div class="stat"><div class="stat-label">胜率</div><div class="stat-value" id="win-rate">—</div></div>
+      <div class="stat"><div class="stat-label">资金利用率</div><div class="stat-value" id="exposure">—</div></div>
     </div>
-    <div style="margin-top:10px">
+    <div class="stat-grid" style="margin-top:10px">
       <div class="stat"><div class="stat-label">今日开/平</div><div class="stat-sm" id="today-trades">—</div></div>
-      <div class="stat"><div class="stat-label">持仓</div><div class="stat-sm" id="open-count">—</div></div>
-      <div class="stat"><div class="stat-label">待处理决策</div><div class="stat-sm" id="pending">—</div></div>
+      <div class="stat"><div class="stat-label">待处理</div><div class="stat-sm" id="pending">—</div></div>
       <div class="stat"><div class="stat-label">今日被拒</div><div class="stat-sm" id="rejected">—</div></div>
+      <div class="stat"><div class="stat-label">总盈亏</div><div class="stat-sm" id="total-pnl">—</div></div>
+      <div class="stat"><div class="stat-label">最大回撤</div><div class="stat-sm" id="max-dd">—</div></div>
+      <div class="stat"><div class="stat-label">胜/总</div><div class="stat-sm" id="total-closed">—</div></div>
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" style="overflow:auto;max-height:380px">
     <h2>当前持仓</h2>
     <table>
       <thead><tr>
-        <th>币种</th><th>方向</th><th>入场</th><th>现价</th><th>PnL%</th><th>止损</th><th>止盈</th>
+        <th>币种</th><th>方向</th><th>入场</th><th>现价</th><th>PnL%</th><th>止损</th><th>止盈</th><th>持仓</th>
       </tr></thead>
       <tbody id="positions-body"></tbody>
     </table>
@@ -2191,15 +2254,21 @@ async function loadOverview() {
   try {
     const r = await fetch('/api/agent/overview');
     const d = await r.json();
-    $('#equity').textContent = '$' + d.equity;
-    $('#equity').className = 'stat-value ' + (d.unrealized >= 0 ? 'green' : 'red');
-    $('#available').textContent = '$' + d.available;
+    $('#equity-avail').innerHTML = '$' + d.equity + '<br><span style="font-size:13px;color:var(--muted)">$' + d.available + '</span>';
+    $('#equity-avail').className = 'stat-value ' + (d.unrealized >= 0 ? 'green' : 'red');
     $('#today-pnl').textContent = fmtPct(d.today_pnl);
     $('#today-pnl').className = 'stat-value ' + pnlClass(d.today_pnl);
     $('#win-rate').textContent = d.win_rate + '%';
     $('#today-trades').innerHTML = '<span class="green">' + d.today_opens + '</span> / <span class="red">' + d.today_closes + '</span> (胜' + d.today_wins + ' 负' + d.today_losses + ')';
-    $('#open-count').textContent = d.open_count + ' 笔';
     $('#pending').textContent = d.pending_decisions + ' 条';
+    $('#rejected').textContent = d.rejected_today + ' 条';
+    $('#exposure').textContent = (d.exposure || 0).toFixed(1) + '%';
+    $('#exposure').className = 'stat-value ' + (d.exposure > 50 ? 'red' : d.exposure > 30 ? 'yellow' : '');
+    $('#total-pnl').textContent = fmtPct(d.total_pnl_pct);
+    $('#total-pnl').className = 'stat-sm ' + pnlClass(d.total_pnl_pct);
+    $('#max-dd').textContent = (d.max_drawdown || 0).toFixed(2) + '%';
+    $('#max-dd').className = 'stat-sm ' + ((d.max_drawdown||0) < -5 ? 'red' : (d.max_drawdown||0) < -2 ? 'yellow' : '');
+    $('#total-closed').innerHTML = '<span class="green">' + d.total_wins + '</span>胜/<span>' + d.total_closed + '</span>笔';
     $('#rejected').textContent = d.rejected_today + ' 条';
   } catch(e) { console.error('overview', e); }
 }
@@ -2220,6 +2289,10 @@ async function loadPositions() {
     empty.style.display = 'none';
     tbody.innerHTML = positions.map(p => {
       const pnl = p.pnl_pct != null ? Number(p.pnl_pct) : null;
+      let hold = '—';
+      if (p.created_at) {
+        try { const d = new Date(p.created_at.replace(' ','T') + 'Z'); const h = Math.floor((Date.now()-d)/3600000); const m = Math.floor((Date.now()-d)/60000)%60; hold = (h ? h+'h' : '') + m + 'm'; } catch(e) {}
+      }
       return '<tr>' +
         '<td style="font-weight:bold;color:var(--accent)">' + esc(p.token) + '</td>' +
         '<td>' + esc(p.side) + '</td>' +
@@ -2228,6 +2301,7 @@ async function loadPositions() {
         '<td class="' + pnlClass(pnl) + '">' + fmtPct(pnl) + '</td>' +
         '<td>' + fmtPrice(p.stop_loss_price) + '</td>' +
         '<td>' + fmtPrice(p.tp1_price) + '</td>' +
+        '<td style="font-size:11px;white-space:nowrap">' + esc(hold) + '</td>' +
         '</tr>';
     }).join('');
   } catch(e) { console.error('positions', e); }
@@ -2236,7 +2310,7 @@ async function loadPositions() {
 // 教训库
 let _lsOffset = 0;
 let _lsHasMore = true;
-const _LS_PAGE = 20;
+const _LS_PAGE = 5;
 
 async function loadLessons(reset = false) {
   if (reset) { _lsOffset = 0; _lsHasMore = true; }
@@ -2300,7 +2374,7 @@ let _expandedDets = new Set();
 let _tlOffset = 0;
 let _tlHasMore = true;
 let _tlDetIdx = 0;
-const _TL_PAGE = 30;
+const _TL_PAGE = 10;
 
 async function loadTimeline(reset = false) {
   if (reset) { _tlOffset = 0; _tlHasMore = true; }
@@ -2332,7 +2406,7 @@ async function loadTimeline(reset = false) {
         action = item.action;
         token = item.token;
         badgeClass = action;
-        time = fmtTime(item.created_at);
+        time = fmtDateTime(item.created_at).replace(/^\\d{4}-/, '');
         reason = item.reason || '';
         meta = [];
         if (item.pnl_pct != null) meta.push('PnL: ' + fmtPct(item.pnl_pct));
@@ -2343,7 +2417,7 @@ async function loadTimeline(reset = false) {
       } else {
         action = item.action;
         token = item.token;
-        time = fmtTime(item.created_at);
+        time = fmtDateTime(item.created_at);
         reason = item.reason || '';
         if (item.status === 'pending') { badgeClass = 'pending'; }
         else if (item.status === 'rejected') { badgeClass = 'rejected'; reason = '拒绝: ' + (item.reject_reason || '') + ' | ' + reason; }
@@ -2412,6 +2486,46 @@ async function loadTimeline(reset = false) {
   } catch(e) { console.error('timeline', e); }
 }
 
+async function searchMemory() {
+  const q = $('#mem-query').value.trim();
+  if (!q) return;
+  const token = $('#mem-token').value.trim();
+  const el = $('#mem-results');
+  el.style.display = 'block';
+  el.innerHTML = '<div class="muted" style="padding:10px">搜索中...</div>';
+  try {
+    const url = '/api/agent/memory/search?q=' + encodeURIComponent(q) + (token ? '&token=' + encodeURIComponent(token) : '');
+    const r = await fetch(url);
+    const d = await r.json();
+    const items = d.results || [];
+    if (!items.length) {
+      el.innerHTML = '<div class="muted" style="padding:10px">无结果</div>';
+      return;
+    }
+    el.innerHTML = items.map((m, i) => {
+      const meta = m.metadata || {};
+      const pnl = meta.pnl != null ? (meta.pnl >= 0 ? '<span class="green">+' + meta.pnl.toFixed(2) + '%</span>' : '<span class="red">' + meta.pnl.toFixed(2) + '%</span>') : '—';
+      const result = meta.result === 'win' ? '🟢' : meta.result === 'loss' ? '🔴' : '';
+      return '<div style="padding:8px 10px;margin-bottom:6px;background:#151a26;border-radius:4px;border-left:3px solid var(--accent)">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">' +
+          '<span><span style="color:var(--accent);font-weight:500">[' + (i+1) + ']</span> ' +
+          '<span style="font-size:12px;color:var(--muted)">score=' + (m.score || 0).toFixed(3) + '</span> ' +
+          '<b>' + esc(meta.token || '?') + '</b> ' + result + '</span>' +
+          '<span style="font-size:12px">PnL: ' + pnl + '</span>' +
+        '</div>' +
+        '<div style="font-size:12px;color:var(--text);line-height:1.5">' + esc(m.memory || '') + '</div>' +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    el.innerHTML = '<div class="muted" style="padding:10px">搜索失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+function closeMemorySearch() {
+  $('#mem-results').style.display = 'none';
+  $('#mem-results').innerHTML = '';
+}
+
 function toggleDet(i) {
   const el = document.getElementById('det-' + i);
   if (!el) return;
@@ -2429,20 +2543,29 @@ function updateClock() {
   $('#clock').textContent = now.toLocaleString('zh-CN', {hour12: false, timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'}).replace(/\\//g, '-') + ' UTC+8';
 }
 
-async function loadJournal() {
+let _jOffset = 0;
+let _jHasMore = true;
+const _J_PAGE = 5;
+
+async function loadJournal(reset = false) {
+  if (reset) { _jOffset = 0; _jHasMore = true; }
+  if (!_jHasMore) return;
   try {
-    const r = await fetch('/api/agent/journal?limit=30');
+    const r = await fetch('/api/agent/journal?limit=' + _J_PAGE + '&offset=' + _jOffset);
     const d = await r.json();
     const items = d.journal || [];
+    _jHasMore = d.has_more;
+    _jOffset += items.length;
+
     const tbody = $('#journal-body');
     const empty = $('#journal-empty');
-    if (!items.length) {
-      tbody.innerHTML = '';
-      empty.style.display = '';
-      return;
+    if (reset && !items.length) {
+      tbody.innerHTML = ''; empty.style.display = ''; return;
     }
     empty.style.display = 'none';
-    tbody.innerHTML = items.map(j => {
+
+    let html = '';
+    items.forEach(j => {
       const actionLabel = j.action === 'open' ? '开仓' : j.action === 'close' ? '平仓' : j.action;
       const actionCls = j.action === 'open' ? 'green' : j.action === 'close' ? 'red' : '';
       const pnl = j.pnl_pct != null ? Number(j.pnl_pct) : null;
@@ -2453,7 +2576,7 @@ async function loadJournal() {
       const hold = j.hold_duration || '';
       const reasonWithHold = (reason + (hold ? ' (' + hold + ')' : ''));
       const fullReasonWithHold = (fullReason + (hold ? ' (' + hold + ')' : ''));
-      return '<tr>' +
+      html += '<tr>' +
         '<td style="font-size:11px;white-space:nowrap">' + fmtDateTime(j.created_at).replace(' ', '<br>') + '</td>' +
         '<td><span style="font-size:11px;padding:1px 6px;border-radius:3px' + (actionCls ? ';color:' + (j.action==='open'?'var(--green)':'var(--red)') + ';background:' + (j.action==='open'?'#1a3a1a':'#3a1a1a') : '') + '">' + esc(actionLabel) + '</span></td>' +
         '<td style="font-weight:bold;color:var(--accent)">' + esc(j.token) + '</td>' +
@@ -2462,22 +2585,29 @@ async function loadJournal() {
         '<td class="right ' + pnlCls + '">' + pnlStr + '</td>' +
         '<td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" class="muted" title="' + esc(fullReasonWithHold) + '">' + esc(reasonWithHold) + '</td>' +
         '</tr>';
-    }).join('');
+    });
+    if (reset) { tbody.innerHTML = html; } else { tbody.innerHTML += html; }
+    if (_jHasMore && items.length) {
+      const btn = document.getElementById('j-more');
+      if (!btn) {
+        const b = document.createElement('div');
+        b.id = 'j-more'; b.style.cssText = 'text-align:center;padding:8px;cursor:pointer;color:var(--accent);font-size:12px';
+        b.textContent = '▼ 加载更多'; b.onclick = () => loadJournal(false);
+        $('#journal-empty').parentElement.appendChild(b);
+      }
+    } else { const btn = document.getElementById('j-more'); if (btn) btn.remove(); }
   } catch(e) { console.error('journal', e); }
 }
 
 async function refreshAll() {
-  await Promise.all([loadOverview(), loadPositions(), loadLessons(true), loadTimeline(true), loadJournal()]);
+  await Promise.all([loadOverview(), loadPositions(), loadLessons(true), loadTimeline(true), loadJournal(true)]);
 }
 
 updateClock();
 setInterval(updateClock, 1000);
 refreshAll();
-setInterval(loadOverview, 5000);
+setInterval(loadOverview, 15000);
 setInterval(loadPositions, 5000);
-setInterval(loadTimeline, 10000);
-setInterval(loadJournal, 10000);
-setInterval(loadLessons, 60000);
 </script>
 </body>
 </html>

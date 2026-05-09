@@ -56,3 +56,4 @@ htmlcov/
 config_local.py
 .env
 .env.local
+extra/git.txt

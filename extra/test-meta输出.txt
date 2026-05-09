@@ -1,0 +1,25 @@
+1. 连接 Mem0...
+
+不过滤: 2 条
+metadata子结构: 1 条
+HTTP error occurred: Client error '400 Bad Request' for url 'https://api.mem0.ai/v3/memories/search/'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400
+Traceback (most recent call last):
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python314\Lib\site-packages\mem0\client\utils.py", line 38, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python314\Lib\site-packages\mem0\client\main.py", line 312, in search
+    response.raise_for_status()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_models.py", line 829, in raise_for_status
+    raise HTTPStatusError(message, request=request, response=self)
+httpx.HTTPStatusError: Client error '400 Bad Request' for url 'https://api.mem0.ai/v3/memories/search/'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\小龙虾学习手册\Hermes\bsm-agent\test_mem0.py", line 34, in <module>
+    r2b = client.search("OI", filters={"user_id": user_id, "metadata.token": "CHIP"})
+  File "C:\Users\Administrator\AppData\Local\Programs\Python\Python314\Lib\site-packages\mem0\client\utils.py", line 86, in wrapper
+    raise exception
+mem0.exceptions.ValidationError: {"error":"{'filters': [ErrorDetail(string=\"Unknown filter key 'metadata.token'. Allowed: ['AND', 'NOT', 'OR', 'agent_id', 'app_id', 'categories', 'created_at', 'keywords', 'memory_ids', 'metadata', 'run_id', 'text', 'timestamp', 'updated_at', 'user_id'].\", code='invalid')]}"}
