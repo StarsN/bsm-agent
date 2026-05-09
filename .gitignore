@@ -57,3 +57,8 @@ config_local.py
 .env
 .env.local
 extra/git.txt
+config.py
+extra/
+fix/
+test/
+CHANGELOG/
