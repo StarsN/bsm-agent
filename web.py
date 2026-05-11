@@ -694,17 +694,37 @@ def api_agent_memory_search(q: str = "", token: str = "", limit: int = 10):
 
 
 @app.get("/api/agent/lessons")
-def api_agent_lessons(limit: int = 20, offset: int = 0):
-    """Agent 教训库 + 统计，分页"""
+def api_agent_lessons(limit: int = 20, offset: int = 0, all: int = 0):
+    """Agent 教训库 + 统计，分页。all=1 显示全部含已失效"""
     with storage.get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM lessons WHERE learned=0").fetchone()[0]
-        active = conn.execute(
-            "SELECT * FROM lessons WHERE learned=0 ORDER BY severity DESC, created_at DESC LIMIT ? OFFSET ?",
-            (limit, offset)
-        ).fetchall()
-        active = [dict(r) for r in active]
+        if all:
+            total = conn.execute("SELECT COUNT(*) FROM lessons").fetchone()[0]
+            rows = conn.execute(
+                "SELECT * FROM lessons ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset)
+            ).fetchall()
+        else:
+            total = conn.execute("SELECT COUNT(*) FROM lessons WHERE learned=0").fetchone()[0]
+            rows = conn.execute(
+                "SELECT * FROM lessons WHERE learned=0 ORDER BY severity DESC, created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset)
+            ).fetchall()
+        active = [dict(r) for r in rows]
         stats = storage.lessons_stats(conn)
     return {"active": active, "stats": stats, "has_more": (offset + limit) < total}
+
+
+@app.post("/api/agent/lessons/toggle")
+def api_agent_lessons_toggle(id: int = 0):
+    if not id:
+        raise HTTPException(400, "需要 id")
+    with storage.get_conn() as conn:
+        row = conn.execute("SELECT learned FROM lessons WHERE id=?", (id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "不存在")
+        new_val = 0 if row["learned"] else 1
+        conn.execute("UPDATE lessons SET learned=? WHERE id=?", (new_val, id))
+    return {"ok": True, "id": id, "learned": bool(new_val)}
 
 
 # === 前端页面 ===
@@ -2177,7 +2197,7 @@ tr:hover { background: #1f2536; }
     <h2>当前持仓</h2>
     <table>
       <thead><tr>
-        <th>币种</th><th>方向</th><th>入场</th><th>现价</th><th>PnL%</th><th>止损</th><th>止盈</th><th>持仓</th>
+        <th>币种</th><th>方向</th><th>入场</th><th>现价</th><th>PnL%</th><th>止损</th><th>TP1</th><th>TP2</th><th>持仓</th>
       </tr></thead>
       <tbody id="positions-body"></tbody>
     </table>
@@ -2256,8 +2276,8 @@ async function loadOverview() {
     const d = await r.json();
     $('#equity-avail').innerHTML = '$' + d.equity + '<br><span style="font-size:13px;color:var(--muted)">$' + d.available + '</span>';
     $('#equity-avail').className = 'stat-value ' + (d.unrealized >= 0 ? 'green' : 'red');
-    $('#today-pnl').textContent = fmtPct(d.today_pnl);
-    $('#today-pnl').className = 'stat-value ' + pnlClass(d.today_pnl);
+    $('#today-pnl').textContent = (d.today_pnl >= 0 ? '+' : '') + '$' + Math.abs(d.today_pnl).toFixed(2);
+    $('#today-pnl').className = 'stat-value ' + (d.today_pnl >= 0 ? 'green' : 'red');
     $('#win-rate').textContent = d.win_rate + '%';
     $('#today-trades').innerHTML = '<span class="green">' + d.today_opens + '</span> / <span class="red">' + d.today_closes + '</span> (胜' + d.today_wins + ' 负' + d.today_losses + ')';
     $('#pending').textContent = d.pending_decisions + ' 条';
@@ -2301,6 +2321,7 @@ async function loadPositions() {
         '<td class="' + pnlClass(pnl) + '">' + fmtPct(pnl) + '</td>' +
         '<td>' + fmtPrice(p.stop_loss_price) + '</td>' +
         '<td>' + fmtPrice(p.tp1_price) + '</td>' +
+        '<td>' + fmtPrice(p.tp2_price) + '</td>' +
         '<td style="font-size:11px;white-space:nowrap">' + esc(hold) + '</td>' +
         '</tr>';
     }).join('');
@@ -2310,13 +2331,15 @@ async function loadPositions() {
 // 教训库
 let _lsOffset = 0;
 let _lsHasMore = true;
+let _lsShowAll = true;
 const _LS_PAGE = 5;
 
 async function loadLessons(reset = false) {
   if (reset) { _lsOffset = 0; _lsHasMore = true; }
   if (!_lsHasMore) return;
   try {
-    const r = await fetch('/api/agent/lessons?limit=' + _LS_PAGE + '&offset=' + _lsOffset);
+    const url = '/api/agent/lessons?limit=' + _LS_PAGE + '&offset=' + _lsOffset + '&all=' + (_lsShowAll ? 1 : 0);
+    const r = await fetch(url);
     const d = await r.json();
     const s = d.stats || {};
     _lsOffset += (d.active || []).length;
@@ -2327,7 +2350,8 @@ async function loadLessons(reset = false) {
         '<div class="item"><span class="label">活跃</span> <strong>' + (s.active || 0) + '</strong></div>' +
         '<div class="item"><span class="label">critical</span> <strong class="red">' + ((s.severity_dist || {}).critical || 0) + '</strong></div>' +
         '<div class="item"><span class="label">warning</span> <strong class="yellow">' + ((s.severity_dist || {}).warning || 0) + '</strong></div>' +
-        '<div class="item"><span class="label">medium</span> <strong class="blue">' + ((s.severity_dist || {}).medium || 0) + '</strong></div>';
+        '<div class="item"><span class="label">medium</span> <strong class="blue">' + ((s.severity_dist || {}).medium || 0) + '</strong></div>' +
+        '<div class="item"><span onclick="toggleLessonsAll()" style="cursor:pointer;color:var(--accent);font-size:11px">[' + (_lsShowAll ? '仅活跃' : '全部') + ']</span></div>';
     }
 
     const lessons = d.active || [];
@@ -2338,12 +2362,20 @@ async function loadLessons(reset = false) {
     }
 
     let html = '';
+    const now = new Date();
     lessons.forEach(l => {
       const sev = l.severity || 'medium';
+      const isNew = l.created_at ? (now - new Date(l.created_at.replace(' ','T') + 'Z')) / 3600000 < 24 : false;
+      const learned = l.learned ? '无效' : '有效';
+      const learnedCls = l.learned ? 'red' : 'green';
       html += '<div class="lesson-item ' + sev + '">' +
         '<div class="lesson-head">' +
+          '<span style="color:var(--muted);font-size:10px;margin-right:6px">#' + (l.id || '?') + '</span>' +
           '<span class="lesson-token">' + esc(l.token) + '</span>' +
+          (isNew ? '<span style="background:#3a1f5f;color:#c4a0ff;padding:1px 5px;border-radius:2px;font-size:10px;margin-left:4px">NEW</span>' : '') +
           '<span class="lesson-sev ' + sev + '">' + sev + '</span>' +
+          '<span style="font-size:10px;color:var(--muted);margin-left:auto">' + (l.created_at ? l.created_at.substr(0,16) : '') + '</span>' +
+          '<span style="font-size:11px;color:var(--' + learnedCls + ');margin-left:8px;cursor:pointer" onclick="toggleLearned(' + (l.id || 0) + ')" title="点击切换">' + learned + '</span>' +
         '</div>' +
         '<div class="lesson-body">' + truncText(l.lesson, 120) + '</div>' +
         (l.rule_update ? '<div class="lesson-rule">规则: ' + truncText(l.rule_update, 80) + '</div>' : '') +
@@ -2524,6 +2556,19 @@ async function searchMemory() {
 function closeMemorySearch() {
   $('#mem-results').style.display = 'none';
   $('#mem-results').innerHTML = '';
+}
+
+function toggleLessonsAll() {
+  _lsShowAll = !_lsShowAll;
+  loadLessons(true);
+}
+
+async function toggleLearned(id) {
+  try {
+    const r = await fetch('/api/agent/lessons/toggle?id=' + id, {method:'POST'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    loadLessons(true);
+  } catch(e) { console.error('toggleLearned', e); }
 }
 
 function toggleDet(i) {

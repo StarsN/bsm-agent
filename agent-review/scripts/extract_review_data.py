@@ -58,16 +58,6 @@ if close_order_ids:
         close_order_ids,
     )]
 
-# ---- 活跃持仓 ----
-open_positions = [dict(r) for r in conn.execute(
-    """SELECT token, side, entry_price, current_price, stop_loss_price,
-       tp1_price, tp2_price, pnl_pct, margin_amount, highest_price,
-       open_reason, created_at
-       FROM trade_positions
-       WHERE status IN ('OPEN','PARTIAL')
-       AND json_extract(signal_snapshot, '$.source') = 'agent'"""
-)]
-
 # ---- 已有 lessons ----
 existing_lessons = [dict(r) for r in conn.execute(
     "SELECT id, token, root_cause, rule_update, severity, created_at "
@@ -97,7 +87,6 @@ output = {
     "opens": opens,
     "closes": closes,
     "closed_positions": closed_positions,
-    "open_positions": open_positions,
     "existing_lessons": existing_lessons,
     "existing_rules": existing_rules,
     "tag_stats": tag_stats,
@@ -108,5 +97,5 @@ with open(args.output, "w", encoding="utf-8") as f:
 
 print(f"数据已写入 {args.output}")
 print(f"  未复盘 journal: {len(journal)} 条（开仓 {len(opens)} / 平仓 {len(closes)}）")
-print(f"  涉及平仓: {len(closed_positions)} 笔  活跃: {len(open_positions)} 笔")
+print(f"  涉及平仓: {len(closed_positions)} 笔")
 print(f"  已有 lessons: {len(existing_lessons)} 条")

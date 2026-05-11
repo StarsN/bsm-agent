@@ -22,7 +22,7 @@ allowed-tools: [Bash, Read, Write]
 python3 /root/binance-monitor/bsm-agent/agent-review/scripts/extract_review_data.py --output /tmp/review_data.json
 ```
 
-输出 JSON 包含：今日的 journal、开仓记录、平仓记录、已平仓持仓、活跃持仓、已有 lessons、止损标签统计。各字段含义详见 `references/复盘数据字段说明.md`。
+输出 JSON 包含：今日的 journal、开仓记录、平仓记录、已平仓持仓、已有 lessons、止损标签统计。各字段含义详见 `references/复盘数据字段说明.md`。
 
 ### 第二步：交叉分析
 

@@ -849,9 +849,8 @@ def update_paper_positions(conn):
             )
             try:
                 import sync_memory
-                sync_memory.record_close(
-                    token=pos["token"],
-                    round_num=0,
+                sync_memory.record_trade_from_journal(
+                    conn, token=pos["token"],
                     pnl=_margin_pnl_pct(realized, 0, float(pos.get("margin_amount") or 1)),
                     close_reason="sl_hit",
                     hold_duration=_calc_hold(pos.get("created_at")) or "",

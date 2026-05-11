@@ -1,9 +1,8 @@
 """
-Mem0 记忆系统：交易场景存储和模糊搜索
+Mem0 记忆系统：一笔交易一条记忆。
 
-写入：auto_trader 执行开仓/平仓时同步记录
+写入：平仓后一次写入完整记录（数据+决策+结果合并）
 搜索：Agent 开仓前查类似场景
-部署：pip install mem0ai，config.py 填 MEM0_API_KEY + MEM0_ENABLED=True
 """
 from __future__ import annotations
 
@@ -30,48 +29,14 @@ def _client():
 _USER_ID = getattr(config, "MEM0_USER_ID", "agent-trade")
 
 
-def record_open(token: str, round_num: int, tier: str,
-                reason: str, dimension_data: str, market_overview: str):
+def record_trade(token: str, round_num: int, tier: str,
+                 reason: str, dimension_data: str, market_overview: str,
+                 pnl: float, close_reason: str, hold_duration: str):
     """
-    记录开仓决策到记忆。
+    平仓时写入一条完整记忆。
 
-    token: 币种
-    round_num: 来自 latest_round
-    tier: full/half/quarter
-    reason: Agent 决策理由
-    dimension_data: 30个中文字段的 JSON 字符串
-    market_overview: BTC走势+恐惧贪婪+时段
-    """
-    if not _enabled():
-        return
-    try:
-        cl = _client()
-        cl.add(
-            messages=[
-                {"role": "user",
-                 "content": f"Round={round_num} {token} 市场数据：{dimension_data}"},
-                {"role": "assistant",
-                 "content": f"开仓决策：{token} tier={tier}。理由：{reason}。市场环境：{market_overview}"},
-            ],
-            user_id=_USER_ID,
-            metadata={"token": token, "pnl": None, "round": round_num},
-            infer=False,
-        )
-        _log.info(f"record_open {token} tier={tier} round={round_num}")
-    except Exception as e:
-        _log.warning(f"record_open {token} 失败: {e}")
-
-
-def record_close(token: str, round_num: int, pnl: float,
-                 close_reason: str, hold_duration: str):
-    """
-    追加平仓结果到记忆。
-
-    token: 币种
-    round_num: 来自 latest_round
-    pnl: 盈亏百分比（正=盈利，负=亏损）
-    close_reason: sl_hit / tp_hit / manual
-    hold_duration: "2h30m" 格式
+    调用方需传入开仓信息（来自 journal 或 decision）和平仓结果。
+    Mem0 只存一条消息，含完整上下文。
     """
     if not _enabled():
         return
@@ -79,26 +44,63 @@ def record_close(token: str, round_num: int, pnl: float,
         is_win = pnl >= 0
         result = "win" if is_win else "loss"
         if is_win and close_reason == "sl_hit":
-            desc = f"尾仓sl_hit（整体盈利）"
+            outcome = "尾仓sl_hit（整体盈利）"
         elif is_win:
-            desc = f"{close_reason}（盈利）"
+            outcome = f"{close_reason}（盈利）"
         else:
-            desc = f"{close_reason}（亏损）"
+            outcome = f"{close_reason}（亏损）"
+
+        content = (
+            f"Round={round_num} {token} tier={tier} "
+            f"入场理由：{reason}。"
+            f"市场：{market_overview}。"
+            f"结果：{outcome} PnL={pnl:+.2f}% 持仓={hold_duration}。"
+            f"入场数据：{dimension_data}"
+        )
 
         cl = _client()
         cl.add(
-            messages=[
-                {"role": "user",
-                 "content": f"Round={round_num} {token} 平仓结果：{desc}, "
-                            f"PnL={pnl:+.2f}%, 持仓={hold_duration}"},
-            ],
+            messages=[{"role": "user", "content": content}],
             user_id=_USER_ID,
-            metadata={"token": token, "pnl": pnl, "round": round_num, "result": result},
+            metadata={"token": token, "pnl": pnl, "round": round_num, "result": result, "tier": tier},
             infer=False,
         )
-        _log.info(f"record_close {token} pnl={pnl:+.2f}% result={result}")
+        _log.info(f"record {token} tier={tier} pnl={pnl:+.2f}% {result}")
     except Exception as e:
-        _log.warning(f"record_close {token} 失败: {e}")
+        _log.warning(f"record {token} 失败: {e}")
+
+
+def record_trade_from_journal(conn, token: str, pnl: float,
+                               close_reason: str, hold_duration: str,
+                               round_num: int = 0):
+    """
+    从 journal 表查开仓信息，组合平仓结果，写一条完整记忆。
+    """
+    if not _enabled():
+        return
+    try:
+        # 查最近一条 open 日志
+        row = conn.execute(
+            "SELECT tier, reason, dimension_data, market_overview, source_round "
+            "FROM journal WHERE token=? AND action='open' ORDER BY id DESC LIMIT 1",
+            (token.upper(),)
+        ).fetchone()
+        if not row:
+            return
+
+        record_trade(
+            token=token,
+            round_num=row["source_round"] or round_num,
+            tier=row["tier"] or "?",
+            reason=row["reason"] or "",
+            dimension_data=row["dimension_data"] or "{}",
+            market_overview=row["market_overview"] or "",
+            pnl=pnl,
+            close_reason=close_reason,
+            hold_duration=hold_duration,
+        )
+    except Exception as e:
+        _log.warning(f"record_from_journal {token} 失败: {e}")
 
 
 def search_similar(query: str, token: str = None, limit: int = 5) -> list[dict]:
@@ -107,7 +109,7 @@ def search_similar(query: str, token: str = None, limit: int = 5) -> list[dict]:
 
     query: 场景描述，如 "OI涨 taker弱 新币"
     token: 可选，限定币种
-    返回: [{memory, metadata, score}, ...]，score 越高越相似
+    返回: [{memory, metadata, score}, ...]
     """
     if not _enabled():
         return []
