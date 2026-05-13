@@ -379,7 +379,10 @@ async def main():
 
     while _running:
         try:
-            await one_round(scraper)
+            round_timeout = config.SCRAPE_ROUND_SECONDS + 120
+            await asyncio.wait_for(one_round(scraper), timeout=round_timeout)
+        except asyncio.TimeoutError:
+            console.print(f"[red]本轮超时（>{round_timeout}s），跳过[/red]")
         except Exception as e:
             console.print(f"[red]本轮出错：{e}[/red]")
             import traceback

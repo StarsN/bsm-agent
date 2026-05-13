@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将 Agent 复盘教训写入 lessons 表。自动去重。"""
+"""将 Agent 复盘教训写入 lessons 表。去重由 Agent 在写入前自查 existing_lessons 完成。"""
 import argparse
 import json
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Write review lessons to DB")
 parser.add_argument("--lessons", required=True, help="Path to Agent-generated lessons JSON file")
-parser.add_argument("--journal-ids", help="Comma-separated journal IDs to mark as reviewed")
+parser.add_argument("--journal-ids", required=True, help="'NONE' or comma-separated journal IDs to mark as reviewed")
 args = parser.parse_args()
 
 # 路径：基于脚本自身位置
@@ -49,6 +49,15 @@ if "lessons" not in data:
 lessons = data["lessons"]
 deprecate_ids = data.get("deprecate_ids", [])
 
+def _safe_str(v):
+    """兼容 dict 和 string 类型的 rule_update"""
+    if v is None:
+        return ""
+    if isinstance(v, dict):
+        return "。".join(f"{k}: {v}" for k, v in v.items())
+    return str(v).strip()
+
+
 conn = sqlite3.connect(DB)
 
 # 废弃旧规则
@@ -57,20 +66,9 @@ if deprecate_ids:
     conn.execute(f"UPDATE lessons SET learned=1 WHERE id IN ({ph})", deprecate_ids)
     print(f"已废弃 {len(deprecate_ids)} 条旧教训: {deprecate_ids}")
 
-# 已有规则
-existing = conn.execute(
-    "SELECT rule_update FROM lessons WHERE rule_update IS NOT NULL"
-).fetchall()
-existing_rules = set(r[0].strip() for r in existing)
-
 written = 0
-skipped = 0
 for l in lessons:
-    rule = (l.get("rule_update") or "").strip()
-    if rule and rule in existing_rules:
-        skipped += 1
-        print(f"跳过重复: {rule[:60]}")
-        continue
+    rule = _safe_str(l.get("rule_update"))
 
     conn.execute(
         """INSERT INTO lessons
@@ -83,15 +81,15 @@ for l in lessons:
             l.get("entry_price"), l.get("exit_price"), l.get("pnl_pct"),
             l.get("market_snapshot"), l.get("macro_context"),
             l.get("signal_error"), l.get("what_missed"),
-            l.get("root_cause"), l["lesson"],
-            rule or None, l.get("severity", "medium"),
+            l.get("root_cause"), l.get("lesson", ""),
+            _safe_str(rule) or None, l.get("severity", "medium"),
         ),
     )
     written += 1
-    print(f"写入: {l['token']} [{l.get('severity', 'medium')}] {l['lesson'][:60]}")
+    print(f"写入: {l['token']} [{l.get('severity', 'medium')}] {l.get('lesson', '')[:60]}")
 
 # 标记 journal 已复盘
-if args.journal_ids:
+if args.journal_ids and args.journal_ids.strip().upper() != "NONE":
     ids = [int(x.strip()) for x in args.journal_ids.split(",") if x.strip()]
     if ids:
         ph = ",".join("?" * len(ids))
@@ -100,4 +98,4 @@ if args.journal_ids:
 
 conn.commit()
 conn.close()
-print(f"\n写入 {written} 条，跳过 {skipped} 条")
+print(f"\n写入 {written} 条")

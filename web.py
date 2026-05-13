@@ -445,7 +445,7 @@ def api_trading():
     def compute():
         with storage.get_conn() as conn:
             account = trade_logic.account_summary(conn)
-            positions = storage.trade_positions_all(conn, limit=30)
+            positions = storage.trade_positions_all(conn, limit=10000)
             leaderboard_items, _ = _build_leaderboard_items(conn)
             candidates = trade_logic.build_trade_candidates_from_leaderboard(
                 conn, leaderboard_items, passed_only=True)
@@ -2464,18 +2464,7 @@ async function loadTimeline(reset = false) {
       if (src === 'journal' && item.dimension_data) {
         try {
           const dd = typeof item.dimension_data === 'string' ? JSON.parse(item.dimension_data) : item.dimension_data;
-          let fields = [];
-          if (dd.market && dd.market.snapshot && typeof dd.market.snapshot === 'object') {
-            const snap = dd.market.snapshot;
-            fields = [
-              ['价格', dd.price], ['15m涨跌', snap.change_15m_pct], ['1h涨跌', snap.change_1h_pct],
-              ['4h涨跌', snap.change_4h_pct], ['OI 1h', snap.oi_change_1h_pct], ['OI 4h', snap.oi_change_4h_pct],
-              ['taker', snap.taker_buy_sell_ratio], ['资金费率', snap.funding_rate_pct],
-              ['散户多空', snap.long_short_ratio], ['大户多空', snap.top_trader_ls_ratio],
-            ];
-          } else {
-            fields = Object.entries(dd).map(([k,v]) => [k, typeof v === 'object' ? JSON.stringify(v) : v]);
-          }
+          let fields = Object.entries(dd).map(([k,v]) => [k, typeof v === 'object' ? JSON.stringify(v) : v]);
           detail = '<div class="tl-detail" id="det-' + di + '">'
             + fields.map(([k,v]) => '<b>' + esc(String(k)) + ':</b> ' + esc(v != null ? String(v) : '-')).join(' &nbsp;|&nbsp; ')
             + '</div>';

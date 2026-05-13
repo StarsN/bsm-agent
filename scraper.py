@@ -208,15 +208,27 @@ class SquareScraper:
         burst_seconds = getattr(config, "SCRAPE_BURST_SECONDS", 50)
         idle_seconds = getattr(config, "SCRAPE_IDLE_SECONDS", 45)
 
+        # 清理 Windows Chromium 锁文件，防止 launch_persistent_context 卡死
+        if USER_DATA_DIR.exists():
+            for lock_name in ("SingletonLock", "SingletonSocket"):
+                lock_path = USER_DATA_DIR / lock_name
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
         async with async_playwright() as p:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(USER_DATA_DIR),
-                headless=config.HEADLESS,
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/126.0.0.0 Safari/537.36"),
-                viewport={"width": 1440, "height": 900},
-                args=_build_chrome_args(),
+            context = await asyncio.wait_for(
+                p.chromium.launch_persistent_context(
+                    user_data_dir=str(USER_DATA_DIR),
+                    headless=config.HEADLESS,
+                    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/126.0.0.0 Safari/537.36"),
+                    viewport={"width": 1440, "height": 900},
+                    args=_build_chrome_args(),
+                ),
+                timeout=getattr(config, "BROWSER_LAUNCH_TIMEOUT", 120),
             )
             page = context.pages[0] if context.pages else await context.new_page()
             page.on("response", self._handle_response)

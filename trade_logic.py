@@ -18,7 +18,8 @@ import config
 import storage
 import risk
 from analyzer import compute_short_scores, compute_composite_scores
-from market import get_mark_price, get_klines_1h
+from market import get_mark_price, get_klines_1h, get_market_snapshot
+from signals import analyze as analyze_signals
 
 
 MAX_ENTRY_CHANGE_15M = 5.0
@@ -89,6 +90,7 @@ def _timestamp_age_seconds(raw: str | None) -> float | None:
         return None
 
 
+
 def _calc_hold(created_at: str | None) -> str | None:
     if not created_at:
         return None
@@ -102,6 +104,46 @@ def _calc_hold(created_at: str | None) -> str | None:
         return f"{hours}h{mins}m" if hours else f"{mins}m"
     except Exception:
         return None
+
+
+# 关仓快照中文字段映射：snapshot 原始 key → 中文 key，与开仓 dimension_data 一致
+_CLOSE_SNAP_MAP = [
+    ("mark_price",           "标记价"),
+    ("change_15m_pct",       "15分钟涨跌"),
+    ("change_1h_pct",        "1小时涨跌"),
+    ("change_4h_pct",        "4小时涨跌"),
+    ("change_24h_pct",       "24小时涨跌"),
+    ("change_48h_pct",       "48小时涨跌"),
+    ("funding_rate_pct",     "资金费率(%/8h)"),
+    ("oi_usd",               "未平仓(USD)"),
+    ("oi_change_15m_pct",    "OI15分钟变化"),
+    ("oi_change_1h_pct",     "OI1小时变化"),
+    ("oi_change_4h_pct",     "OI4小时变化"),
+    ("oi_change_48h_pct",    "OI48小时变化"),
+    ("taker_buy_sell_ratio", "主动买卖比"),
+    ("taker_buy_pct",        "主动买入占比"),
+    ("taker_trend_pct",      "Taker趋势"),
+    ("bid_ask_spread_pct",   "盘口价差"),
+    ("depth_bid_1pct_usd",   "买盘深度(USD)"),
+    ("depth_ask_1pct_usd",   "卖盘深度(USD)"),
+    ("depth_imbalance_pct",  "盘口失衡度"),
+    ("volume_24h_usd",       "24小时成交额"),
+    ("long_short_ratio",     "散户多空比"),
+    ("top_trader_ls_ratio",  "大户多空比"),
+]
+
+
+def _build_close_snap(close_price: float, snap: dict, analysis: dict) -> str:
+    """构建与开仓同格式的中文平铺关仓快照 JSON。"""
+    result = {"平仓价": close_price}
+    for en_key, cn_key in _CLOSE_SNAP_MAP:
+        result[cn_key] = snap.get(en_key)
+    result["信号判定"] = analysis.get("verdict")
+    result["走向"] = analysis.get("direction")
+    result["信号标签"] = analysis.get("tags", [])
+    result["分析备注"] = analysis.get("notes", [])
+    result["OI背离"] = analysis.get("oi_divergence")
+    return json.dumps(result, default=str, ensure_ascii=False)
 
 
 def _position_price(token: str, market: dict, realtime: dict) -> float | None:
@@ -632,8 +674,9 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
         # 写平仓 journal
         margin = float(pos.get("margin_amount") or 1)
         pnl_pct_val = (realized / margin) * 100
-        close_snap = json.dumps({"price": price, "market": market, "realtime": realtime},
-                                default=str, ensure_ascii=False)
+        _cs_snap = get_market_snapshot(token, heavy=True)
+        _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
+        close_snap = _build_close_snap(price, _cs_snap or {}, _cs_analysis)
         storage.journal_add_close(
             conn, order_id=pos["id"], token=token, price=price,
             reason="取消收藏触发：按市价平仓",
@@ -643,9 +686,8 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
         )
         try:
             import sync_memory
-            sync_memory.record_close(
-                token=token,
-                round_num=0,
+            sync_memory.record_trade_from_journal(
+                conn, token=token,
                 pnl=pnl_pct_val,
                 close_reason="manual",
                 hold_duration=_calc_hold(pos.get("created_at")) or "",
@@ -838,8 +880,9 @@ def update_paper_positions(conn):
             })
             storage.trade_position_update(conn, pos["id"], fields)
             # 写平仓 journal
-            close_snap = json.dumps({"price": fill_price, "market": market, "realtime": realtime},
-                                    default=str, ensure_ascii=False)
+            _cs_snap = get_market_snapshot(pos["token"], heavy=True)
+            _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
+            close_snap = _build_close_snap(fill_price, _cs_snap or {}, _cs_analysis)
             storage.journal_add_close(
                 conn, order_id=pos["id"], token=pos["token"], price=fill_price,
                 reason=f"止损触发 @ ${fill_price:.6g}（含假设滑点）",
@@ -919,8 +962,9 @@ def update_paper_positions(conn):
                 })
                 storage.trade_position_update(conn, pos["id"], fields)
                 # 写平仓 journal
-                close_snap = json.dumps({"price": fill_price, "market": market, "realtime": realtime},
-                                        default=str, ensure_ascii=False)
+                _cs_snap = get_market_snapshot(pos["token"], heavy=True)
+                _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
+                close_snap = _build_close_snap(fill_price, _cs_snap or {}, _cs_analysis)
                 storage.journal_add_close(
                     conn, order_id=pos["id"], token=pos["token"], price=fill_price,
                     reason=f"跟踪止盈触发 @ ${fill_price:.6g}",
@@ -930,9 +974,8 @@ def update_paper_positions(conn):
                 )
                 try:
                     import sync_memory
-                    sync_memory.record_close(
-                        token=pos["token"],
-                        round_num=0,
+                    sync_memory.record_trade_from_journal(
+                        conn, token=pos["token"],
                         pnl=_margin_pnl_pct(realized, 0, float(pos.get("margin_amount") or 1)),
                         close_reason="tp_hit",
                         hold_duration=_calc_hold(pos.get("created_at")) or "",

@@ -23,7 +23,7 @@ allowed-tools: [Bash, Read, Write]
 ```
 读数据 → 自主分析 → 查教训 → 开单/跳过 → 系统执行 → 复盘写 lessons → 下次开仓前查
                   ↑______________________________________________↓
-                            每一笔亏损都变成下一笔的过滤条件
+                      每一笔亏损都变成下一笔的认知滤网与策略微调依据
 ```
 
 每次亏损都会生成一条 lesson，让你在未来同场景下更谨慎。你的目标不是每次都赚钱，而是**不重复犯同一个错**。
@@ -78,7 +78,12 @@ python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.
 - `agent_lessons`：复盘写的教训，字段含义见 `references/lessons字段说明.md`。同 token 有没有踩过坑？全局教训（token='*'）适用吗？
 - `tag_stats + archive_lessons`：系统自动打的失败标签。详见 `references/失败的教训标签.md`。
 
-如果当前场景和某条教训吻合，要么不开，要么在 reason 里说明为什么这次不同。
+历史教训的`rule_update`字段为 [情境] + [倾向] + [策略] 描述，你必须按以下逻辑使用它们：
+1、情境匹配：评估当前市场数据与教训中 [情境] 的相似度。
+2、倾向引导：如果情境高度吻合，应用教训中的 [倾向] 作为高权重参考。不要机械地拒绝开仓，而是将注意力转移到倾向所提示的风险点上（如：去检查 Taker 是否背离）。
+3、策略微调：如果决定在有历史风险警告的环境下开仓，参考教训中 [策略] 建议的动作（例如：将仓位从 full 降级为 half，或要求更严苛的入场信号）。
+
+命中模式时，读它的倾向和策略，作为参考输入你的判断。不是强制规则——你结合当前市场上下文自主决定。
 
 ### 第四步：写决策
 
@@ -87,6 +92,8 @@ python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.
 **先加载参考**：`skill_view(name='agent-trade', file_path='assets/决策JSON格式.md')`，按其中完整格式构造 JSON。**必须用信封格式**：`{"market_read": "...", "decisions": [...]}`。空决策也必须带 `market_read`，不能只写 `[]`。
 
 **常见 reject 原因**：详见 `references/数据操作要点.md`。
+
+强制要求：如果你的决策参考了某条历史教训，必须在 reason 字段中显式说明：你匹配了哪条教训的情境，以及你是如何落地执行其策略的（例如：“触发了轧空教训，已将档位降级为 half”）。
 
 构造完成后执行：
 
