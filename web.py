@@ -68,6 +68,7 @@ class TradingSettingsBody(BaseModel):
     initial_balance: float | None = None
     leverage: int | None = None
     order_amount: float | None = None
+    agent_trigger_interval: int | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -462,7 +463,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_trigger_interval"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -679,18 +680,6 @@ def api_agent_timeline(limit: int = 30, offset: int = 0):
     has_more = (offset + limit) < max(journal_total, decision_total)
     return {"timeline": timeline[:limit], "has_more": has_more}
 
-
-@app.get("/api/agent/memory/search")
-def api_agent_memory_search(q: str = "", token: str = "", limit: int = 10):
-    """记忆搜索：调 Mem0 搜历史类似场景"""
-    if not q.strip():
-        return {"results": []}
-    try:
-        import sync_memory
-        results = sync_memory.search_similar(q.strip(), token=token.strip() or None, limit=limit)
-        return {"results": results, "query": q.strip()}
-    except Exception:
-        return {"results": [], "query": q.strip()}
 
 
 @app.get("/api/agent/lessons")
@@ -1071,9 +1060,6 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 
 <div class="panel">
   <h2 style="margin-top:0">自动交易面板</h2>
-  <div class="muted" style="font-size:12px;margin-bottom:10px;">
-    默认模拟交易。自动开仓规则：判断栏为看起来健康，15m 涨幅 0%-5%，1h 涨幅 0%-20%，OI 15m/1h/4h 都增加，主动买卖比 > 1.15，有可用价格后按市价开多。同一代币同一轮榜单只开一次。止损固定 -2%，止盈为 +1R 平 50%、+2R 平 30%、剩余跟踪。
-  </div>
   <div class="trade-controls">
     <div>
       <label>自动交易</label>
@@ -1097,11 +1083,19 @@ tr.flash { animation: row-flash 1.5s ease-out; }
       <label>交易倍数</label>
       <input id="trade-leverage" type="number" min="1" max="125" step="1">
     </div>
-    <div style="display:flex;align-items:end;gap:8px;">
-      <button class="refresh-btn" onclick="saveTradingSettings()">保存交易设置</button>
-      <button class="refresh-btn danger-btn" onclick="resetTradingAccount()"
-              title="清空所有持仓和历史记录，把账户恢复到初始金额">重置账户</button>
+    <div>
+      <label>Agent 交易频率</label>
+      <select id="trade-agent-interval">
+        <option value="1">每轮触发</option>
+        <option value="2">隔一轮触发</option>
+        <option value="3">隔两轮触发</option>
+      </select>
     </div>
+  </div>
+  <div style="text-align:center;margin-bottom:12px">
+    <button class="refresh-btn" onclick="saveTradingSettings()">保存交易设置</button>
+    <button class="refresh-btn danger-btn" onclick="resetTradingAccount()"
+            title="清空所有持仓和历史记录，把账户恢复到初始金额" style="margin-left:8px">重置账户</button>
   </div>
   <div class="trade-summary" id="trade-summary"></div>
   <div class="trade-position-grid">
@@ -1719,6 +1713,7 @@ function renderTradingPanel(data) {
     document.getElementById('trade-mode').value = settings.mode || 'paper';
     document.getElementById('trade-initial').value = settings.initial_balance ?? '';
     document.getElementById('trade-leverage').value = settings.leverage ?? '';
+    document.getElementById('trade-agent-interval').value = settings.agent_trigger_interval ?? 3;
   }
 
   document.getElementById('trade-summary').innerHTML = `
@@ -1773,6 +1768,8 @@ function renderOpenPositions(items) {
 
 function renderClosedPositions(items) {
   const el = document.getElementById('trade-closed-positions');
+  const scrollEl = el.querySelector('.closed-positions-scroll');
+  const scrollTop = scrollEl ? scrollEl.scrollTop : 0;
   if (!items.length) {
     el.innerHTML = '<div class="empty">暂无已平仓记录</div>';
     return;
@@ -1818,6 +1815,8 @@ function renderClosedPositions(items) {
       </tbody></table>
     </div>
   `;
+  const newScrollEl = el.querySelector('.closed-positions-scroll');
+  if (newScrollEl && scrollTop) newScrollEl.scrollTop = scrollTop;
 }
 
 function renderTradeCandidates(items) {
@@ -1880,6 +1879,7 @@ async function saveTradingSettings() {
     mode: document.getElementById('trade-mode').value,
     initial_balance: Number(document.getElementById('trade-initial').value),
     leverage: Number(document.getElementById('trade-leverage').value),
+    agent_trigger_interval: Number(document.getElementById('trade-agent-interval').value),
   };
   try {
     const resp = await fetch('/api/trading/settings', {
@@ -2161,17 +2161,6 @@ tr:hover { background: #1f2536; }
   <a href="/" class="nav-link">市场监控 →</a>
 </div>
 
-<!-- 记忆搜索 -->
-<div class="panel">
-  <div style="display:flex;align-items:center;gap:8px">
-    <span style="font-size:13px;font-weight:500;white-space:nowrap">🔍 记忆搜索</span>
-    <input id="mem-query" type="text" placeholder="OI涨 taker弱 sl_hit" style="flex:1;background:#0a0e15;color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 10px;font-size:13px" onkeydown="if(event.key==='Enter')searchMemory()">
-    <input id="mem-token" type="text" placeholder="限定币种(可选)" style="width:120px;background:#0a0e15;color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 10px;font-size:13px">
-    <button onclick="searchMemory()" style="background:var(--accent);color:#000;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:13px;font-weight:500">搜索</button>
-    <button onclick="closeMemorySearch()" style="background:transparent;color:var(--muted);border:none;cursor:pointer;font-size:18px" title="关闭">✕</button>
-  </div>
-  <div id="mem-results" style="display:none;margin-top:10px"></div>
-</div>
 
 <!-- 顶部：账户概览 + 持仓 -->
 <div class="grid-top">
@@ -2507,45 +2496,6 @@ async function loadTimeline(reset = false) {
   } catch(e) { console.error('timeline', e); }
 }
 
-async function searchMemory() {
-  const q = $('#mem-query').value.trim();
-  if (!q) return;
-  const token = $('#mem-token').value.trim();
-  const el = $('#mem-results');
-  el.style.display = 'block';
-  el.innerHTML = '<div class="muted" style="padding:10px">搜索中...</div>';
-  try {
-    const url = '/api/agent/memory/search?q=' + encodeURIComponent(q) + (token ? '&token=' + encodeURIComponent(token) : '');
-    const r = await fetch(url);
-    const d = await r.json();
-    const items = d.results || [];
-    if (!items.length) {
-      el.innerHTML = '<div class="muted" style="padding:10px">无结果</div>';
-      return;
-    }
-    el.innerHTML = items.map((m, i) => {
-      const meta = m.metadata || {};
-      const pnl = meta.pnl != null ? (meta.pnl >= 0 ? '<span class="green">+' + meta.pnl.toFixed(2) + '%</span>' : '<span class="red">' + meta.pnl.toFixed(2) + '%</span>') : '—';
-      const result = meta.result === 'win' ? '🟢' : meta.result === 'loss' ? '🔴' : '';
-      return '<div style="padding:8px 10px;margin-bottom:6px;background:#151a26;border-radius:4px;border-left:3px solid var(--accent)">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">' +
-          '<span><span style="color:var(--accent);font-weight:500">[' + (i+1) + ']</span> ' +
-          '<span style="font-size:12px;color:var(--muted)">score=' + (m.score || 0).toFixed(3) + '</span> ' +
-          '<b>' + esc(meta.token || '?') + '</b> ' + result + '</span>' +
-          '<span style="font-size:12px">PnL: ' + pnl + '</span>' +
-        '</div>' +
-        '<div style="font-size:12px;color:var(--text);line-height:1.5">' + esc(m.memory || '') + '</div>' +
-      '</div>';
-    }).join('');
-  } catch(e) {
-    el.innerHTML = '<div class="muted" style="padding:10px">搜索失败: ' + esc(e.message) + '</div>';
-  }
-}
-
-function closeMemorySearch() {
-  $('#mem-results').style.display = 'none';
-  $('#mem-results').innerHTML = '';
-}
 
 function toggleLessonsAll() {
   _lsShowAll = !_lsShowAll;

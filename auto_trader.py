@@ -330,18 +330,6 @@ def execute_close(conn, decision: dict) -> dict:
             }, default=str, ensure_ascii=False),
         })
 
-    # Mem0 记忆：一条完整记录
-    try:
-        import sync_memory
-        sync_memory.record_trade_from_journal(
-            conn, token=token,
-            pnl=pnl_pct_val,
-            close_reason=decision.get("close_reason") or "agent",
-            hold_duration=hold or "",
-            round_num=decision.get("source_round") or 0,
-        )
-    except Exception:
-        pass
 
     return {"ok": True}
 

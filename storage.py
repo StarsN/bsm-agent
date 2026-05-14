@@ -295,6 +295,23 @@ CREATE TABLE IF NOT EXISTS journal (
 
 CREATE INDEX IF NOT EXISTS idx_journal_token ON journal(token, created_at);
 CREATE INDEX IF NOT EXISTS idx_journal_action ON journal(action, created_at);
+
+-- Agent 候选币池（每轮面板扫描结果快照）
+CREATE TABLE IF NOT EXISTS agent_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number    INTEGER NOT NULL,
+    token           TEXT NOT NULL,
+    data            TEXT NOT NULL,           -- 候选币全字段 JSON（同 extract 脚本 candidates 格式）
+    tier            TEXT,                    -- full / half / skip
+    passed          INTEGER DEFAULT 0,       -- 0 / 1
+    hard_blocks     TEXT,                    -- JSON 数组
+    pass_count      INTEGER,
+    signal_key      TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_candidates_round ON agent_candidates(round_number);
+CREATE INDEX IF NOT EXISTS idx_agent_candidates_token_round ON agent_candidates(token, round_number);
 """
 
 
@@ -582,6 +599,48 @@ def leaderboard_signal_key(conn) -> str:
     return "no-history"
 
 
+# === Agent 候选币池 ===
+
+def agent_candidates_insert_batch(conn, round_number: int, items: list[dict]):
+    """批量写入一轮的候选币评估结果。每条 items 含 token/data/tier/passed/hard_blocks/pass_count/signal_key。"""
+    for item in items:
+        conn.execute("""
+            INSERT INTO agent_candidates
+                (round_number, token, data, tier, passed, hard_blocks, pass_count, signal_key)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            round_number, item["token"], item["data"], item.get("tier"),
+            item.get("passed", 0), item.get("hard_blocks", "[]"),
+            item.get("pass_count", 0), item.get("signal_key"),
+        ))
+
+
+def agent_candidates_get_latest(conn, rounds: int = 2) -> list[dict]:
+    """读取最近 N 轮的候选币，按 token 去重取每币最新一条。"""
+    cur = conn.execute("""
+        SELECT a.* FROM agent_candidates a
+        INNER JOIN (
+            SELECT token, MAX(id) AS max_id
+            FROM agent_candidates
+            WHERE round_number > (
+                SELECT COALESCE(MAX(round_number), 0) - ? FROM agent_candidates
+            )
+            GROUP BY token
+        ) b ON a.id = b.max_id
+        ORDER BY a.id
+    """, (rounds - 1,))
+    return [dict(r) for r in cur.fetchall()]
+
+
+def agent_candidates_purge_old(conn, keep_last_rounds: int = 20):
+    conn.execute("""
+        DELETE FROM agent_candidates
+        WHERE round_number <= (
+            SELECT COALESCE(MAX(round_number), 0) - ? FROM agent_candidates
+        )
+    """, (keep_last_rounds,))
+
+
 # === 收藏锚定 ===
 
 def entry_get(conn, token: str) -> dict | None:
@@ -739,7 +798,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_trigger_interval"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -932,22 +991,29 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
       - 所有持仓（含 PENDING / OPEN / PARTIAL / CLOSED / CANCELED）
       - signal_lock 防重复表
       - 止损学习归档表
+      - pending_decisions 待处理决策
+      - agent_candidates 候选池
 
     保留：
       - trading_settings 配置（enabled / mode / leverage 等）
+      - lessons 教训库（真金白银买来的经验）
+      - journal 操作日志（历史记录）
       - 如传入 new_initial_balance，同时更新初始余额
 
     返回：各表删除的行数 + 新配置
     """
+    # 旧日志/教训标记失效，避免关联已删除的持仓数据
+    conn.execute("UPDATE journal SET reviewed = 1")
+    conn.execute("UPDATE lessons SET learned = 1")
     positions_deleted = conn.execute("DELETE FROM trade_positions").rowcount or 0
     locks_deleted = conn.execute("DELETE FROM trade_signal_locks").rowcount or 0
     archive_deleted = conn.execute("DELETE FROM trade_loss_archive").rowcount or 0
-    lessons_deleted = conn.execute("DELETE FROM lessons").rowcount or 0
-    journal_deleted = conn.execute("DELETE FROM journal").rowcount or 0
-    candidates_deleted = conn.execute("DELETE FROM round_candidates").rowcount or 0
+    decisions_deleted = conn.execute("DELETE FROM pending_decisions").rowcount or 0
+    candidates_deleted = conn.execute("DELETE FROM agent_candidates").rowcount or 0
 
-    # AUTOINCREMENT 计数器也重置（让新的 id 从 1 开始，看起来更整洁）
-    for tbl in ("trade_positions", "trade_signal_locks", "trade_loss_archive", "lessons", "journal", "round_candidates"):
+    # AUTOINCREMENT 计数器也重置
+    for tbl in ("trade_positions", "trade_signal_locks", "trade_loss_archive",
+                "pending_decisions", "agent_candidates"):
         conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (tbl,))
 
     if new_initial_balance is not None and new_initial_balance > 0:
@@ -958,8 +1024,7 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
         "positions_deleted": positions_deleted,
         "locks_deleted": locks_deleted,
         "loss_archive_deleted": archive_deleted,
-        "lessons_deleted": lessons_deleted,
-        "journal_deleted": journal_deleted,
+        "decisions_deleted": decisions_deleted,
         "candidates_deleted": candidates_deleted,
         "settings": settings,
     }
