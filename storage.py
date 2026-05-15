@@ -776,6 +776,7 @@ def trading_settings_defaults() -> dict:
         "initial_balance": config.TRADING_INITIAL_BALANCE,
         "leverage": config.TRADING_LEVERAGE,
         "order_amount": config.TRADING_ORDER_AMOUNT,
+        "agent_collect_interval_minutes": getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15),
     }
 
 
@@ -798,7 +799,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -990,7 +991,6 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
     清理内容：
       - 所有持仓（含 PENDING / OPEN / PARTIAL / CLOSED / CANCELED）
       - signal_lock 防重复表
-      - 止损学习归档表
       - pending_decisions 待处理决策
       - agent_candidates 候选池
 
@@ -998,6 +998,7 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
       - trading_settings 配置（enabled / mode / leverage 等）
       - lessons 教训库（真金白银买来的经验）
       - journal 操作日志（历史记录）
+      - trade_loss_archive 止损归档样本（历史记录）
       - 如传入 new_initial_balance，同时更新初始余额
 
     返回：各表删除的行数 + 新配置
@@ -1007,12 +1008,11 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
     conn.execute("UPDATE lessons SET learned = 1")
     positions_deleted = conn.execute("DELETE FROM trade_positions").rowcount or 0
     locks_deleted = conn.execute("DELETE FROM trade_signal_locks").rowcount or 0
-    archive_deleted = conn.execute("DELETE FROM trade_loss_archive").rowcount or 0
     decisions_deleted = conn.execute("DELETE FROM pending_decisions").rowcount or 0
     candidates_deleted = conn.execute("DELETE FROM agent_candidates").rowcount or 0
 
     # AUTOINCREMENT 计数器也重置
-    for tbl in ("trade_positions", "trade_signal_locks", "trade_loss_archive",
+    for tbl in ("trade_positions", "trade_signal_locks",
                 "pending_decisions", "agent_candidates"):
         conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (tbl,))
 
@@ -1023,7 +1023,6 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
     return {
         "positions_deleted": positions_deleted,
         "locks_deleted": locks_deleted,
-        "loss_archive_deleted": archive_deleted,
         "decisions_deleted": decisions_deleted,
         "candidates_deleted": candidates_deleted,
         "settings": settings,

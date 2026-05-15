@@ -146,7 +146,12 @@ if fng_data and fng_data.get("data"):
         pass
 
 # ---- 候选币（最近 interval+2 分钟内面板收集的全量数据，2min 缓冲防漏）----
-inter_min = getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)
+inter_min = 15
+try:
+    ts = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM trading_settings").fetchall()}
+    inter_min = int(ts.get("agent_collect_interval_minutes", getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
+except Exception:
+    pass
 ac_rows = conn.execute(
     "SELECT a.data FROM agent_candidates a "
     "INNER JOIN ("

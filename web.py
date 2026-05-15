@@ -112,9 +112,19 @@ def _scan_candidates():
 
 def _collect_loop():
     global _collected, _last_flush
-    interval_seconds = getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15) * 60
     poll_seconds = getattr(config, "AGENT_COLLECT_POLL_SECONDS", 5)
     cache_ttl = getattr(config, "AGENT_COLLECT_CACHE_TTL", 5)
+
+    def _read_interval():
+        try:
+            with storage.get_conn() as conn:
+                settings = storage.trading_settings_get(conn)
+                return int(settings.get("agent_collect_interval_minutes",
+                         getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
+        except Exception:
+            return getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)
+
+    interval_seconds = _read_interval() * 60
     _last_flush = time.time()  # 线程启动开始计时
     _last_heartbeat = 0
     print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库", flush=True)
@@ -138,6 +148,11 @@ def _collect_loop():
             now = time.time()
             if now - _last_heartbeat >= 60:
                 _last_heartbeat = now
+                # 即时生效：从 DB 重新读取间隔
+                new_interval = _read_interval() * 60
+                if new_interval != interval_seconds:
+                    print(f"[collect] 间隔变更: {interval_seconds//60} → {new_interval//60} 分钟", flush=True)
+                    interval_seconds = new_interval
                 remaining = max(0, interval_seconds - (now - _last_flush))
                 print(f"[collect] 距下次入库约 {remaining/60:.0f} 分钟"
                       f"（已收集 {len(_collected)} 个）", flush=True)
@@ -188,6 +203,7 @@ class TradingSettingsBody(BaseModel):
     initial_balance: float | None = None
     leverage: int | None = None
     order_amount: float | None = None
+    agent_collect_interval_minutes: int | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -580,7 +596,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1199,6 +1215,10 @@ tr.flash { animation: row-flash 1.5s ease-out; }
     <div>
       <label>交易倍数</label>
       <input id="trade-leverage" type="number" min="1" max="125" step="1">
+    </div>
+    <div>
+      <label>Agent 收集间隔（分钟）</label>
+      <input id="trade-collect-interval" type="number" min="5" max="60" step="1">
     </div>
   </div>
   <div style="text-align:center;margin-bottom:12px">
@@ -1822,6 +1842,7 @@ function renderTradingPanel(data) {
     document.getElementById('trade-mode').value = settings.mode || 'paper';
     document.getElementById('trade-initial').value = settings.initial_balance ?? '';
     document.getElementById('trade-leverage').value = settings.leverage ?? '';
+    document.getElementById('trade-collect-interval').value = settings.agent_collect_interval_minutes ?? 15;
   }
 
   document.getElementById('trade-summary').innerHTML = `
@@ -1987,6 +2008,7 @@ async function saveTradingSettings() {
     mode: document.getElementById('trade-mode').value,
     initial_balance: Number(document.getElementById('trade-initial').value),
     leverage: Number(document.getElementById('trade-leverage').value),
+    agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
   };
   try {
     const resp = await fetch('/api/trading/settings', {
