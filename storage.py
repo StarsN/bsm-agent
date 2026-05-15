@@ -798,7 +798,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_trigger_interval"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount"}
     rows = []
     for key, value in fields.items():
         if key in allowed:

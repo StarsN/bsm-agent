@@ -145,19 +145,13 @@ if fng_data and fng_data.get("data"):
     except (TypeError, ValueError, KeyError, IndexError):
         pass
 
-# ---- 候选币（轮数 = trigger_interval - 1，与触发器间隔对齐）----
-trigger_interval = 3
-try:
-    ts = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM trading_settings").fetchall()}
-    trigger_interval = int(ts.get("agent_trigger_interval", getattr(config, "AGENT_TRIGGER_INTERVAL", 3)))
-except Exception:
-    pass
-lookback = trigger_interval - 1  # interval=3→取3轮, interval=2→取2轮
+# ---- 候选币（最近 interval+2 分钟内面板收集的全量数据，2min 缓冲防漏）----
+inter_min = getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)
 ac_rows = conn.execute(
     "SELECT a.data FROM agent_candidates a "
     "INNER JOIN ("
     "  SELECT token, MAX(id) AS max_id FROM agent_candidates "
-    f"  WHERE round_number >= (SELECT COALESCE(MAX(round_number), 0) - {lookback} FROM agent_candidates) "
+    f"  WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
     "  GROUP BY token"
     ") b ON a.id = b.max_id "
     "ORDER BY a.id"
@@ -168,7 +162,7 @@ for r in ac_rows:
     try:
         d = json.loads(r["data"])
         # 去掉系统内部字段，Agent 只看原始市场数据
-        for k in ("realtime", "tier", "passed", "hard_block", "pass_count", "suggestion", "reasons"):
+        for k in ("realtime", "tier", "passed", "hard_block", "pass_count", "suggestion", "reasons", "verdict", "direction"):
             d.pop(k, None)
         candidates.append(d)
     except (json.JSONDecodeError, TypeError):

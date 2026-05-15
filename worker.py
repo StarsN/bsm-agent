@@ -19,20 +19,10 @@ from rich.console import Console
 import config
 import storage
 from scraper import SquareScraper
-from analyzer import extract_tokens_from_text, compute_short_scores, compute_composite_scores
+from analyzer import extract_tokens_from_text, compute_short_scores
 from filters import is_likely_human, post_passes_quality
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
 from signals import analyze as analyze_signals
-from trade_logic import evaluate_candidate
-
-
-def _loads(raw, default=None):
-    if not raw:
-        return default
-    try:
-        return json.loads(raw)
-    except Exception:
-        return default
 
 
 console = Console()
@@ -337,158 +327,8 @@ async def one_round(scraper: SquareScraper):
         console.print(f"   已更新 {updated} 个代币的合约快照"
                       + (" (全量)" if heavy_this_round else " (轻量)"))
 
-        # === 构建 Agent 候选币池（面板"合约扫描与操作建议"同源）===
-        try:
-            with storage.get_conn() as conn:
-                scored = compute_composite_scores(conn, short_scores,
-                                                  config.COMPOSITE_HISTORY_WINDOW)
-                watchlist_set = set(watchlist)
-                leaderboard = []
-                for s in scored:
-                    snap_row = storage.snapshot_get(conn, s["token"])
-                    if not snap_row:
-                        continue
-                    snap_data = _loads(snap_row.get("snapshot"), {})
-                    if not snap_data.get("mark_price"):
-                        continue
-                    rt_row = storage.realtime_get(conn, s["token"])
-                    realtime = _loads(rt_row.get("snapshot"), {}) if rt_row else {}
-                    market = {
-                        "snapshot": snap_data,
-                        "analysis": _loads(snap_row.get("analysis"), {}),
-                        "updated_at": snap_row.get("updated_at"),
-                    }
-                    verdict = market["analysis"].get("verdict", "")
-                    leaderboard.append((s, market, realtime, verdict))
-
-                VERDICT_ORDER = {
-                    "✅ 看起来健康": 0, "🎯 值得留意": 1, "⚠️ 过热预警": 2,
-                    "📉 信号偏弱": 3, "⚪ 中性": 4, "数据不足": 5,
-                }
-                leaderboard.sort(key=lambda x: (
-                    VERDICT_ORDER.get(x[3], 99),
-                    -(x[0].get("composite_score") or 0),
-                    -(x[0].get("score") or 0),
-                ))
-
-                signal_key = storage.leaderboard_signal_key(conn)
-                items = []
-                for rank, (score_row, market, realtime, _) in enumerate(leaderboard, 1):
-                    result = evaluate_candidate(score_row, rank, market, realtime)
-                    if not result.get("passed"):
-                        continue  # 只存 passed 的，与面板"合约扫描与操作建议"对齐
-                    snap = market["snapshot"]
-                    analysis = market.get("analysis") or {}
-                    data_blob = {
-                        "token": score_row["token"],
-                        "social_score": score_row.get("score", 0),
-                        "mentions": score_row.get("mentions", 0),
-                        "price": snap.get("mark_price"),
-                        "15m": snap.get("change_15m_pct"),
-                        "1h": snap.get("change_1h_pct"),
-                        "4h": snap.get("change_4h_pct"),
-                        "24h": snap.get("change_24h_pct"),
-                        "oi_15m": snap.get("oi_change_15m_pct"),
-                        "oi_1h": snap.get("oi_change_1h_pct"),
-                        "oi_4h": snap.get("oi_change_4h_pct"),
-                        "oi_48h": snap.get("oi_change_48h_pct"),
-                        "funding": snap.get("funding_rate_pct"),
-                        "lsr": snap.get("long_short_ratio"),
-                        "top_lsr": snap.get("top_trader_ls_ratio"),
-                        "taker": snap.get("taker_buy_sell_ratio"),
-                        "taker_pct": snap.get("taker_buy_pct"),
-                        "taker_trend": snap.get("taker_trend_pct"),
-                        "spread": snap.get("bid_ask_spread_pct"),
-                        "depth_bid": snap.get("depth_bid_1pct_usd"),
-                        "depth_ask": snap.get("depth_ask_1pct_usd"),
-                        "imbalance": snap.get("depth_imbalance_pct"),
-                        "vol_24h": snap.get("volume_24h_usd"),
-                        "oi_usd": snap.get("oi_usd"),
-                        "chg_48h": snap.get("change_48h_pct"),
-                        "oi_divergence": analysis.get("oi_divergence"),
-                        "verdict": analysis.get("verdict"),
-                        "direction": analysis.get("direction"),
-                        "tags": analysis.get("tags", []),
-                        "notes": analysis.get("notes", []),
-                        "age": (
-                            None if not snap.get("klines_15m_count") else
-                            ">1d" if snap["klines_15m_count"] >= 96 else
-                            f"{snap['klines_15m_count'] * 15 // 60 // 24}d"
-                            f"{snap['klines_15m_count'] * 15 // 60 % 24}h"
-                        ),
-                        "realtime": realtime,
-                        "tier": result["tier"],
-                        "passed": result["passed"],
-                        "hard_block": result["hard_block"],
-                        "pass_count": result["pass_count"],
-                        "suggestion": result["suggestion"],
-                        "reasons": result["reasons"],
-                    }
-                    items.append({
-                        "token": score_row["token"],
-                        "data": json.dumps(data_blob, default=str, ensure_ascii=False),
-                        "tier": result["tier"],
-                        "passed": 1 if result["passed"] else 0,
-                        "hard_blocks": json.dumps(result["hard_block"], ensure_ascii=False),
-                        "pass_count": result["pass_count"],
-                        "signal_key": signal_key,
-                    })
-
-                storage.agent_candidates_insert_batch(conn, _ROUND_NUMBER, items)
-                console.print(f"   候选币池已入库: {len(items)} 个")
-
-            # 清理旧数据
-            if _ROUND_NUMBER % 20 == 0:
-                with storage.get_conn() as conn:
-                    storage.agent_candidates_purge_old(conn, keep_last_rounds=20)
-        except Exception as e:
-            console.print(f"   [yellow]候选币池构建失败: {e}[/yellow]")
-
     elapsed = time.time() - round_start
     console.print(f"[green]本轮 #{_ROUND_NUMBER} 总耗时 {elapsed:.0f}s[/green]\n")
-
-    # 触发 Agent 交易决策（有候选币数据才触发，间隔从 DB 设置读取）
-    if getattr(config, "AGENT_AUTO_TRIGGER", False):
-        agent_interval = getattr(config, "AGENT_TRIGGER_INTERVAL", 3)
-        candidate_count = 0
-        try:
-            with storage.get_conn() as conn:
-                settings = storage.trading_settings_get(conn)
-                agent_interval = int(settings.get("agent_trigger_interval", agent_interval))
-            if _ROUND_NUMBER % agent_interval != 0:
-                candidate_count = -1  # 未到触发轮次
-        except Exception:
-            pass
-        if candidate_count == -1:
-            pass  # 未到轮次，不触发
-        elif candidate_count == 0:
-            # 到轮次但需检查是否有候选数据
-            try:
-                with storage.get_conn() as conn:
-                    lookback = agent_interval - 1
-                    row = conn.execute(
-                        "SELECT COUNT(*) AS cnt FROM agent_candidates a "
-                        "INNER JOIN ("
-                        "  SELECT token, MAX(id) AS max_id FROM agent_candidates "
-                        f"  WHERE round_number >= (SELECT COALESCE(MAX(round_number), 0) - {lookback} FROM agent_candidates) "
-                        "  AND passed = 1"
-                        "  GROUP BY token"
-                        ") b ON a.id = b.max_id"
-                    ).fetchone()
-                    candidate_count = row["cnt"] if row else 0
-            except Exception:
-                pass
-        if candidate_count is not None and candidate_count > 0:
-            try:
-                import subprocess
-                job_id = getattr(config, "AGENT_HERMES_JOB_ID", "")
-                subprocess.run(
-                    ["hermes", "cron", "run", job_id],
-                    timeout=300, capture_output=True, text=True,
-                )
-                console.print(f"[dim]已触发 Agent (round {_ROUND_NUMBER}, {candidate_count} 个候选)[/dim]")
-            except Exception as e:
-                console.print(f"[dim]Agent 触发失败: {e}[/dim]")
 
     _write_status(
         stage="idle",

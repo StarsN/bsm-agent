@@ -59,8 +59,6 @@ FIELD_CN = {
     "top_lsr": "大户多空比",
     "social_score": "社交热度分",
     "mentions": "提及次数",
-    "verdict": "信号判定",
-    "direction": "走向",
     "tags": "信号标签",
     "notes": "分析备注",
     "oi_divergence": "OI背离",

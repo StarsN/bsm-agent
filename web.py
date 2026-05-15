@@ -4,6 +4,7 @@ Web 仪表盘服务
 访问：http://localhost:8000
 """
 import json
+import subprocess
 import time
 import threading
 from datetime import datetime, timezone
@@ -58,6 +59,125 @@ def _cache_invalidate(*keys):
                 _cache.pop(k, None)
 
 
+# === Agent 候选币收集器 ===
+# 后台线程每 3 秒复现面板"合约扫描与操作建议"，
+# 累计后每隔指定分钟入库 agent_candidates 并触发 Agent。
+_collected = {}          # token → {token, data, tier, passed, ...}
+_last_flush = time.time()
+_flush_lock = threading.Lock()
+
+
+def _build_data_blob(candidate: dict) -> dict:
+    """组装与 extract 脚本同格式的候选币 data JSON"""
+    snap = candidate["market"]["snapshot"]
+    analysis = candidate["market"].get("analysis") or {}
+    score_row = candidate["score"]
+    return {
+        "token": candidate["token"], "social_score": score_row.get("score", 0),
+        "mentions": score_row.get("mentions", 0),
+        "price": snap.get("mark_price"), "15m": snap.get("change_15m_pct"),
+        "1h": snap.get("change_1h_pct"), "4h": snap.get("change_4h_pct"),
+        "24h": snap.get("change_24h_pct"), "oi_15m": snap.get("oi_change_15m_pct"),
+        "oi_1h": snap.get("oi_change_1h_pct"), "oi_4h": snap.get("oi_change_4h_pct"),
+        "oi_48h": snap.get("oi_change_48h_pct"), "funding": snap.get("funding_rate_pct"),
+        "lsr": snap.get("long_short_ratio"), "top_lsr": snap.get("top_trader_ls_ratio"),
+        "taker": snap.get("taker_buy_sell_ratio"), "taker_pct": snap.get("taker_buy_pct"),
+        "taker_trend": snap.get("taker_trend_pct"),
+        "spread": snap.get("bid_ask_spread_pct"),
+        "depth_bid": snap.get("depth_bid_1pct_usd"),
+        "depth_ask": snap.get("depth_ask_1pct_usd"),
+        "imbalance": snap.get("depth_imbalance_pct"),
+        "vol_24h": snap.get("volume_24h_usd"), "oi_usd": snap.get("oi_usd"),
+        "chg_48h": snap.get("change_48h_pct"),
+        "oi_divergence": analysis.get("oi_divergence"),
+        "verdict": analysis.get("verdict"), "direction": analysis.get("direction"),
+        "tags": analysis.get("tags", []), "notes": analysis.get("notes", []),
+        "age": (None if not snap.get("klines_15m_count") else
+                ">1d" if snap["klines_15m_count"] >= 96 else
+                f"{snap['klines_15m_count'] * 15 // 60 // 24}d"
+                f"{snap['klines_15m_count'] * 15 // 60 % 24}h"),
+        "tier": candidate["tier"], "passed": candidate["passed"],
+        "hard_block": candidate["hard_block"],
+        "pass_count": candidate["pass_count"],
+        "suggestion": candidate["suggestion"], "reasons": candidate["reasons"],
+    }
+
+
+def _scan_candidates():
+    with storage.get_conn() as conn:
+        items, skipped = _build_leaderboard_items(conn)
+        return trade_logic.build_trade_candidates_from_leaderboard(
+            conn, items, passed_only=True)
+
+
+def _collect_loop():
+    global _collected, _last_flush
+    interval_seconds = getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15) * 60
+    poll_seconds = getattr(config, "AGENT_COLLECT_POLL_SECONDS", 5)
+    cache_ttl = getattr(config, "AGENT_COLLECT_CACHE_TTL", 5)
+    _last_flush = time.time()  # 线程启动开始计时
+    _last_heartbeat = 0
+    print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库", flush=True)
+
+    while True:
+        try:
+            time.sleep(poll_seconds)
+            candidates = _cached("candidates_scan", cache_ttl, _scan_candidates)
+
+            for c in candidates:
+                _collected[c["token"]] = {
+                    "token": c["token"],
+                    "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
+                    "tier": c["tier"],
+                    "passed": 1 if c["passed"] else 0,
+                    "hard_blocks": json.dumps(c.get("hard_block", []), ensure_ascii=False),
+                    "pass_count": c.get("pass_count", 0),
+                    "signal_key": c.get("signal_key", ""),
+                }
+
+            now = time.time()
+            if now - _last_heartbeat >= 60:
+                _last_heartbeat = now
+                remaining = max(0, interval_seconds - (now - _last_flush))
+                print(f"[collect] 距下次入库约 {remaining/60:.0f} 分钟"
+                      f"（已收集 {len(_collected)} 个）", flush=True)
+
+            with _flush_lock:
+                if now - _last_flush >= interval_seconds and _collected:
+                    elapsed = now - _last_flush
+                    batch = list(_collected.values())
+
+                    with storage.get_conn() as conn:
+                        last_round = conn.execute(
+                            "SELECT COALESCE(MAX(round_number), 0) FROM token_heat_history"
+                        ).fetchone()[0]
+                        storage.agent_candidates_insert_batch(conn, last_round, batch)
+                        storage.agent_candidates_purge_old(conn, keep_last_rounds=50)
+
+                    _collected.clear()
+                    _last_flush = now
+
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    print(f"[collect] {ts} 入库 {len(batch)} 个候选"
+                          f"（距上次 {elapsed/60:.0f} 分钟），已触发 Agent", flush=True)
+                    job_id = getattr(config, "AGENT_HERMES_JOB_ID", "")
+                    if job_id:
+                        subprocess.run(
+                            ["hermes", "cron", "run", job_id],
+                            timeout=10, capture_output=True, text=True,
+                        )
+
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+
+# 启动 collector（模块加载时直接启，不用 FastAPI 事件）
+if getattr(config, "AGENT_AUTO_TRIGGER", False):
+    _collector_thread = threading.Thread(target=_collect_loop, daemon=True)
+    _collector_thread.start()
+
+
 class TokenBody(BaseModel):
     token: str
 
@@ -68,7 +188,6 @@ class TradingSettingsBody(BaseModel):
     initial_balance: float | None = None
     leverage: int | None = None
     order_amount: float | None = None
-    agent_trigger_interval: int | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -447,9 +566,7 @@ def api_trading():
         with storage.get_conn() as conn:
             account = trade_logic.account_summary(conn)
             positions = storage.trade_positions_all(conn, limit=10000)
-            leaderboard_items, _ = _build_leaderboard_items(conn)
-            candidates = trade_logic.build_trade_candidates_from_leaderboard(
-                conn, leaderboard_items, passed_only=True)
+            candidates = _cached("candidates_scan", getattr(config, "AGENT_COLLECT_CACHE_TTL", 5), _scan_candidates)
             loss_archive = storage.trade_loss_archive_stats(conn)
         return {
             "account": account,
@@ -463,7 +580,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_trigger_interval"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1082,14 +1199,6 @@ tr.flash { animation: row-flash 1.5s ease-out; }
     <div>
       <label>交易倍数</label>
       <input id="trade-leverage" type="number" min="1" max="125" step="1">
-    </div>
-    <div>
-      <label>Agent 交易频率</label>
-      <select id="trade-agent-interval">
-        <option value="1">每轮触发</option>
-        <option value="2">隔一轮触发</option>
-        <option value="3">隔两轮触发</option>
-      </select>
     </div>
   </div>
   <div style="text-align:center;margin-bottom:12px">
@@ -1713,7 +1822,6 @@ function renderTradingPanel(data) {
     document.getElementById('trade-mode').value = settings.mode || 'paper';
     document.getElementById('trade-initial').value = settings.initial_balance ?? '';
     document.getElementById('trade-leverage').value = settings.leverage ?? '';
-    document.getElementById('trade-agent-interval').value = settings.agent_trigger_interval ?? 3;
   }
 
   document.getElementById('trade-summary').innerHTML = `
@@ -1879,7 +1987,6 @@ async function saveTradingSettings() {
     mode: document.getElementById('trade-mode').value,
     initial_balance: Number(document.getElementById('trade-initial').value),
     leverage: Number(document.getElementById('trade-leverage').value),
-    agent_trigger_interval: Number(document.getElementById('trade-agent-interval').value),
   };
   try {
     const resp = await fetch('/api/trading/settings', {
@@ -2035,7 +2142,7 @@ async function pollWatchlistRealtime() {
 
 refreshAll({ silent: true });
 pollWorkerStatus();
-setInterval(pollWatchlistRealtime, 1000);
+setInterval(pollWatchlistRealtime, 5000);
 setInterval(loadTradingPanel, 3000);
 setInterval(() => refreshAll(), 30000);
 setInterval(pollWorkerStatus, 2000);  // worker 状态高频刷新

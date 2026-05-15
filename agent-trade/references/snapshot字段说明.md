@@ -52,8 +52,6 @@ vol_24h     — 24小时成交额（USDT）
 ## 分析结果
 
 ```
-verdict     — 信号判定（✅看起来健康 / 🎯值得留意 / ⚠️过热预警 / 📉信号偏弱 / ⚪中性 / 数据不足）
-direction   — 走向（↑偏多 / ↓偏空 / 震荡 / 不明）
 tags        — 信号标签列表（如 ["funding:极高", "taker:买盘强"]）
 notes       — 人类可读解读
 oi_divergence — OI背离检测 {type, direction, oi_pct, price_pct, note} 或 None

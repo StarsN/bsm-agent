@@ -138,8 +138,6 @@ def _build_close_snap(close_price: float, snap: dict, analysis: dict) -> str:
     result = {"平仓价": close_price}
     for en_key, cn_key in _CLOSE_SNAP_MAP:
         result[cn_key] = snap.get(en_key)
-    result["信号判定"] = analysis.get("verdict")
-    result["走向"] = analysis.get("direction")
     result["信号标签"] = analysis.get("tags", [])
     result["分析备注"] = analysis.get("notes", [])
     result["OI背离"] = analysis.get("oi_divergence")
