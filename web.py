@@ -5,6 +5,7 @@ Web 仪表盘服务
 """
 import json
 import subprocess
+import sys
 import time
 import threading
 from datetime import datetime, timezone
@@ -148,8 +149,19 @@ def _collect_loop():
             now = time.time()
             if now - _last_heartbeat >= 60:
                 _last_heartbeat = now
-                # 即时生效：从 DB 重新读取间隔
-                new_interval = _read_interval() * 60
+                # 即时生效：从 DB 重读数据源和间隔（一次 DB 读）
+                try:
+                    with storage.get_conn() as conn:
+                        ts = storage.trading_settings_get(conn)
+                    ds = ts.get("agent_data_source", "agent_candidates")
+                    if ds != "agent_candidates":
+                        print("[collect] 数据源已切换，collector 自动退出", flush=True)
+                        break
+                    new_interval = int(ts.get("agent_collect_interval_minutes",
+                               getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
+                    new_interval *= 60
+                except Exception:
+                    new_interval = _read_interval() * 60
                 if new_interval != interval_seconds:
                     print(f"[collect] 间隔变更: {interval_seconds//60} → {new_interval//60} 分钟", flush=True)
                     interval_seconds = new_interval
@@ -187,8 +199,15 @@ def _collect_loop():
             traceback.print_exc()
 
 
-# 启动 collector（模块加载时直接启，不用 FastAPI 事件）
-if getattr(config, "AGENT_AUTO_TRIGGER", False):
+# 启动 collector（从 DB 读数据源，fallback config）
+_data_source = getattr(config, "AGENT_DATA_SOURCE", "agent_candidates")
+try:
+    with storage.get_conn() as conn:
+        ts = storage.trading_settings_get(conn)
+    _data_source = ts.get("agent_data_source", _data_source)
+except Exception:
+    pass
+if _data_source == "agent_candidates":
     _collector_thread = threading.Thread(target=_collect_loop, daemon=True)
     _collector_thread.start()
 
@@ -204,6 +223,8 @@ class TradingSettingsBody(BaseModel):
     leverage: int | None = None
     order_amount: float | None = None
     agent_collect_interval_minutes: int | None = None
+    agent_trigger_interval: int | None = None
+    agent_data_source: str | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -596,7 +617,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -632,6 +653,17 @@ def api_trading_reset(body: TradingResetBody):
         result = storage.trade_reset_all(conn, body.new_initial_balance)
     _cache_invalidate()  # 全清，立即看到空状态
     return {"ok": True, **result}
+
+
+@app.post("/api/system/restart")
+def api_system_restart():
+    """重启所有进程（kill -9 + 等 60s + start）"""
+    manage = Path(__file__).resolve().parent / "manage_processes.py"
+    subprocess.Popen(
+        [sys.executable, str(manage), "restart", "--no-browser"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return {"ok": True, "msg": "系统将在 3 分钟后自动重启"}
 
 
 # === Agent 监控 API ===
@@ -857,6 +889,7 @@ HTML = """
 <head>
 <meta charset="UTF-8">
 <title>Binance Square Monitor</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #0f1419;
@@ -864,22 +897,25 @@ HTML = """
   --border: #2a3142;
   --text: #e6e8eb;
   --muted: #8b92a5;
-  --accent: #f0b90b;
-  --green: #52c41a;
-  --red: #ff4d4f;
-  --yellow: #faad14;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
 }
 * { box-sizing: border-box; }
 body {
   margin: 0; padding: 20px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-family: 'JetBrains Mono', 'Inter', -apple-system, BlinkMacSystemFont, "Microsoft YaHei", monospace;
   background: var(--bg); color: var(--text);
 }
 h1, h2 { margin: 0 0 12px; }
 h1 { font-size: 22px; color: var(--accent); }
 h2 { font-size: 16px; color: var(--accent); margin-top: 24px; }
 .updated { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
-.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+input, select { border-radius: 8px; }
+button { border-radius: 8px; }
+table { border-radius: 8px; overflow: hidden; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 6px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 td { padding: 5px 6px; border-bottom: 1px solid #222836; }
@@ -915,7 +951,7 @@ tr:hover { background: #1f2536; }
 .notes { font-size: 12px; color: var(--muted); margin-top: 6px; padding-left: 16px; }
 .notes li { margin-bottom: 3px; }
 .disclaimer {
-  background: #3a1f1f; border: 1px solid #5a2f2f; color: #ffb4b4;
+  background: #1f2335; border: 1px solid #30363d; color: #8b949e;
   padding: 10px 14px; border-radius: 6px; font-size: 12px; margin-bottom: 16px;
 }
 .empty { color: var(--muted); font-style: italic; padding: 20px; text-align: center; }
@@ -926,7 +962,7 @@ tr:hover { background: #1f2536; }
 .refresh-btn:hover { opacity: 0.85; }
 .refresh-btn:disabled { opacity: 0.5; cursor: wait; }
 .refresh-btn.danger-btn {
-  background: #c0392b; color: #fff;
+  background: #da3633; color: #fff;
 }
 .refresh-btn.danger-btn:hover { background: #e74c3c; }
 
@@ -1000,7 +1036,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 }
 .worker-stage-badge.scraping { background: #1e3a5f; color: #7eb3ff; }
 .worker-stage-badge.saving   { background: #3a5f1e; color: #9eff7e; }
-.worker-stage-badge.market   { background: #5f1e3a; color: #ff7eb3; }
+.worker-stage-badge.market   { background: #1e3a5f; color: #79c0ff; }
 .worker-stage-badge.idle     { background: #2a3142; color: var(--muted); }
 .worker-detail { color: var(--text); font-size: 13px; margin-bottom: 8px; }
 .worker-progress {
@@ -1048,7 +1084,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 /* 归档徽章 */
 .archived-badge {
   display: inline-block; margin-left: 6px;
-  background: #5a1f1f; color: #ffb4b4;
+  background: #1f2335; color: #8b949e;
   padding: 1px 6px; border-radius: 3px; font-size: 10px;
 }
 .watch-info { display: flex; gap: 20px; flex-wrap: wrap; font-size: 12px; }
@@ -1147,7 +1183,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 .open-btn:hover { opacity: 0.8; }
 .open-btn:disabled { background: #2a3142; color: var(--muted); cursor: not-allowed; }
 .close-btn {
-  background: #c0392b; color: #fff; border: none;
+  background: #da3633; color: #fff; border: none;
   padding: 2px 8px; border-radius: 3px; cursor: pointer;
   font-size: 11px; font-weight: 500; margin-left: 6px;
 }
@@ -1161,6 +1197,16 @@ tr.flash { animation: row-flash 1.5s ease-out; }
   vertical-align: middle;
   cursor: default;
 }
+.nav-bar {
+  display: flex; justify-content: center; gap: 0; margin-bottom: 16px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.nav-bar a {
+  padding: 10px 28px; color: var(--muted); text-decoration: none;
+  font-size: 14px; font-weight: 500; border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -1168,16 +1214,16 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 <div class="progress-bar" id="progress-bar"><div class="fill" id="progress-fill" style="width:0%"></div></div>
 <div class="toast" id="toast"></div>
 
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/agent">🤖 Agent 面板</a>
+  <a href="/settings">⚙ 系统设置</a>
+</div>
+
 <div style="display:flex;align-items:center;gap:16px;margin-bottom:4px;">
 <h1 style="margin:0">🔥 币安广场热度监控</h1>
-<a href="/agent" style="font-size:13px;color:var(--accent);text-decoration:none;padding:4px 12px;border:1px solid var(--border);border-radius:4px;">Agent 监控 →</a>
 </div>
 <div class="updated" id="updated">加载中...</div>
-
-<div class="disclaimer">
-⚠ 本页所有数据和标签仅为客观数据呈现，<strong>不是投资建议</strong>。综合分高 ≠ 一定上涨，
-市场永远可能反向走，加密货币合约是高风险产品，请独立判断并谨慎决策。
-</div>
 
 <div class="worker-panel" id="worker-panel">
   <div class="worker-header">
@@ -1192,40 +1238,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 </div>
 
 <div class="panel">
-  <h2 style="margin-top:0">自动交易面板</h2>
-  <div class="trade-controls">
-    <div>
-      <label>自动交易</label>
-      <select id="trade-enabled">
-        <option value="false">关闭</option>
-        <option value="true">开启</option>
-      </select>
-    </div>
-    <div>
-      <label>模式</label>
-      <select id="trade-mode">
-        <option value="paper">模拟</option>
-        <option value="live">实盘（暂未启用）</option>
-      </select>
-    </div>
-    <div>
-      <label>账户初始金额 USDT</label>
-      <input id="trade-initial" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>交易倍数</label>
-      <input id="trade-leverage" type="number" min="1" max="125" step="1">
-    </div>
-    <div>
-      <label>Agent 收集间隔（分钟）</label>
-      <input id="trade-collect-interval" type="number" min="5" max="60" step="1">
-    </div>
-  </div>
-  <div style="text-align:center;margin-bottom:12px">
-    <button class="refresh-btn" onclick="saveTradingSettings()">保存交易设置</button>
-    <button class="refresh-btn danger-btn" onclick="resetTradingAccount()"
-            title="清空所有持仓和历史记录，把账户恢复到初始金额" style="margin-left:8px">重置账户</button>
-  </div>
+  <h2 style="margin-top:0">账户概览</h2>
   <div class="trade-summary" id="trade-summary"></div>
   <div class="trade-position-grid">
     <div class="trade-window" style="overflow-x:auto">
@@ -1834,16 +1847,6 @@ const fmtUsdGlobal = (v) => {
 
 function renderTradingPanel(data) {
   const acc = data.account || {};
-  const settings = acc.settings || {};
-  const active = document.activeElement;
-  const editingSettings = active && active.closest && active.closest('.trade-controls');
-  if (!editingSettings) {
-    document.getElementById('trade-enabled').value = settings.enabled ? 'true' : 'false';
-    document.getElementById('trade-mode').value = settings.mode || 'paper';
-    document.getElementById('trade-initial').value = settings.initial_balance ?? '';
-    document.getElementById('trade-leverage').value = settings.leverage ?? '';
-    document.getElementById('trade-collect-interval').value = settings.agent_collect_interval_minutes ?? 15;
-  }
 
   document.getElementById('trade-summary').innerHTML = `
     <div class="metric"><div class="label">初始金额</div><div class="value">${fmtUsdGlobal(acc.initial_balance)}</div></div>
@@ -2002,6 +2005,24 @@ async function loadTradingPanel() {
   }
 }
 
+function toggleDataSourceOpts() {
+  const src = document.getElementById('trade-data-source').value;
+  document.getElementById('ds-opt-candidates').style.display = src === 'agent_candidates' ? '' : 'none';
+  document.getElementById('ds-opt-heat').style.display = src === 'token_heat_history' ? '' : 'none';
+}
+
+async function restartSystem() {
+  if (!confirm('确定要重启系统吗？\\n\\n所有进程将被强制终止（kill -9），等待 3 分钟后自动重启。\\n\\n重启期间约 4 分钟不可用。')) return;
+  try {
+    showToast('正在重启系统...', 'ok');
+    const resp = await fetch('/api/system/restart', {method:'POST'});
+    const d = await resp.json();
+    showToast(d.msg || '已触发重启', 'ok');
+  } catch(e) {
+    showToast('重启指令发送失败，请手动重启', 'err');
+  }
+}
+
 async function saveTradingSettings() {
   const body = {
     enabled: document.getElementById('trade-enabled').value === 'true',
@@ -2009,6 +2030,8 @@ async function saveTradingSettings() {
     initial_balance: Number(document.getElementById('trade-initial').value),
     leverage: Number(document.getElementById('trade-leverage').value),
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
+    agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
+    agent_data_source: document.getElementById('trade-data-source').value,
   };
   try {
     const resp = await fetch('/api/trading/settings', {
@@ -2180,22 +2203,32 @@ AGENT_HTML = """
 <head>
 <meta charset="UTF-8">
 <title>Agent 监控面板</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #0f1419; --panel: #1a1f2e; --border: #2a3142;
-  --text: #e6e8eb; --muted: #8b92a5; --accent: #f0b90b;
-  --green: #52c41a; --red: #ff4d4f; --yellow: #faad14; --blue: #1890ff;
+  --text: #e6e8eb; --muted: #8b92a5; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #1890ff;
 }
 * { box-sizing: border-box; }
 body {
   margin: 0; padding: 16px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-family: 'JetBrains Mono', 'Inter', -apple-system, BlinkMacSystemFont, "Microsoft YaHei", monospace;
   background: var(--bg); color: var(--text); font-size: 13px;
 }
 h1 { font-size: 20px; color: var(--accent); margin: 0 0 4px; }
 h2 { font-size: 14px; color: var(--accent); margin: 0 0 10px; }
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .header-time { color: var(--muted); font-size: 12px; }
+.nav-bar-agent {
+  display: flex; justify-content: center; gap: 0; margin-bottom: 16px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.nav-bar-agent a {
+  padding: 10px 24px; color: var(--muted); text-decoration: none;
+  font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
+}
+.nav-bar-agent a.active, .nav-bar-agent a:hover { color: var(--accent); border-bottom-color: var(--accent); }
 .nav-link { color: var(--accent); text-decoration: none; font-size: 12px; }
 .nav-link:hover { text-decoration: underline; }
 
@@ -2207,7 +2240,7 @@ h2 { font-size: 14px; color: var(--accent); margin: 0 0 10px; }
 }
 
 /* 面板 */
-.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
 .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .stat { padding: 8px; background: #222836; border-radius: 6px; }
 .stat-label { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
@@ -2282,12 +2315,18 @@ tr:hover { background: #1f2536; }
 </head>
 <body>
 
+<div class="nav-bar-agent">
+  <a href="/">📊 市场监控</a>
+  <a href="/agent" class="active">🤖 Agent 面板</a>
+  <a href="/settings">⚙ 系统设置</a>
+</div>
+
 <div class="header">
   <div>
     <h1>Agent 监控面板</h1>
     <span class="header-time" id="clock"></span>
   </div>
-  <a href="/" class="nav-link">市场监控 →</a>
+</div>
 </div>
 
 
@@ -2725,6 +2764,209 @@ setInterval(loadPositions, 5000);
 </body>
 </html>
 """
+
+SETTINGS_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>系统设置 - BSM Agent</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
+  --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
+  --danger: #da3633;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Inter',-apple-system,BlinkMacSystemFont,sans-serif; padding: 20px; max-width: 700px; margin: 0 auto; }
+h1 { font-size: 20px; margin-bottom: 20px; }
+h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px; }
+input, select { width: 100%; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 14px; margin-bottom: 14px; }
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.btn { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
+.btn-save { background: var(--accent); color: #000; width: 100%; }
+.btn-danger { background: var(--danger); color: #fff; }
+.btn-warn { background: #da3633; color: #fff; }
+.btn-row { display: flex; gap: 10px; margin-top: 16px; justify-content: center; flex-wrap: wrap; }
+.toast { position: fixed; top: 20px; right: 20px; padding: 10px 18px; border-radius: 6px; color: #fff; font-size: 13px; z-index: 999; opacity: 0; transition: opacity 0.3s; }
+.toast.show { opacity: 1; }
+.toast.ok { background: var(--green); }
+.toast.err { background: var(--red); }
+.nav-bar {
+  display: flex; justify-content: center; gap: 0; margin-bottom: 20px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.nav-bar a {
+  padding: 10px 28px; color: var(--muted); text-decoration: none;
+  font-size: 14px; font-weight: 500; border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/agent">🤖 Agent 面板</a>
+  <a href="/settings" class="active">⚙ 系统设置</a>
+</div>
+
+<h1>⚙ 系统设置</h1>
+
+<div class="panel">
+  <h2>交易参数</h2>
+  <div class="grid2">
+    <div>
+      <label>自动交易</label>
+      <select id="trade-enabled">
+        <option value="false">关闭</option>
+        <option value="true">开启</option>
+      </select>
+    </div>
+    <div>
+      <label>模式</label>
+      <select id="trade-mode">
+        <option value="paper">模拟</option>
+        <option value="live">实盘（暂未启用）</option>
+      </select>
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>账户初始金额 USDT</label>
+      <input id="trade-initial" type="number" min="1" step="1">
+    </div>
+    <div>
+      <label>交易倍数</label>
+      <input id="trade-leverage" type="number" min="1" max="125" step="1">
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Agent 参数</h2>
+  <div class="grid2">
+    <div>
+      <label>数据源</label>
+      <select id="trade-data-source" onchange="toggleDataSourceOpts()">
+        <option value="agent_candidates">面板收集器</option>
+        <option value="token_heat_history">热度榜轮次</option>
+      </select>
+    </div>
+    <div id="ds-opt-candidates">
+      <label>收集间隔（分钟）</label>
+      <input id="trade-collect-interval" type="number" min="5" max="60" step="1">
+    </div>
+    <div id="ds-opt-heat" style="display:none">
+      <label>触发间隔（轮）</label>
+      <input id="trade-trigger-interval" type="number" min="1" max="10" step="1">
+    </div>
+  </div>
+</div>
+
+<div class="btn-row">
+  <button class="btn btn-save" onclick="saveTradingSettings()">保存设置</button>
+</div>
+
+<div class="panel" style="margin-top:16px">
+  <h2>操作</h2>
+  <div class="btn-row">
+    <button class="btn btn-danger" onclick="resetTradingAccount()">重置账户</button>
+    <button class="btn btn-warn" onclick="restartSystem()">重启系统</button>
+  </div>
+  <div style="color:var(--muted);font-size:11px;margin-top:12px;text-align:center;line-height:1.5">
+    重置账户：清空持仓、决策、候选池，保留教训和日志<br>
+    重启系统：强制终止所有进程，等 3 分钟后自动重启<br>
+    切换数据源后需点击重启生效
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const escHtml = s => s != null ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : '';
+function showToast(msg, kind = 'ok', d = 2500) {
+  const el = document.getElementById('toast');
+  el.className = 'toast ' + kind; el.textContent = msg;
+  requestAnimationFrame(() => el.classList.add('show'));
+  clearTimeout(el._t); el._t = setTimeout(() => el.classList.remove('show'), d);
+}
+function toggleDataSourceOpts() {
+  const src = document.getElementById('trade-data-source').value;
+  document.getElementById('ds-opt-candidates').style.display = src === 'agent_candidates' ? '' : 'none';
+  document.getElementById('ds-opt-heat').style.display = src === 'token_heat_history' ? '' : 'none';
+}
+async function loadSettings() {
+  try {
+    const r = await fetch('/api/trading');
+    const d = await r.json();
+    const s = d.account.settings || {};
+    document.getElementById('trade-enabled').value = s.enabled ? 'true' : 'false';
+    document.getElementById('trade-mode').value = s.mode || 'paper';
+    document.getElementById('trade-initial').value = s.initial_balance ?? '';
+    document.getElementById('trade-leverage').value = s.leverage ?? '';
+    document.getElementById('trade-data-source').value = s.agent_data_source ?? 'agent_candidates';
+    document.getElementById('trade-collect-interval').value = s.agent_collect_interval_minutes ?? 15;
+    document.getElementById('trade-trigger-interval').value = s.agent_trigger_interval ?? 3;
+    toggleDataSourceOpts();
+  } catch(e) { console.error(e); }
+}
+async function saveTradingSettings() {
+  const body = {
+    enabled: document.getElementById('trade-enabled').value === 'true',
+    mode: document.getElementById('trade-mode').value,
+    initial_balance: Number(document.getElementById('trade-initial').value),
+    leverage: Number(document.getElementById('trade-leverage').value),
+    agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
+    agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
+    agent_data_source: document.getElementById('trade-data-source').value,
+  };
+  try {
+    const resp = await fetch('/api/trading/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!resp.ok) { const err = await resp.text(); throw new Error(err); }
+    showToast('设置已保存', 'ok');
+  } catch(e) { showToast('保存失败：'+e.message, 'err'); }
+}
+async function resetTradingAccount() {
+  if (!confirm('确定要重置账户吗？\\n\\n将清空所有持仓和历史记录，保留教训和操作日志。')) return;
+  const cur = document.getElementById('trade-initial').value || 1000;
+  const input = prompt('请输入重置后的账户初始金额 USDT (回车保持 '+cur+'):', cur);
+  if (input === null) return;
+  const v = parseFloat(input);
+  if (!v || v <= 0) { showToast('金额必须为正数', 'err'); return; }
+  try {
+    const resp = await fetch('/api/trading/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true, new_initial_balance:v})});
+    if (!resp.ok) { const err = await resp.text(); throw new Error(err); }
+    document.getElementById('trade-initial').value = v;
+    showToast('账户已重置', 'ok');
+  } catch(e) { showToast('重置失败：'+e.message, 'err'); }
+}
+async function restartSystem() {
+  if (!confirm('确定要重启系统吗？\\n\\n所有进程将被强制终止，等待 60 秒后自动重启。\\n\\n重启期间约 90 秒不可用。')) return;
+  try {
+    showToast('正在重启...', 'ok');
+    const resp = await fetch('/api/system/restart', {method:'POST'});
+    const d = await resp.json();
+    showToast(d.msg || '已触发重启', 'ok');
+  } catch(e) { showToast('重启指令发送失败', 'err'); }
+}
+loadSettings();
+</script>
+</body>
+</html>
+"""
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page():
+    return HTMLResponse(
+        content=SETTINGS_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
 
 
 @app.get("/agent", response_class=HTMLResponse)

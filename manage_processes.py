@@ -158,8 +158,43 @@ def status():
 
 
 def restart(open_browser: bool = True):
-    stop()
-    time.sleep(1)
+    """强制杀所有进程，等 3 分钟让端口释放，重启"""
+    state = _load_state()
+    for name, _script in reversed(PROGRAMS):
+        info = state.get(name) or {}
+        pid = info.get("pid")
+        if pid and _pid_running(int(pid)):
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                )
+            else:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except OSError:
+                    pass
+            print(f"{name}: killed pid={pid}")
+    if PID_FILE.exists():
+        PID_FILE.unlink()
+    # 清理浏览器僵尸进程（Chromium/Chrome 残留）
+    zombie_names = ("chrome", "chromium", "chromedriver", "playwright")
+    for name in zombie_names:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", f"{name}.exe", "/T"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                )
+            else:
+                subprocess.run(
+                    ["pkill", "-9", "-f", name],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                )
+        except Exception:
+            pass
+    print("等待 3 分钟后重启...")
+    time.sleep(180)
     start(open_browser=open_browser)
 
 

@@ -777,6 +777,8 @@ def trading_settings_defaults() -> dict:
         "leverage": config.TRADING_LEVERAGE,
         "order_amount": config.TRADING_ORDER_AMOUNT,
         "agent_collect_interval_minutes": getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15),
+        "agent_trigger_interval": getattr(config, "AGENT_TRIGGER_INTERVAL", 3),
+        "agent_data_source": getattr(config, "AGENT_DATA_SOURCE", "agent_candidates"),
     }
 
 
@@ -799,7 +801,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source"}
     rows = []
     for key, value in fields.items():
         if key in allowed:

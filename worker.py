@@ -327,6 +327,32 @@ async def one_round(scraper: SquareScraper):
         console.print(f"   已更新 {updated} 个代币的合约快照"
                       + (" (全量)" if heavy_this_round else " (轻量)"))
 
+    # Agent 触发（页面 DB 配置即时生效）
+    try:
+        with storage.get_conn() as conn:
+            ts = storage.trading_settings_get(conn)
+        data_source = ts.get("agent_data_source",
+                          getattr(config, "AGENT_DATA_SOURCE", "agent_candidates"))
+        trigger_interval = int(ts.get("agent_trigger_interval",
+                               getattr(config, "AGENT_TRIGGER_INTERVAL", 3)))
+    except Exception:
+        data_source = getattr(config, "AGENT_DATA_SOURCE", "agent_candidates")
+        trigger_interval = getattr(config, "AGENT_TRIGGER_INTERVAL", 3)
+
+    if (data_source == "token_heat_history"
+            and _ROUND_NUMBER % trigger_interval == 0):
+        try:
+            import subprocess
+            job_id = getattr(config, "AGENT_HERMES_JOB_ID", "")
+            if job_id:
+                subprocess.run(
+                    ["hermes", "cron", "run", job_id],
+                    timeout=10, capture_output=True, text=True,
+                )
+                console.print(f"[dim]已触发 Agent (round {_ROUND_NUMBER})[/dim]")
+        except Exception as e:
+            console.print(f"[dim]Agent 触发失败: {e}[/dim]")
+
     elapsed = time.time() - round_start
     console.print(f"[green]本轮 #{_ROUND_NUMBER} 总耗时 {elapsed:.0f}s[/green]\n")
 

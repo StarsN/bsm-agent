@@ -145,37 +145,107 @@ if fng_data and fng_data.get("data"):
     except (TypeError, ValueError, KeyError, IndexError):
         pass
 
-# ---- 候选币（最近 interval+2 分钟内面板收集的全量数据，2min 缓冲防漏）----
-inter_min = 15
+data_source = "agent_candidates"
 try:
     ts = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM trading_settings").fetchall()}
-    inter_min = int(ts.get("agent_collect_interval_minutes", getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
+    data_source = ts.get("agent_data_source", getattr(config, "AGENT_DATA_SOURCE", "agent_candidates"))
 except Exception:
-    pass
-ac_rows = conn.execute(
-    "SELECT a.data FROM agent_candidates a "
-    "INNER JOIN ("
-    "  SELECT token, MAX(id) AS max_id FROM agent_candidates "
-    f"  WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
-    "  GROUP BY token"
-    ") b ON a.id = b.max_id "
-    "ORDER BY a.id"
-).fetchall()
+    data_source = getattr(config, "AGENT_DATA_SOURCE", "agent_candidates")
 
-candidates = []
-for r in ac_rows:
-    try:
-        d = json.loads(r["data"])
-        # 去掉系统内部字段，Agent 只看原始市场数据
-        for k in ("realtime", "tier", "passed", "hard_block", "pass_count", "suggestion", "reasons", "verdict", "direction"):
-            d.pop(k, None)
-        candidates.append(d)
-    except (json.JSONDecodeError, TypeError):
-        pass
-
+# 旧路径需要的轮次（新路径也用于 latest_round 输出字段）
 latest_round = conn.execute(
     "SELECT COALESCE(MAX(round_number), 0) FROM token_heat_history"
 ).fetchone()[0] or 0
+
+if data_source == "token_heat_history":
+    # ---- 旧逻辑：token_heat_history + market_snapshots 联表，最近一轮 TOP30 ----
+
+    rows = [dict(r) for r in conn.execute(
+        "SELECT token, score, mentions, unique_posts FROM token_heat_history "
+        "WHERE round_number = ? ORDER BY score DESC",
+        (latest_round,)
+    )]
+    best_by_token = {}
+    for r in rows:
+        t = r["token"]
+        if t not in best_by_token or r["score"] > best_by_token[t]["score"]:
+            best_by_token[t] = r
+    candidates_raw = sorted(
+        best_by_token.values(), key=lambda x: x["score"], reverse=True
+    )[:30]
+
+    candidates = []
+    for h in candidates_raw:
+        snap = conn.execute(
+            "SELECT snapshot, analysis FROM market_snapshots WHERE token=?",
+            (h["token"],)
+        ).fetchone()
+        if snap:
+            s = json.loads(snap["snapshot"])
+            a = json.loads(snap["analysis"])
+            candidates.append({
+                "token": h["token"],
+                "social_score": h["score"],
+                "mentions": h["mentions"],
+                "price": s.get("mark_price"),
+                "15m": s.get("change_15m_pct"),
+                "1h": s.get("change_1h_pct"),
+                "4h": s.get("change_4h_pct"),
+                "24h": s.get("change_24h_pct"),
+                "oi_15m": s.get("oi_change_15m_pct"),
+                "oi_1h": s.get("oi_change_1h_pct"),
+                "oi_4h": s.get("oi_change_4h_pct"),
+                "oi_48h": s.get("oi_change_48h_pct"),
+                "funding": s.get("funding_rate_pct"),
+                "lsr": s.get("long_short_ratio"),
+                "top_lsr": s.get("top_trader_ls_ratio"),
+                "taker": s.get("taker_buy_sell_ratio"),
+                "taker_pct": s.get("taker_buy_pct"),
+                "taker_trend": s.get("taker_trend_pct"),
+                "spread": s.get("bid_ask_spread_pct"),
+                "depth_bid": s.get("depth_bid_1pct_usd"),
+                "depth_ask": s.get("depth_ask_1pct_usd"),
+                "imbalance": s.get("depth_imbalance_pct"),
+                "vol_24h": s.get("volume_24h_usd"),
+                "oi_usd": s.get("oi_usd"),
+                "chg_48h": s.get("change_48h_pct"),
+                "oi_divergence": a.get("oi_divergence"),
+                "tags": a.get("tags", []),
+                "notes": a.get("notes", []),
+                "age": (
+                    None if not s.get("klines_15m_count") else
+                    ">1d" if s["klines_15m_count"] >= 96 else
+                    f"{s['klines_15m_count'] * 15 // 60 // 24}d"
+                    f"{s['klines_15m_count'] * 15 // 60 % 24}h"
+                ),
+            })
+else:
+    # ---- 新逻辑：agent_candidates 时间窗口 ----
+    inter_min = 15
+    try:
+        ts = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM trading_settings").fetchall()}
+        inter_min = int(ts.get("agent_collect_interval_minutes", getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
+    except Exception:
+        pass
+    ac_rows = conn.execute(
+        "SELECT a.data FROM agent_candidates a "
+        "INNER JOIN ("
+        "  SELECT token, MAX(id) AS max_id FROM agent_candidates "
+        f"  WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
+        "  GROUP BY token"
+        ") b ON a.id = b.max_id "
+        "ORDER BY a.id"
+    ).fetchall()
+
+    candidates = []
+    for r in ac_rows:
+        try:
+            d = json.loads(r["data"])
+            for k in ("realtime", "tier", "passed", "hard_block", "pass_count", "suggestion", "reasons", "verdict", "direction"):
+                d.pop(k, None)
+            candidates.append(d)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
 # ---- 持仓（Agent 开的单）----
 positions = [dict(p) for p in conn.execute(
@@ -264,7 +334,7 @@ output = {
     "agent_lessons": agent_lessons,
     "today_journal": today_journal,
     "candidate_count": len(candidates),
-    "total_candidates": len(ac_rows),
+    "total_candidates": len(candidates_raw) if data_source == "token_heat_history" else len(ac_rows),
     "current_round": current_round,
     "latest_round": latest_round,
     "worker_stage": stage,
@@ -277,6 +347,7 @@ with open(args.output, "w", encoding="utf-8") as f:
     json.dump(output, f, default=str, ensure_ascii=False)
 
 print(f"数据已写入 {args.output}")
-print(f"  候选: {len(candidates)} 有快照 / {len(ac_rows)} 去重后")
+print(f"  候选: {len(candidates)} 有快照"
+      f" / {len(candidates_raw) if data_source == 'token_heat_history' else len(ac_rows)} 总行数")
 print(f"  持仓: {len(positions)} 个")
 print(f"  Worker: round={current_round} stage={stage}")
