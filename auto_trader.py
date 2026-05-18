@@ -45,8 +45,8 @@ def execute_open(conn, decision: dict, settings: dict) -> dict:
     token = decision["token"]
 
     # 防重复
-    if storage.trade_has_active(conn, token):
-        return {"ok": False, "reason": f"{token} 已有持仓"}
+    if storage.trade_has_active(conn, token, "agent"):
+        return {"ok": False, "reason": f"{token} Agent已有持仓"}
 
     # 合约过滤
     if not has_perpetual(token):
@@ -54,13 +54,13 @@ def execute_open(conn, decision: dict, settings: dict) -> dict:
 
     # signal_lock 防重
     signal_key = storage.leaderboard_signal_key(conn)
-    if not storage.trade_signal_lock_acquire(conn, token, signal_key):
+    if not storage.trade_signal_lock_acquire(conn, token, signal_key, "agent"):
         return {"ok": False, "reason": f"{token} signal_lock 已占用"}
 
     mode = settings.get("mode") or "paper"
 
     # 实盘模式用 exchange 余额覆盖账户权益
-    account = trade_logic._build_account_context(conn)
+    account = trade_logic._build_account_context(conn, "agent")
     if mode == "live":
         import exchange
         live_balance = exchange.get_balance()
@@ -199,6 +199,7 @@ def execute_open(conn, decision: dict, settings: dict) -> dict:
             "tp1": exchange_tp1_id,
             "tp2": exchange_tp2_id,
         }) if mode == "live" else None,
+        "strategy": "agent",
     }
 
     ok = storage.trade_position_insert(conn, position)
@@ -335,7 +336,7 @@ def execute_close(conn, decision: dict) -> dict:
 
 
 def one_scan():
-    """每2秒执行一次：读 Agent 决策 → 风控检查 → 执行"""
+    """每2秒执行一次：读 Agent 决策 + 系统自动开仓 → 风控检查 → 执行"""
     with storage.get_conn() as conn:
         settings = storage.trading_settings_get(conn)
 
@@ -397,13 +398,30 @@ def one_scan():
                     f"[yellow]✗ 拒绝: {dec['token']} — {result.get('reason', '')}[/yellow]"
                 )
 
-    return {"opened": executed, "enabled": True}
+    # 4. 策略 B：系统自动开仓（读榜单 passed 币直接开，signal_lock 防重复）
+    system_opened = 0
+    if getattr(config, "SYSTEM_AUTO_TRADE_ENABLED", True):
+        with storage.get_conn() as conn:
+            candidates = trade_logic.build_trade_candidates(
+                conn, limit=config.COMPOSITE_HEAT_TOP_N, passed_only=True)
+        for c in candidates:
+            if not c.get("has_active_position"):
+                with storage.get_conn() as conn:
+                    if trade_logic.open_paper_position(conn, c, settings, strategy="system"):
+                        system_opened += 1
+                        console.print(
+                            f"[green]系统开仓: {c['token']} tier={c.get('tier','?')} "
+                            f"price={c.get('price',0):.8g}[/green]"
+                        )
+
+    return {"opened": executed, "system_opened": system_opened, "enabled": True}
 
 
 def main():
     storage.init_db()
-    console.print("[green]=== 自动交易循环启动（Agent决策执行模式） ===[/green]")
-    console.print("[dim]等待 Agent 写入 pending_decisions，自动执行开仓/平仓。[/dim]")
+    console.print("[green]=== 自动交易循环启动（Agent + 系统双策略） ===[/green]")
+    console.print("[dim]策略A: 等待 Agent 写入 pending_decisions，自动执行开仓。[/dim]")
+    console.print("[dim]策略B: 扫描榜单 passed 币直接系统开仓（signal_lock 防重复）。[/dim]")
     console.print("[dim]持仓管理（TP/SL/跟踪止盈）由系统自动处理。[/dim]")
     last_cleanup_at = 0.0
     while _running:

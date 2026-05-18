@@ -37,7 +37,11 @@ conn.row_factory = sqlite3.Row
 
 # ---- 未复盘的 journal ----
 journal = [dict(r) for r in conn.execute(
-    "SELECT * FROM journal WHERE reviewed = 0 ORDER BY id LIMIT 1000"
+    "SELECT j.* FROM journal j "
+    "LEFT JOIN trade_positions tp ON j.order_id = tp.id "
+    "WHERE j.reviewed = 0 "
+    "AND (j.action = 'open' OR tp.strategy = 'agent') "
+    "ORDER BY j.id LIMIT 1000"
 )]
 journal_ids = [j["id"] for j in journal]
 
@@ -190,6 +194,7 @@ if close_order_ids:
     closed_positions = [dict(r) for r in conn.execute(
         f"""SELECT * FROM trade_positions
             WHERE status='CLOSED'
+            AND strategy = 'agent'
             AND id IN ({ph})
             ORDER BY closed_at""",
         close_order_ids,
@@ -216,7 +221,7 @@ for r in conn.execute(
     """SELECT la.reason_tags FROM trade_loss_archive la
        JOIN trade_positions tp ON la.position_id = tp.id
        WHERE la.reason_tags IS NOT NULL
-       AND json_extract(tp.signal_snapshot, '$.source') = 'agent'"""
+       AND tp.strategy = 'agent'"""
 ):
     for t in json.loads(r["reason_tags"]):
         tag_stats[t] = tag_stats.get(t, 0) + 1

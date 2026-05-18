@@ -225,6 +225,9 @@ class TradingSettingsBody(BaseModel):
     agent_collect_interval_minutes: int | None = None
     agent_trigger_interval: int | None = None
     agent_data_source: str | None = None
+    strategy_initial_agent: float | None = None
+    strategy_initial_system: float | None = None
+    strategy_initial_manual: float | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -604,12 +607,10 @@ def api_trading():
             account = trade_logic.account_summary(conn)
             positions = storage.trade_positions_all(conn, limit=10000)
             candidates = _cached("candidates_scan", getattr(config, "AGENT_COLLECT_CACHE_TTL", 5), _scan_candidates)
-            loss_archive = storage.trade_loss_archive_stats(conn)
         return {
             "account": account,
             "positions": positions,
             "candidates": candidates,
-            "loss_archive": loss_archive,
         }
     return _cached("trading", 2.0, compute)
 
@@ -617,7 +618,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source", "strategy_initial_agent", "strategy_initial_system", "strategy_initial_manual"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -673,53 +674,53 @@ def api_agent_overview():
     """Agent 账户概览 + 今日统计"""
     def compute():
         with storage.get_conn() as conn:
-            # 账户
+            # 账户（仅 Agent 策略）
             settings = storage.trading_settings_get(conn)
-            initial = float(settings.get("initial_balance", 1000))
+            initial = float(settings.get("strategy_initial_agent", 1000))
             realized = conn.execute(
-                "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions"
+                "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions WHERE strategy='agent'"
             ).fetchone()[0]
             unrealized = conn.execute(
                 "SELECT COALESCE(SUM(unrealized_pnl),0) FROM trade_positions "
-                "WHERE status IN ('OPEN','PARTIAL')"
+                "WHERE status IN ('OPEN','PARTIAL') AND strategy='agent'"
             ).fetchone()[0]
             locked = conn.execute(
                 "SELECT COALESCE(SUM(margin_amount),0) FROM trade_positions "
-                "WHERE status IN ('OPEN','PARTIAL')"
+                "WHERE status IN ('OPEN','PARTIAL') AND strategy='agent'"
             ).fetchone()[0]
             equity = round(initial + realized + unrealized, 2)
             available = round(initial + realized - locked, 2)
 
-            # 今日统计（从 trade_positions 读，覆盖收藏/auto/止损止盈所有来源）
+            # 今日统计（仅 Agent 策略）
             today_opens = conn.execute(
                 "SELECT COUNT(*) FROM trade_positions "
-                "WHERE date(created_at, '+8 hours')=date('now', '+8 hours')"
+                "WHERE strategy='agent' AND date(created_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_closes = conn.execute(
                 "SELECT COUNT(*) FROM trade_positions "
-                "WHERE status='CLOSED' AND closed_at IS NOT NULL "
+                "WHERE strategy='agent' AND status='CLOSED' AND closed_at IS NOT NULL "
                 "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_wins = conn.execute(
                 "SELECT COUNT(*) FROM trade_positions "
-                "WHERE status='CLOSED' AND realized_pnl > 0 AND closed_at IS NOT NULL "
+                "WHERE strategy='agent' AND status='CLOSED' AND realized_pnl > 0 AND closed_at IS NOT NULL "
                 "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_losses = conn.execute(
                 "SELECT COUNT(*) FROM trade_positions "
-                "WHERE status='CLOSED' AND realized_pnl <= 0 AND closed_at IS NOT NULL "
+                "WHERE strategy='agent' AND status='CLOSED' AND realized_pnl <= 0 AND closed_at IS NOT NULL "
                 "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_pnl = conn.execute(
                 "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions "
-                "WHERE status='CLOSED' AND closed_at IS NOT NULL "
+                "WHERE strategy='agent' AND status='CLOSED' AND closed_at IS NOT NULL "
                 "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
 
-            # 持仓数
+            # 持仓数（仅 Agent）
             open_count = conn.execute(
                 "SELECT COUNT(*) FROM trade_positions "
-                "WHERE status IN ('OPEN','PARTIAL')"
+                "WHERE status IN ('OPEN','PARTIAL') AND strategy='agent'"
             ).fetchone()[0]
 
             # 待处理决策
@@ -731,13 +732,13 @@ def api_agent_overview():
                 "WHERE status='rejected' AND date(created_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
 
-            # 总体胜率
+            # 总体胜率（仅 Agent）
             total_closed = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions WHERE status='CLOSED'"
+                "SELECT COUNT(*) FROM trade_positions WHERE strategy='agent' AND status='CLOSED'"
             ).fetchone()[0]
             total_wins = conn.execute(
                 "SELECT COUNT(*) FROM trade_positions "
-                "WHERE status='CLOSED' AND realized_pnl > 0"
+                "WHERE strategy='agent' AND status='CLOSED' AND realized_pnl > 0"
             ).fetchone()[0]
 
             # 最大回撤（1h 缓存）
@@ -749,7 +750,7 @@ def api_agent_overview():
                 running = float(initial or 0)
                 peak = running
                 max_dd = 0.0
-                for r in conn.execute("SELECT COALESCE(realized_pnl,0) FROM trade_positions WHERE status='CLOSED' ORDER BY closed_at").fetchall():
+                for r in conn.execute("SELECT COALESCE(realized_pnl,0) FROM trade_positions WHERE status='CLOSED' AND strategy='agent' ORDER BY closed_at").fetchall():
                     running += float(r[0])
                     if running > peak: peak = running
                     if peak > 0:
@@ -793,11 +794,18 @@ def api_agent_overview():
 def api_agent_journal(limit: int = 5, offset: int = 0):
     """操作日志：仅 journal 表（已执行的交易），按时间倒排，分页"""
     with storage.get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM journal j "
+            "JOIN trade_positions tp ON j.order_id = tp.id "
+            "WHERE tp.strategy = 'agent'"
+        ).fetchone()[0]
         rows = conn.execute(
-            "SELECT token, action, price, tier, pnl_pct, close_reason, "
-            "hold_duration, reason, created_at "
-            "FROM journal ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT j.token, j.action, j.price, j.tier, j.pnl_pct, j.close_reason, "
+            "j.hold_duration, j.reason, j.created_at "
+            "FROM journal j "
+            "JOIN trade_positions tp ON j.order_id = tp.id "
+            "WHERE tp.strategy = 'agent' "
+            "ORDER BY j.id DESC LIMIT ? OFFSET ?",
             (limit, offset)
         ).fetchall()
     return {
@@ -810,12 +818,20 @@ def api_agent_journal(limit: int = 5, offset: int = 0):
 def api_agent_timeline(limit: int = 30, offset: int = 0):
     """Agent 决策时间线：journal + pending_decisions 合并，按时间倒排，分页"""
     with storage.get_conn() as conn:
-        journal_total = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
+        journal_total = conn.execute(
+            "SELECT COUNT(*) FROM journal j "
+            "JOIN trade_positions tp ON j.order_id = tp.id "
+            "WHERE tp.strategy = 'agent'"
+        ).fetchone()[0]
         journal_rows = conn.execute(
-            "SELECT id, token, action, price, tier, stop_loss, tp1_price, tp2_price, "
-            "reason, dimension_data, market_overview, lesson_checked, "
-            "pnl_pct, close_reason, hold_duration, created_at "
-            "FROM journal ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT j.id, j.token, j.action, j.price, j.tier, j.stop_loss, "
+            "j.tp1_price, j.tp2_price, j.reason, j.dimension_data, "
+            "j.market_overview, j.lesson_checked, j.pnl_pct, j.close_reason, "
+            "j.hold_duration, j.created_at "
+            "FROM journal j "
+            "JOIN trade_positions tp ON j.order_id = tp.id "
+            "WHERE tp.strategy = 'agent' "
+            "ORDER BY j.id DESC LIMIT ? OFFSET ?",
             (limit, offset)
         ).fetchall()
 
@@ -1217,6 +1233,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 <div class="nav-bar">
   <a href="/">📊 市场监控</a>
   <a href="/agent">🤖 Agent 面板</a>
+  <a href="/strategies">📈 策略对比</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -1238,22 +1255,8 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 </div>
 
 <div class="panel">
-  <h2 style="margin-top:0">账户概览</h2>
-  <div class="trade-summary" id="trade-summary"></div>
-  <div class="trade-position-grid">
-    <div class="trade-window" style="overflow-x:auto">
-      <h3>持仓代币</h3>
-      <div id="trade-positions"><div class="empty">暂无持仓</div></div>
-    </div>
-    <div class="trade-window" style="overflow-x:auto">
-      <h3>已平仓代币</h3>
-      <div id="trade-closed-positions"><div class="empty">暂无已平仓记录</div></div>
-    </div>
-  </div>
-  <h2>合约扫描与操作建议</h2>
+  <h2 style="margin-top:0">合约扫描与操作建议</h2>
   <div id="trade-candidates"><div class="empty">等待扫描数据...</div></div>
-  <h2>止损失败归档</h2>
-  <div id="trade-loss-archive"><div class="empty">暂无止损样本</div></div>
 </div>
 
 <div class="panel">
@@ -1840,115 +1843,8 @@ async function loadLossSamples() {
 }
 
 // === 自动交易面板 ===
-const fmtUsdGlobal = (v) => {
-  if (v === null || v === undefined || isNaN(Number(v))) return '-';
-  return '$' + Number(v).toFixed(2);
-};
-
 function renderTradingPanel(data) {
-  const acc = data.account || {};
-
-  document.getElementById('trade-summary').innerHTML = `
-    <div class="metric"><div class="label">初始金额</div><div class="value">${fmtUsdGlobal(acc.initial_balance)}</div></div>
-    <div class="metric"><div class="label">账户权益</div><div class="value">${fmtUsdGlobal(acc.equity)}</div></div>
-    <div class="metric"><div class="label">剩余金额</div><div class="value">${fmtUsdGlobal(acc.available_balance)}</div></div>
-    <div class="metric"><div class="label">占用保证金</div><div class="value">${fmtUsdGlobal(acc.locked_margin)}</div></div>
-    <div class="metric"><div class="label">已实现盈亏</div><div class="value">${fmtUsdGlobal(acc.realized_pnl)}</div></div>
-    <div class="metric"><div class="label">浮动盈亏</div><div class="value">${fmtUsdGlobal(acc.unrealized_pnl)}</div></div>
-  `;
-
-  renderTradePositions(data.positions || []);
   renderTradeCandidates(data.candidates || []);
-  renderTradeLossArchive(data.loss_archive || {});
-}
-
-function renderTradePositions(items) {
-  const activeStatuses = new Set(['PENDING', 'OPEN', 'PARTIAL']);
-  const activeItems = items.filter(p => activeStatuses.has(p.status));
-  const closedItems = items.filter(p => !activeStatuses.has(p.status));
-  renderOpenPositions(activeItems);
-  renderClosedPositions(closedItems);
-}
-
-function renderOpenPositions(items) {
-  const el = document.getElementById('trade-positions');
-  if (!items.length) {
-    el.innerHTML = '<div class="empty">暂无持仓</div>';
-    return;
-  }
-  el.innerHTML = '<table class="compact-table"><thead><tr>' +
-    '<th>代币</th><th>状态</th><th class="right">倍数</th><th class="right">金额</th>' +
-    '<th class="right">入场</th><th class="right">现价</th><th class="right">止损</th>' +
-    '<th class="right">盈亏</th><th>操作建议</th>' +
-    '</tr></thead><tbody>' +
-    items.map(p => {
-      const pnl = Number(p.pnl_pct || 0);
-      const pnlCls = pnl >= 0 ? 'green' : 'red';
-      return `<tr data-token="${p.token}">
-        <td class="token">${p.token}<button class="close-btn" onclick="closeTrade('${p.token}')">平仓</button></td>
-        <td>${p.status}</td>
-        <td class="right">${Number(p.leverage || 0).toFixed(0)}x</td>
-        <td class="right">${fmtUsdGlobal(p.margin_amount)}</td>
-        <td class="right">${fmtPrice(p.entry_price || p.limit_price)}</td>
-        <td class="right">${fmtPrice(p.current_price)}</td>
-        <td class="right">${fmtPrice(p.stop_loss_price)}</td>
-        <td class="right ${pnlCls}">${pnl.toFixed(2)}%</td>
-        <td><span class="cell-advice" title="${escHtml(p.advice || '-')}">${escHtml(p.advice || '-')}</span></td>
-      </tr>`;
-    }).join('') + '</tbody></table>';
-}
-
-function renderClosedPositions(items) {
-  const el = document.getElementById('trade-closed-positions');
-  const scrollEl = el.querySelector('.closed-positions-scroll');
-  const scrollTop = scrollEl ? scrollEl.scrollTop : 0;
-  if (!items.length) {
-    el.innerHTML = '<div class="empty">暂无已平仓记录</div>';
-    return;
-  }
-  const closed = items.filter(p => p.status === 'CLOSED');
-  const totalPnl = closed.reduce((sum, p) => sum + Number(p.realized_pnl || 0), 0);
-  const wins = closed.filter(p => Number(p.realized_pnl || 0) > 0).length;
-  const losses = closed.filter(p => Number(p.realized_pnl || 0) < 0).length;
-  const winRate = closed.length ? (wins / closed.length * 100) : 0;
-  const totalCls = totalPnl >= 0 ? 'green' : 'red';
-
-  el.innerHTML = `
-    <div class="closed-summary">
-      <div class="metric"><div class="label">已平仓</div><div class="value">${closed.length}</div></div>
-      <div class="metric"><div class="label">总盈亏</div><div class="value ${totalCls}">${fmtUsdGlobal(totalPnl)}</div></div>
-      <div class="metric"><div class="label">胜率</div><div class="value">${winRate.toFixed(1)}%</div></div>
-    </div>
-    <div class="closed-positions-scroll">
-      <table class="compact-table"><thead><tr>
-        <th>代币</th><th>状态</th><th class="right">入场</th><th class="right">平仓价</th>
-        <th class="right">盈亏</th><th class="right">盈亏率</th><th>操作建议</th>
-      </tr></thead><tbody>
-        ${items.map(p => {
-          const realized = Number(p.realized_pnl || 0);
-          let pnl = Number(p.pnl_pct || 0);
-          if (!pnl && realized && Number(p.margin_amount || 0)) {
-            pnl = realized / Number(p.margin_amount) * 100;
-          }
-          const pnlCls = realized >= 0 ? 'green' : 'red';
-          const qty = Number(p.quantity || 0);
-          const entry = Number(p.entry_price || p.limit_price || 0);
-          const avgExit = qty && entry ? entry + realized / qty : Number(p.current_price || 0);
-          return `<tr data-token="${p.token}">
-            <td class="token">${p.token}</td>
-            <td>${p.status}</td>
-            <td class="right">${fmtPrice(entry || p.limit_price)}</td>
-            <td class="right">${fmtPrice(avgExit)}</td>
-            <td class="right ${pnlCls}">${fmtUsdGlobal(realized)}</td>
-            <td class="right ${pnlCls}">${pnl.toFixed(2)}%</td>
-            <td><span class="cell-advice" title="${escHtml(p.advice || '-')}">${escHtml(p.advice || '-')}</span></td>
-          </tr>`;
-        }).join('')}
-      </tbody></table>
-    </div>
-  `;
-  const newScrollEl = el.querySelector('.closed-positions-scroll');
-  if (newScrollEl && scrollTop) newScrollEl.scrollTop = scrollTop;
 }
 
 function renderTradeCandidates(items) {
@@ -1966,32 +1862,6 @@ function renderTradeCandidates(items) {
       <div class="muted" style="margin-top:5px;">${reasons}</div>
     </div>`;
   }).join('') + '</div>';
-}
-
-function renderTradeLossArchive(archive) {
-  const el = document.getElementById('trade-loss-archive');
-  if (!archive.count) {
-    el.innerHTML = '<div class="empty">暂无止损样本</div>';
-    return;
-  }
-  const tags = Object.entries(archive.tag_counts || {})
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => `<span class="tag-chip">${k}: ${v}</span>`)
-    .join('');
-  const recent = (archive.recent || []).slice(0, 5).map(r => {
-    const pnl = Number(r.pnl_pct || 0);
-    return `<tr>
-      <td class="token">${r.token}</td>
-      <td>${r.failed_reason || '-'}</td>
-      <td class="right red">${pnl.toFixed(2)}%</td>
-      <td>${r.reason_tags || '[]'}</td>
-    </tr>`;
-  }).join('');
-  el.innerHTML = `
-    <div class="deep-tags">${tags}</div>
-    <table><thead><tr><th>代币</th><th>失败原因</th><th class="right">亏损</th><th>标签</th></tr></thead>
-    <tbody>${recent}</tbody></table>
-  `;
 }
 
 async function loadTradingPanel() {
@@ -2318,6 +2188,7 @@ tr:hover { background: #1f2536; }
 <div class="nav-bar-agent">
   <a href="/">📊 市场监控</a>
   <a href="/agent" class="active">🤖 Agent 面板</a>
+  <a href="/strategies">📈 策略对比</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -2354,7 +2225,7 @@ tr:hover { background: #1f2536; }
     <h2>当前持仓</h2>
     <table>
       <thead><tr>
-        <th>币种</th><th>方向</th><th>入场</th><th>现价</th><th>PnL%</th><th>止损</th><th>TP1</th><th>TP2</th><th>持仓</th>
+        <th>币种</th><th>方向</th><th>锁利</th><th>入场</th><th>现价</th><th>PnL%</th><th>止损</th><th>TP1</th><th>TP2</th><th>持仓</th>
       </tr></thead>
       <tbody id="positions-body"></tbody>
     </table>
@@ -2455,7 +2326,7 @@ async function loadPositions() {
   try {
     const r = await fetch('/api/trading');
     const d = await r.json();
-    const positions = (d.positions || []).filter(p => p.status === 'OPEN' || p.status === 'PARTIAL');
+    const positions = (d.positions || []).filter(p => (p.status === 'OPEN' || p.status === 'PARTIAL') && p.strategy === 'agent');
     const tbody = $('#positions-body');
     const empty = $('#positions-empty');
     if (!positions.length) {
@@ -2466,6 +2337,9 @@ async function loadPositions() {
     empty.style.display = 'none';
     tbody.innerHTML = positions.map(p => {
       const pnl = p.pnl_pct != null ? Number(p.pnl_pct) : null;
+      const closedQty = Number(p.closed_qty || 0);
+      const totalQty = Number(p.quantity || 0);
+      const lockedPct = totalQty > 0 ? (closedQty / totalQty * 100) : 0;
       let hold = '—';
       if (p.created_at) {
         try { const d = new Date(p.created_at.replace(' ','T') + 'Z'); const h = Math.floor((Date.now()-d)/3600000); const m = Math.floor((Date.now()-d)/60000)%60; hold = (h ? h+'h' : '') + m + 'm'; } catch(e) {}
@@ -2473,6 +2347,7 @@ async function loadPositions() {
       return '<tr>' +
         '<td style="font-weight:bold;color:var(--accent)">' + esc(p.token) + '</td>' +
         '<td>' + esc(p.side) + '</td>' +
+        '<td style="font-size:11px;color:var(--green)">' + (lockedPct > 0 ? '🔒'+lockedPct.toFixed(0)+'%' : '—') + '</td>' +
         '<td>' + fmtPrice(p.entry_price) + '</td>' +
         '<td>' + fmtPrice(p.current_price) + '</td>' +
         '<td class="' + pnlClass(pnl) + '">' + fmtPct(pnl) + '</td>' +
@@ -2788,6 +2663,7 @@ label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px
 input, select { width: 100%; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 14px; margin-bottom: 14px; }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
 .btn { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
 .btn-save { background: var(--accent); color: #000; width: 100%; }
 .btn-danger { background: var(--danger); color: #fff; }
@@ -2813,6 +2689,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 <div class="nav-bar">
   <a href="/">📊 市场监控</a>
   <a href="/agent">🤖 Agent 面板</a>
+  <a href="/strategies">📈 策略对比</a>
   <a href="/settings" class="active">⚙ 系统设置</a>
 </div>
 
@@ -2844,6 +2721,24 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <div>
       <label>交易倍数</label>
       <input id="trade-leverage" type="number" min="1" max="125" step="1">
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>策略独立账户</h2>
+  <div class="grid3">
+    <div>
+      <label>Agent 策略初始 USDT</label>
+      <input id="trade-strategy-agent" type="number" min="1" step="1">
+    </div>
+    <div>
+      <label>系统策略初始 USDT</label>
+      <input id="trade-strategy-system" type="number" min="1" step="1">
+    </div>
+    <div>
+      <label>手动策略初始 USDT</label>
+      <input id="trade-strategy-manual" type="number" min="1" step="1">
     </div>
   </div>
 </div>
@@ -2913,6 +2808,9 @@ async function loadSettings() {
     document.getElementById('trade-data-source').value = s.agent_data_source ?? 'agent_candidates';
     document.getElementById('trade-collect-interval').value = s.agent_collect_interval_minutes ?? 15;
     document.getElementById('trade-trigger-interval').value = s.agent_trigger_interval ?? 3;
+    document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
+    document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
+    document.getElementById('trade-strategy-manual').value = s.strategy_initial_manual ?? 1000;
     toggleDataSourceOpts();
   } catch(e) { console.error(e); }
 }
@@ -2922,6 +2820,9 @@ async function saveTradingSettings() {
     mode: document.getElementById('trade-mode').value,
     initial_balance: Number(document.getElementById('trade-initial').value),
     leverage: Number(document.getElementById('trade-leverage').value),
+    strategy_initial_agent: Number(document.getElementById('trade-strategy-agent').value),
+    strategy_initial_system: Number(document.getElementById('trade-strategy-system').value),
+    strategy_initial_manual: Number(document.getElementById('trade-strategy-manual').value),
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
     agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
     agent_data_source: document.getElementById('trade-data-source').value,
@@ -2965,6 +2866,211 @@ loadSettings();
 def settings_page():
     return HTMLResponse(
         content=SETTINGS_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@app.get("/api/strategy/stats")
+def api_strategy_stats():
+    with storage.get_conn() as conn:
+        strategies = [dict(r) for r in conn.execute("""
+            SELECT strategy,
+                   COUNT(CASE WHEN status='CLOSED' THEN 1 END) as total,
+                   SUM(CASE WHEN status='CLOSED' AND realized_pnl>0 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN status='CLOSED' AND realized_pnl<=0 THEN 1 ELSE 0 END) as losses,
+                   ROUND(SUM(CASE WHEN status='CLOSED' THEN realized_pnl ELSE 0 END),2) as total_pnl,
+                   ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),2) as avg_pnl,
+                   SUM(CASE WHEN status IN('OPEN','PARTIAL') THEN 1 ELSE 0 END) as open_count
+            FROM trade_positions WHERE strategy IS NOT NULL
+            GROUP BY strategy ORDER BY strategy
+        """)]
+        # 止损失败标签按策略分组
+        import json as _json
+        loss_tags = {}
+        for r in conn.execute("""
+            SELECT tp.strategy, la.reason_tags
+            FROM trade_loss_archive la
+            JOIN trade_positions tp ON la.position_id = tp.id
+            WHERE la.reason_tags IS NOT NULL
+        """):
+            s = r["strategy"] or "unknown"
+            if s not in loss_tags:
+                loss_tags[s] = {}
+            for t in _json.loads(r["reason_tags"]):
+                loss_tags[s][t] = loss_tags[s].get(t, 0) + 1
+        # 各策略当前持仓 + 最近平仓
+        positions = [dict(r) for r in conn.execute(
+            "SELECT strategy, token, side, status, entry_price, current_price, "
+            "pnl_pct, realized_pnl, stop_loss_price, tp1_price, tp2_price, "
+            "margin_amount, closed_qty, quantity, created_at, closed_at "
+            "FROM trade_positions WHERE strategy IS NOT NULL "
+            "ORDER BY id DESC LIMIT 500"
+        )]
+        for s in strategies:
+            s["loss_tags"] = loss_tags.get(s["strategy"], {})
+            s["account"] = trade_logic.strategy_account_summary(conn, s["strategy"])
+            st = s["strategy"]
+            s["open_positions"] = [p for p in positions if p["strategy"] == st and p["status"] in ("OPEN","PARTIAL")]
+            s["closed_positions"] = [p for p in positions if p["strategy"] == st and p["status"] == "CLOSED"][:10]
+    return {"strategies": strategies}
+
+
+STRATEGIES_HTML = """
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>策略对比 - BSM Agent</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0f1419; --panel: #1a1f2e; --border: #2a3142;
+  --text: #e6e8eb; --muted: #8b92a5; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --yellow: #d29922;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'JetBrains Mono','Inter',-apple-system,BlinkMacSystemFont,"Microsoft YaHei",monospace; padding: 20px; max-width: 1100px; margin: 0 auto; font-size: 13px; }
+h1 { font-size: 20px; margin-bottom: 8px; }
+h2 { font-size: 15px; margin: 20px 0 12px; color: var(--accent); }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+.nav-bar { display: flex; justify-content: center; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+.nav-bar a { padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
+.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.metric { background: #0a0e15; padding: 10px 12px; border-radius: 8px; }
+.metric .label { color: var(--muted); font-size: 11px; }
+.metric .value { font-size: 18px; font-weight: 600; margin-top: 2px; }
+.green { color: var(--green); }
+.red { color: var(--red); }
+table { width: 100%; border-collapse: collapse; font-size: 12px; border-radius: 8px; overflow: hidden; margin-top: 8px; }
+th { text-align: left; padding: 8px 10px; background: #0a0e15; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+.right { text-align: right; }
+.strategy-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.strategy-badge { padding: 4px 12px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+.badge-agent { background: #1a2a4a; color: #79c0ff; }
+.badge-system { background: #1a3a2a; color: #3fb950; }
+.badge-manual { background: #3a2a1a; color: #d29922; }
+.toggle-section { border-top: 1px solid var(--border); padding-top: 6px; margin-top: 8px; }
+.toggle-header { cursor: pointer; color: var(--muted); font-size: 12px; padding: 6px 0; user-select: none; }
+.toggle-header:hover { color: var(--text); }
+.toggle-body { display: none; }
+.toggle-body.show { display: block; }
+</style>
+</head>
+<body>
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/agent">🤖 Agent 面板</a>
+  <a href="/strategies" class="active">📈 策略对比</a>
+  <a href="/settings">⚙ 系统设置</a>
+</div>
+
+<h1>📈 策略对比</h1>
+
+<div id="content"><div style="color:var(--muted);padding:20px">加载中...</div></div>
+
+<script>
+const fmtUsd = v => (v!=null&&!isNaN(Number(v)))?'$'+Number(v).toFixed(2):'-';
+const fmtPct = v => (v!=null&&!isNaN(Number(v)))?(v>=0?'+':'')+Number(v).toFixed(2)+'%':'-';
+const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=1?Number(v).toFixed(4):Number(v).toFixed(6));
+
+async function load() {
+  try {
+    const r = await fetch('/api/strategy/stats');
+    const d = await r.json();
+    const strategies = d.strategies || [];
+    if (!strategies.length) {
+      document.getElementById('content').innerHTML = '<div class="panel"><div style="color:var(--muted);text-align:center;padding:40px">暂无策略数据</div></div>';
+      return;
+    }
+    const badge = {
+      agent: '<span class="strategy-badge badge-agent">🤖 Agent 策略</span>',
+      system: '<span class="strategy-badge badge-system">⚙ 系统策略</span>',
+      manual: '<span class="strategy-badge badge-manual">👆 手动策略</span>',
+    };
+    let html = '';
+    for (const s of strategies) {
+      const wr = s.total > 0 ? (s.wins / s.total * 100) : 0;
+      const pnlCls = (s.total_pnl||0) >= 0 ? 'green' : 'red';
+      const acc = s.account || {};
+      const accPnlCls = (acc.realized_pnl||0) >= 0 ? 'green' : 'red';
+      html += `<div class="panel">
+        <div class="strategy-header">
+          <div>${badge[s.strategy] || s.strategy}</div>
+          <div style="color:var(--muted);font-size:12px">共 ${s.total} 笔</div>
+        </div>
+        <div class="summary" style="grid-template-columns:repeat(6,1fr);margin-bottom:6px">
+          <div class="metric"><div class="label">初始金额</div><div class="value">${fmtUsd(acc.initial_balance)}</div></div>
+          <div class="metric"><div class="label">账户权益</div><div class="value">${fmtUsd(acc.equity)}</div></div>
+          <div class="metric"><div class="label">可用余额</div><div class="value">${fmtUsd(acc.available_balance)}</div></div>
+          <div class="metric"><div class="label">占用保证金</div><div class="value">${fmtUsd(acc.locked_margin)}</div></div>
+          <div class="metric"><div class="label">资金利用率</div><div class="value">${(acc.equity>0?(acc.locked_margin/acc.equity*100).toFixed(1):0)}%</div></div>
+          <div class="metric"><div class="label">已实现盈亏</div><div class="value ${accPnlCls}">${fmtUsd(acc.realized_pnl)}</div></div>
+        </div>
+        <div class="summary" style="grid-template-columns:repeat(6,1fr)">
+          <div class="metric"><div class="label">浮动盈亏</div><div class="value">${fmtUsd(acc.unrealized_pnl)}</div></div>
+          <div class="metric"><div class="label">胜率</div><div class="value">${wr.toFixed(1)}%</div></div>
+          <div class="metric"><div class="label">胜/负</div><div class="value">${s.wins}/${s.losses}</div></div>
+          <div class="metric"><div class="label">总盈亏</div><div class="value ${pnlCls}">${fmtUsd(s.total_pnl)}</div></div>
+          <div class="metric"><div class="label">平均盈亏</div><div class="value ${pnlCls}">${fmtPct(s.avg_pnl)}</div></div>
+          <div class="metric"><div class="label">当前持仓</div><div class="value">${s.open_count||0}</div></div>
+        </div>`;
+      // 止损失败标签
+      const lossTags = s.loss_tags || {};
+      const tags = Object.entries(lossTags).sort((a,b) => b[1]-a[1]);
+      if (tags.length) {
+        const tagHtml = tags.map(([k,v]) =>
+          `<span style="display:inline-block;background:#1a1f2e;padding:3px 8px;border-radius:4px;margin:2px;font-size:11px">${k.replace(/_/g,' ')} <b style="color:var(--red)">${v}</b></span>`
+        ).join('');
+        html += `<div style="margin-top:4px;padding:8px 0;border-top:1px solid var(--border)">
+          <div style="color:var(--muted);font-size:11px;margin-bottom:4px">⚠ 止损失败归档</div>
+          ${tagHtml}
+        </div>`;
+      }
+      // 当前持仓 / 已平仓（折叠展开）
+      const openList = s.open_positions || [];
+      const closedList = s.closed_positions || [];
+      const uid = s.strategy + '-' + Math.random().toString(36).slice(2,6);
+      if (openList.length) {
+        html += `<div class="toggle-section">
+          <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📌 当前持仓 (${openList.length}) ▾</div>
+          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th>锁利</th><th class="right">入场</th><th class="right">现价</th><th class="right">PnL%</th><th class="right">止损</th><th class="right">TP1</th><th class="right">TP2</th><th>持仓</th></tr></thead><tbody>`;
+        for (const p of openList) {
+          const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
+          const cq = Number(p.closed_qty||0), tq = Number(p.quantity||0);
+          const lockedPct = tq > 0 ? (cq/tq*100) : 0;
+          let hold = '—';
+          if (p.created_at) { try { const d = new Date(p.created_at.replace(' ','T')+'Z'); const h = Math.floor((Date.now()-d)/3600000); const m = Math.floor((Date.now()-d)/60000)%60; hold = (h?h+'h':'')+m+'m'; } catch(e) {} }
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td style="color:var(--green);font-size:11px">${lockedPct>0?'🔒'+lockedPct.toFixed(0)+'%':'—'}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right">${fmtPrice(p.stop_loss_price)}</td><td class="right">${fmtPrice(p.tp1_price)}</td><td class="right">${fmtPrice(p.tp2_price)}</td><td style="font-size:11px;white-space:nowrap">${hold}</td></tr>`;
+        }
+        html += `</tbody></table></div></div>`;
+      }
+      if (closedList.length) {
+        html += `<div class="toggle-section">
+          <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📋 最近平仓 (${closedList.length}) ▾</div>
+          <div class="toggle-body"><table><thead><tr><th>代币</th><th>方向</th><th class="right">入场</th><th class="right">平仓</th><th class="right">PnL%</th><th class="right">盈亏</th></tr></thead><tbody>`;
+        for (const p of closedList) {
+          const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.realized_pnl)}</td></tr>`;
+        }
+        html += `</tbody></table></div></div>`;
+      }
+      html += `</div>`;
+    }
+    document.getElementById('content').innerHTML = html;
+  } catch(e) { document.getElementById('content').innerHTML = '<div class="panel"><div style="color:var(--red)">加载失败: '+e.message+'</div></div>'; }
+}
+load();
+</script>
+</body>
+</html>
+"""
+
+@app.get("/strategies", response_class=HTMLResponse)
+def strategies_page():
+    return HTMLResponse(
+        content=STRATEGIES_HTML,
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 

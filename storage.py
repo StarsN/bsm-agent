@@ -84,22 +84,6 @@ CREATE TABLE IF NOT EXISTS token_heat_history (
 );
 CREATE INDEX IF NOT EXISTS idx_heat_token ON token_heat_history(token, recorded_at);
 
--- Agent 候选币池：worker 每轮收集所有上过榜的 token，Agent 从这里读
-CREATE TABLE IF NOT EXISTS round_candidates (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    token           TEXT NOT NULL,
-    score           REAL,
-    mentions        INTEGER,
-    unique_posts    INTEGER,
-    source_round    INTEGER,                -- 来自 worker 第几轮
-    mode            TEXT DEFAULT 'batch',   -- batch / streaming
-    delivered       INTEGER DEFAULT 0,      -- 0=Agent 未读, 1=已读
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_rc_token_round ON round_candidates(token, source_round);
-CREATE INDEX IF NOT EXISTS idx_rc_round ON round_candidates(source_round, delivered);
-
 -- 收藏入场记录：收藏时的锚定数据
 CREATE TABLE IF NOT EXISTS watchlist_entries (
     token           TEXT PRIMARY KEY,
@@ -175,6 +159,7 @@ CREATE TABLE IF NOT EXISTS trade_positions (
     open_reason        TEXT,
     advice             TEXT,
     exchange_order_id  TEXT,               -- 实盘：合约订单 ID（JSON 格式）
+    strategy           TEXT DEFAULT 'agent', -- 策略来源：agent / system
     created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     closed_at          TIMESTAMP
@@ -390,6 +375,27 @@ def _migrate(conn):
     tp_cols = [r[1] for r in conn.execute("PRAGMA table_info(trade_positions)").fetchall()]
     if "exchange_order_id" not in tp_cols:
         conn.execute("ALTER TABLE trade_positions ADD COLUMN exchange_order_id TEXT")
+    if "strategy" not in tp_cols:
+        conn.execute("ALTER TABLE trade_positions ADD COLUMN strategy TEXT DEFAULT 'agent'")
+    # signal_lock 策略隔离：重建唯一约束为 (token, signal_key, strategy)
+    sl_cols = [r[1] for r in conn.execute("PRAGMA table_info(trade_signal_locks)").fetchall()]
+    if "strategy" not in sl_cols:
+        # SQLite 不支持 ALTER TABLE DROP CONSTRAINT，只能重建表
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS trade_signal_locks_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL,
+                signal_key TEXT NOT NULL,
+                strategy TEXT DEFAULT 'agent',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(token, signal_key, strategy)
+            );
+            INSERT INTO trade_signal_locks_new (id, token, signal_key, created_at)
+                SELECT id, token, signal_key, created_at FROM trade_signal_locks;
+            DROP TABLE trade_signal_locks;
+            ALTER TABLE trade_signal_locks_new RENAME TO trade_signal_locks;
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_lock_token ON trade_signal_locks(token, created_at)")
     # lessons 新索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_lessons_ca ON lessons(created_at)")
 
@@ -779,6 +785,9 @@ def trading_settings_defaults() -> dict:
         "agent_collect_interval_minutes": getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15),
         "agent_trigger_interval": getattr(config, "AGENT_TRIGGER_INTERVAL", 3),
         "agent_data_source": getattr(config, "AGENT_DATA_SOURCE", "agent_candidates"),
+        "strategy_initial_agent": getattr(config, "STRATEGY_INITIAL_AGENT", 1000),
+        "strategy_initial_system": getattr(config, "STRATEGY_INITIAL_SYSTEM", 1000),
+        "strategy_initial_manual": getattr(config, "STRATEGY_INITIAL_MANUAL", 1000),
     }
 
 
@@ -801,7 +810,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source", "strategy_initial_agent", "strategy_initial_system", "strategy_initial_manual"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -833,21 +842,28 @@ def trade_positions_all(conn, limit: int = 50) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
-def trade_has_active(conn, token: str) -> bool:
-    row = conn.execute("""
-        SELECT 1 FROM trade_positions
-        WHERE token = ? AND status IN ('PENDING', 'OPEN', 'PARTIAL')
-        LIMIT 1
-    """, (token.upper(),)).fetchone()
+def trade_has_active(conn, token: str, strategy: str = None) -> bool:
+    if strategy:
+        row = conn.execute("""
+            SELECT 1 FROM trade_positions
+            WHERE token = ? AND strategy = ? AND status IN ('PENDING', 'OPEN', 'PARTIAL')
+            LIMIT 1
+        """, (token.upper(), strategy)).fetchone()
+    else:
+        row = conn.execute("""
+            SELECT 1 FROM trade_positions
+            WHERE token = ? AND status IN ('PENDING', 'OPEN', 'PARTIAL')
+            LIMIT 1
+        """, (token.upper(),)).fetchone()
     return row is not None
 
 
-def trade_signal_lock_acquire(conn, token: str, signal_key: str) -> bool:
+def trade_signal_lock_acquire(conn, token: str, signal_key: str, strategy: str = "agent") -> bool:
     try:
         conn.execute("""
-            INSERT INTO trade_signal_locks (token, signal_key)
-            VALUES (?, ?)
-        """, (token.upper(), signal_key))
+            INSERT INTO trade_signal_locks (token, signal_key, strategy)
+            VALUES (?, ?, ?)
+        """, (token.upper(), signal_key, strategy))
         return True
     except sqlite3.IntegrityError:
         return False
@@ -918,12 +934,13 @@ def trade_position_insert(conn, position: dict):
             (token, symbol, side, status, mode, margin_amount, leverage, notional,
              quantity, entry_price, limit_price, current_price, stop_loss_price,
              tp1_price, tp2_price, highest_price, trailing_stop_price,
-             signal_snapshot, open_reason, advice)
+             signal_snapshot, open_reason, advice, strategy)
         VALUES
             (:token, :symbol, :side, :status, :mode, :margin_amount, :leverage,
              :notional, :quantity, :entry_price, :limit_price, :current_price,
              :stop_loss_price, :tp1_price, :tp2_price, :highest_price,
-             :trailing_stop_price, :signal_snapshot, :open_reason, :advice)
+             :trailing_stop_price, :signal_snapshot, :open_reason, :advice,
+             :strategy)
         """, position)
         return True
     except sqlite3.IntegrityError:
@@ -1220,50 +1237,6 @@ def journal_stats(conn) -> dict:
 
 # === Agent 候选币池 ===
 
-def round_candidates_add(conn, tokens: list[dict], source_round: int, mode: str = "batch"):
-    """批量写入一批候选币（同一轮同一 token 不重复，分数取较高值）"""
-    for t in tokens:
-        conn.execute("""
-            INSERT INTO round_candidates
-                (token, score, mentions, unique_posts, source_round, mode)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(token, source_round) DO UPDATE SET
-                score = MAX(round_candidates.score, excluded.score),
-                mentions = excluded.mentions,
-                unique_posts = excluded.unique_posts,
-                mode = excluded.mode
-        """, (t["token"].upper(), t.get("score", 0), t.get("mentions", 0),
-              t.get("unique_posts", 0), source_round, mode))
-
-
-def round_candidates_undelivered(conn) -> list[dict]:
-    """Agent 读取未处理的候选币（返回原始行含 id，Agent 端去重）"""
-    rows = conn.execute("""
-        SELECT id, token, score, mentions, unique_posts, source_round, mode
-        FROM round_candidates
-        WHERE delivered = 0
-        ORDER BY score DESC, id ASC
-    """).fetchall()
-    return [dict(r) for r in rows]
-
-
-def round_candidates_mark_delivered_by_ids(conn, ids: list[int]):
-    """标记指定 ID 的候选币为已处理"""
-    if not ids:
-        return
-    placeholders = ",".join("?" * len(ids))
-    conn.execute(
-        f"UPDATE round_candidates SET delivered = 1 WHERE id IN ({placeholders})", ids
-    )
-
-
-def round_candidates_mark_delivered(conn):
-    """标记所有未处理的候选币为已处理（兼容旧调用）"""
-    conn.execute(
-        "UPDATE round_candidates SET delivered = 1 WHERE delivered = 0"
-    )
-
-
 def watchlist_followups_purge_old(conn, days: int = 3):
     """清理旧的观察列表跟踪数据（浮盈浮亏历史快照）"""
     conn.execute(
@@ -1272,13 +1245,3 @@ def watchlist_followups_purge_old(conn, days: int = 3):
     )
 
 
-def round_candidates_purge_old(conn, keep_last_rounds: int = 50):
-    """清理旧的候选币数据"""
-    conn.execute("""
-        DELETE FROM round_candidates
-        WHERE id NOT IN (
-            SELECT id FROM round_candidates
-            ORDER BY id DESC
-            LIMIT ?
-        )
-    """, (keep_last_rounds * 200,))

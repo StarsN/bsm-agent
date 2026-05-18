@@ -69,11 +69,15 @@ def _load_realtime(conn, token: str) -> dict:
 
 
 def _current_price(market: dict, realtime: dict) -> float | None:
-    snap = market.get("snapshot") or {}
     for key in ("last_trade_price", "mark_price", "best_ask", "best_bid"):
         val = realtime.get(key)
         if val:
             return float(val)
+    # realtime 无数据 → fallback 到 snapshot，但不能用太旧的
+    snap = market.get("snapshot") or {}
+    age = _timestamp_age_seconds(market.get("updated_at"))
+    if age is not None and age > 600:  # 10 分钟以上的快照不可靠
+        return None
     val = snap.get("mark_price")
     return float(val) if val else None
 
@@ -322,10 +326,70 @@ def account_summary(conn) -> dict:
     }
 
 
-def _build_account_context(conn) -> risk.AccountContext:
-    """组装风控决策需要的账户上下文。只读，不修改数据库。"""
-    summary = account_summary(conn)
-    open_positions = storage.trade_open_positions(conn)
+def strategy_account_summary(conn, strategy: str) -> dict:
+    """单策略独立账户核算"""
+    settings = storage.trading_settings_get(conn)
+    initial_key = f"strategy_initial_{strategy}"
+    initial = float(settings.get(initial_key, 1000))
+    realized = conn.execute(
+        "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions WHERE strategy=?",
+        (strategy,)
+    ).fetchone()[0]
+    unrealized = conn.execute(
+        "SELECT COALESCE(SUM(unrealized_pnl),0) FROM trade_positions "
+        "WHERE strategy=? AND status IN ('OPEN','PARTIAL')",
+        (strategy,)
+    ).fetchone()[0]
+    locked = conn.execute(
+        "SELECT COALESCE(SUM(margin_amount),0) FROM trade_positions "
+        "WHERE strategy=? AND status IN ('PENDING','OPEN','PARTIAL')",
+        (strategy,)
+    ).fetchone()[0]
+    equity = initial + realized + unrealized
+    available = initial + realized - locked
+    return {
+        "initial_balance": round(initial, 2),
+        "equity": round(equity, 2),
+        "available_balance": round(available, 2),
+        "locked_margin": round(locked, 2),
+        "realized_pnl": round(realized, 2),
+        "unrealized_pnl": round(unrealized, 2),
+    }
+
+
+def _build_account_context(conn, strategy: str = None) -> risk.AccountContext:
+    """组装风控决策需要的账户上下文。strategy 参数按策略隔离核算。"""
+    if strategy:
+        summary = strategy_account_summary(conn, strategy)
+        open_positions = [dict(r) for r in conn.execute(
+            "SELECT * FROM trade_positions WHERE status IN ('OPEN','PARTIAL') AND strategy=?",
+            (strategy,)
+        )]
+        # 单策略今日数据
+        today_pnl = conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions "
+            "WHERE strategy=? AND status='CLOSED' AND date(closed_at,'+8 hours')=date('now','+8 hours')",
+            (strategy,)
+        ).fetchone()[0] or 0
+        trades_today = conn.execute(
+            "SELECT COUNT(*) FROM trade_positions "
+            "WHERE strategy=? AND date(created_at,'+8 hours')=date('now','+8 hours')",
+            (strategy,)
+        ).fetchone()[0] or 0
+        last_sl_map = {}
+        for r in conn.execute(
+            "SELECT token, MAX(closed_at) as last_sl FROM trade_positions "
+            "WHERE strategy=? AND status='CLOSED' AND realized_pnl < 0 "
+            "GROUP BY token", (strategy,)
+        ):
+            last_sl_map[r["token"]] = r["last_sl"]
+    else:
+        summary = account_summary(conn)
+        open_positions = storage.trade_open_positions(conn)
+        today_pnl = storage.trade_realized_pnl_today(conn)
+        trades_today = storage.trade_count_today_opened(conn)
+        last_sl_map = storage.trade_last_stop_loss_map(
+            conn, hours=max(2, config.TRADING_COOLDOWN_MINUTES_AFTER_LOSS // 30 + 1))
 
     # 按板块聚合
     by_sector = {}
@@ -336,13 +400,12 @@ def _build_account_context(conn) -> risk.AccountContext:
     return risk.AccountContext(
         equity=summary["equity"],
         available_balance=summary["available_balance"],
-        realized_pnl_today=storage.trade_realized_pnl_today(conn),
+        realized_pnl_today=today_pnl,
         unrealized_pnl=summary["unrealized_pnl"],
         open_positions_count=len(open_positions),
         open_positions_by_sector=by_sector,
-        trades_opened_today=storage.trade_count_today_opened(conn),
-        last_stop_loss_by_token=storage.trade_last_stop_loss_map(
-            conn, hours=max(2, config.TRADING_COOLDOWN_MINUTES_AFTER_LOSS // 30 + 1)),
+        trades_opened_today=trades_today,
+        last_stop_loss_by_token=last_sl_map,
     )
 
 
@@ -359,7 +422,7 @@ def _debug_reject(token: str, reason: str, candidate: dict = None):
     print(f"[trade-debug] REJECT {token}: {reason}{extra}", file=sys.stderr, flush=True)
 
 
-def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
+def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "agent") -> bool | dict:
     """
     v2：接入风控中枢的开仓。
 
@@ -387,12 +450,12 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
         _debug_reject(token, "tier=skip", candidate)
         return False
 
-    if storage.trade_has_active(conn, token):
+    if storage.trade_has_active(conn, token, strategy):
         _debug_reject(token, "DB 中已有活跃仓位（并发保护）", candidate)
         return False
 
-    # 账户级风控
-    account = _build_account_context(conn)
+    # 账户级风控（策略隔离）
+    account = _build_account_context(conn, strategy)
     risk_decision = risk.check_account_risk(account, token)
     if not risk_decision.allowed:
         _debug_reject(token, f"账户风控: {risk_decision.reason}", candidate)
@@ -412,7 +475,7 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
 
     # 抢 signal lock
     signal_key = candidate.get("signal_key") or storage.leaderboard_signal_key(conn)
-    if not storage.trade_signal_lock_acquire(conn, token, signal_key):
+    if not storage.trade_signal_lock_acquire(conn, token, signal_key, strategy):
         _debug_reject(token, f"signal_lock 已占用 (signal_key={signal_key})", candidate)
         return False
 
@@ -477,6 +540,7 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
             f"{'满仓' if tier == 'full' else '半仓'}持有：等待 +{config.TRADING_TP1_R}R 止盈 / "
             f"{sizing.get('stop_distance_pct', 0):.2f}% 止损"
         ),
+        "strategy": strategy,
     }
     ok = storage.trade_position_insert(conn, position)
     if not ok:
@@ -496,8 +560,8 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
     - 返回详细 reason，前端 toast 能直接展示
     """
     token = token.upper()
-    if storage.trade_has_active(conn, token):
-        return {"ok": False, "reason": f"{token} 已有持仓或挂单"}
+    if storage.trade_has_active(conn, token, "manual"):
+        return {"ok": False, "reason": f"{token} 手动已有持仓或挂单"}
 
     mode = settings.get("mode") or "paper"
     if mode != "paper":
@@ -514,7 +578,7 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
         return {"ok": False, "reason": f"{token} 缺少可用市价（可能没有永续合约或接口超时）"}
 
     # 账户级风控（收藏豁免部分）
-    account = _build_account_context(conn)
+    account = _build_account_context(conn, "manual")
     risk_decision = risk.check_account_risk(
         account, token,
         bypass_max_concurrent=config.MANUAL_BYPASS_MAX_CONCURRENT,
@@ -594,6 +658,7 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
             f"风险 ${risk_amount:.2f}"
         ),
         "advice": f"手动开仓持有：等待止盈或 {sizing.get('stop_distance_pct', 0):.2f}% 止损",
+        "strategy": "manual",
     }
     if not storage.trade_position_insert(conn, position):
         return {"ok": False, "reason": "DB 写入失败（可能并发冲突）"}

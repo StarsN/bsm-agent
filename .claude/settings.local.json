@@ -1,9 +1,5 @@
 {
   "permissions": {
-    "allow": [
-      "Bash(Get-ChildItem -Recurse -Depth 2)",
-      "Bash(Select-Object Mode, LastWriteTime, Length, Name)",
-      "Bash(Format-List)"
-    ]
+    "defaultMode": "acceptEdits"
   }
 }
