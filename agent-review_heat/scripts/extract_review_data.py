@@ -40,7 +40,7 @@ journal = [dict(r) for r in conn.execute(
     "SELECT j.* FROM journal j "
     "LEFT JOIN trade_positions tp ON j.order_id = tp.id "
     "WHERE j.reviewed = 0 "
-    "AND tp.strategy = 'agent' "
+    "AND tp.strategy = 'heat_agent' "
     "ORDER BY j.id LIMIT 1000"
 )]
 journal_ids = [j["id"] for j in journal]
@@ -194,7 +194,7 @@ if close_order_ids:
     closed_positions = [dict(r) for r in conn.execute(
         f"""SELECT * FROM trade_positions
             WHERE status='CLOSED'
-            AND strategy = 'agent'
+            AND strategy = 'heat_agent'
             AND id IN ({ph})
             ORDER BY closed_at""",
         close_order_ids,
@@ -203,7 +203,7 @@ if close_order_ids:
 # ---- 已有 lessons ----
 existing_lessons = [dict(r) for r in conn.execute(
     "SELECT id, token, root_cause, rule_update, severity, created_at "
-    "FROM lessons WHERE learned=0 AND strategy='agent' ORDER BY id DESC"
+    "FROM lessons WHERE learned=0 AND strategy='heat_agent' ORDER BY id DESC"
 )]
 
 def _safe_str(v):
@@ -221,7 +221,7 @@ for r in conn.execute(
     """SELECT la.reason_tags FROM trade_loss_archive la
        JOIN trade_positions tp ON la.position_id = tp.id
        WHERE la.reason_tags IS NOT NULL
-       AND tp.strategy = 'agent'"""
+       AND tp.strategy = 'heat_agent'"""
 ):
     for t in json.loads(r["reason_tags"]):
         tag_stats[t] = tag_stats.get(t, 0) + 1

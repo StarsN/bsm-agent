@@ -222,7 +222,8 @@ CREATE TABLE IF NOT EXISTS pending_decisions (
     -- 日志字段：Agent 决策时填写，系统开仓时读取写入 journal
     dimension_data  TEXT,                 -- 入场时的市场数据快照（JSON）
     market_overview TEXT,                 -- 市场环境一句话（BTC走势、时段）
-    lesson_checked  TEXT                  -- 开仓前查了哪些 lessons
+    lesson_checked  TEXT,                 -- 开仓前查了哪些 lessons
+    source          TEXT DEFAULT 'agent_candidates'  -- 数据源：agent_candidates / token_heat_history
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_decisions(status, created_at);
@@ -246,6 +247,7 @@ CREATE TABLE IF NOT EXISTS lessons (
     rule_update     TEXT,                   -- 由此衍生的规则（如"4h涨超25%不开多"）
     severity        TEXT DEFAULT 'medium',  -- critical / warning / medium
     learned         INTEGER DEFAULT 0,      -- 0=仍适用, 1=已被新规则覆盖
+    strategy        TEXT DEFAULT 'agent',   -- 归属策略
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -396,6 +398,14 @@ def _migrate(conn):
             ALTER TABLE trade_signal_locks_new RENAME TO trade_signal_locks;
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_lock_token ON trade_signal_locks(token, created_at)")
+    # pending_decisions source 列
+    pd_cols = [r[1] for r in conn.execute("PRAGMA table_info(pending_decisions)").fetchall()]
+    if "source" not in pd_cols:
+        conn.execute("ALTER TABLE pending_decisions ADD COLUMN source TEXT DEFAULT 'agent_candidates'")
+    # lessons strategy 列
+    l_cols = [r[1] for r in conn.execute("PRAGMA table_info(lessons)").fetchall()]
+    if "strategy" not in l_cols:
+        conn.execute("ALTER TABLE lessons ADD COLUMN strategy TEXT DEFAULT 'agent'")
     # lessons 新索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_lessons_ca ON lessons(created_at)")
 
@@ -783,9 +793,9 @@ def trading_settings_defaults() -> dict:
         "leverage": config.TRADING_LEVERAGE,
         "order_amount": config.TRADING_ORDER_AMOUNT,
         "agent_collect_interval_minutes": getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15),
-        "agent_trigger_interval": getattr(config, "AGENT_TRIGGER_INTERVAL", 3),
-        "agent_data_source": getattr(config, "AGENT_DATA_SOURCE", "agent_candidates"),
+        "agent_trigger_interval": getattr(config, "HEAT_AGENT_TRIGGER_INTERVAL", 3),
         "strategy_initial_agent": getattr(config, "STRATEGY_INITIAL_AGENT", 1000),
+        "strategy_initial_heat_agent": getattr(config, "STRATEGY_INITIAL_HEAT_AGENT", 1000),
         "strategy_initial_system": getattr(config, "STRATEGY_INITIAL_SYSTEM", 1000),
         "strategy_initial_manual": getattr(config, "STRATEGY_INITIAL_MANUAL", 1000),
     }
@@ -810,7 +820,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source", "strategy_initial_agent", "strategy_initial_system", "strategy_initial_manual"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -1089,9 +1099,12 @@ def lessons_recent(conn, limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def lessons_stats(conn) -> dict:
-    """教训库统计：总数、按 severity 分布、按 root_cause 分布"""
-    rows = conn.execute("SELECT * FROM lessons").fetchall()
+def lessons_stats(conn, strategy: str = None) -> dict:
+    """教训库统计（策略隔离）"""
+    if strategy:
+        rows = conn.execute("SELECT * FROM lessons WHERE strategy=?", (strategy,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM lessons").fetchall()
     if not rows:
         return {"count": 0}
     import json as _json

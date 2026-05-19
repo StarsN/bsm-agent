@@ -40,13 +40,13 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 
-def execute_open(conn, decision: dict, settings: dict) -> dict:
+def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") -> dict:
     """执行 Agent 的开仓决策 —— 经过 risk.py 兜底检查"""
     token = decision["token"]
 
     # 防重复
-    if storage.trade_has_active(conn, token, "agent"):
-        return {"ok": False, "reason": f"{token} Agent已有持仓"}
+    if storage.trade_has_active(conn, token, strategy):
+        return {"ok": False, "reason": f"{token} 策略已有持仓"}
 
     # 合约过滤
     if not has_perpetual(token):
@@ -54,13 +54,13 @@ def execute_open(conn, decision: dict, settings: dict) -> dict:
 
     # signal_lock 防重
     signal_key = storage.leaderboard_signal_key(conn)
-    if not storage.trade_signal_lock_acquire(conn, token, signal_key, "agent"):
+    if not storage.trade_signal_lock_acquire(conn, token, signal_key, strategy):
         return {"ok": False, "reason": f"{token} signal_lock 已占用"}
 
     mode = settings.get("mode") or "paper"
 
     # 实盘模式用 exchange 余额覆盖账户权益
-    account = trade_logic._build_account_context(conn, "agent")
+    account = trade_logic._build_account_context(conn, strategy)
     if mode == "live":
         import exchange
         live_balance = exchange.get_balance()
@@ -199,7 +199,7 @@ def execute_open(conn, decision: dict, settings: dict) -> dict:
             "tp1": exchange_tp1_id,
             "tp2": exchange_tp2_id,
         }) if mode == "live" else None,
-        "strategy": "agent",
+        "strategy": strategy,
     }
 
     ok = storage.trade_position_insert(conn, position)
@@ -367,12 +367,14 @@ def one_scan():
             "LIMIT 5"
         ).fetchall()
 
+    source_map = {"agent_candidates": "agent", "token_heat_history": "heat_agent"}
     executed = 0
     for dec in pending:
         dec = dict(dec)
+        strategy = source_map.get(dec.get("source", "agent_candidates"), "agent")
         with storage.get_conn() as conn:
             if dec["action"] == "open_long":
-                result = execute_open(conn, dec, settings)
+                result = execute_open(conn, dec, settings, strategy)
             elif dec["action"] == "close":
                 result = execute_close(conn, dec)
             else:

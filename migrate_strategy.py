@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""一次性脚本：给 trade_positions 存量 NULL strategy 回填为 'agent'"""
+"""一次性脚本：存量 NULL 回填（DDL 由 init_db() 启动时自动处理，脚本只管数据）"""
 import sqlite3, sys, os
 
 DB = "binance_square.db"
@@ -11,20 +11,17 @@ if not os.path.exists(DB):
     sys.exit(1)
 
 conn = sqlite3.connect(DB)
-conn.row_factory = sqlite3.Row
 
-# 检查列是否存在
-cols = [r[1] for r in conn.execute("PRAGMA table_info(trade_positions)")]
-if "strategy" not in cols:
-    conn.execute("ALTER TABLE trade_positions ADD COLUMN strategy TEXT DEFAULT 'agent'")
+tables = [
+    ("trade_positions", "strategy", "agent"),
+    ("lessons", "strategy", "agent"),
+    ("pending_decisions", "source", "agent_candidates"),
+]
+
+for tbl, col, default in tables:
+    updated = conn.execute(f"UPDATE {tbl} SET {col} = '{default}' WHERE {col} IS NULL").rowcount
     conn.commit()
-    print("已添加 strategy 列")
+    print(f"[{tbl}] 回填 {updated} 条 {col}='{default}'")
 
-updated = conn.execute(
-    "UPDATE trade_positions SET strategy = 'agent' WHERE strategy IS NULL"
-).rowcount
-conn.commit()
 conn.close()
-
-print(f"已回填 {updated} 条旧数据 strategy='agent'")
 print("完成")

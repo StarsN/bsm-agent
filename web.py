@@ -33,7 +33,7 @@ app = FastAPI(title="Binance Square Monitor")
 # ============================================================
 _cache = {}
 _cache_lock = threading.Lock()
-_max_dd_cache = {"value": 0.0, "time": 0}
+_max_dd_cache = {}
 
 
 def _cached(key: str, ttl_seconds: float, fn):
@@ -149,14 +149,10 @@ def _collect_loop():
             now = time.time()
             if now - _last_heartbeat >= 60:
                 _last_heartbeat = now
-                # 即时生效：从 DB 重读数据源和间隔（一次 DB 读）
+                # 即时生效：从 DB 重读间隔
                 try:
                     with storage.get_conn() as conn:
                         ts = storage.trading_settings_get(conn)
-                    ds = ts.get("agent_data_source", "agent_candidates")
-                    if ds != "agent_candidates":
-                        print("[collect] 数据源已切换，collector 自动退出", flush=True)
-                        break
                     new_interval = int(ts.get("agent_collect_interval_minutes",
                                getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
                     new_interval *= 60
@@ -200,16 +196,9 @@ def _collect_loop():
 
 
 # 启动 collector（从 DB 读数据源，fallback config）
-_data_source = getattr(config, "AGENT_DATA_SOURCE", "agent_candidates")
-try:
-    with storage.get_conn() as conn:
-        ts = storage.trading_settings_get(conn)
-    _data_source = ts.get("agent_data_source", _data_source)
-except Exception:
-    pass
-if _data_source == "agent_candidates":
-    _collector_thread = threading.Thread(target=_collect_loop, daemon=True)
-    _collector_thread.start()
+# collector 无条件启动
+_collector_thread = threading.Thread(target=_collect_loop, daemon=True)
+_collector_thread.start()
 
 
 class TokenBody(BaseModel):
@@ -224,8 +213,8 @@ class TradingSettingsBody(BaseModel):
     order_amount: float | None = None
     agent_collect_interval_minutes: int | None = None
     agent_trigger_interval: int | None = None
-    agent_data_source: str | None = None
     strategy_initial_agent: float | None = None
+    strategy_initial_heat_agent: float | None = None
     strategy_initial_system: float | None = None
     strategy_initial_manual: float | None = None
 
@@ -618,7 +607,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "agent_data_source", "strategy_initial_agent", "strategy_initial_system", "strategy_initial_manual"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -670,87 +659,93 @@ def api_system_restart():
 # === Agent 监控 API ===
 
 @app.get("/api/agent/overview")
-def api_agent_overview():
+def api_agent_overview(strategy: str = "agent"):
     """Agent 账户概览 + 今日统计"""
+    init_key = f"strategy_initial_{strategy}"
     def compute():
         with storage.get_conn() as conn:
-            # 账户（仅 Agent 策略）
+            # 账户（策略隔离）
             settings = storage.trading_settings_get(conn)
-            initial = float(settings.get("strategy_initial_agent", 1000))
+            initial = float(settings.get(init_key, 1000))
             realized = conn.execute(
-                "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions WHERE strategy='agent'"
+                f"SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions WHERE strategy='{strategy}'"
             ).fetchone()[0]
             unrealized = conn.execute(
-                "SELECT COALESCE(SUM(unrealized_pnl),0) FROM trade_positions "
-                "WHERE status IN ('OPEN','PARTIAL') AND strategy='agent'"
+                f"SELECT COALESCE(SUM(unrealized_pnl),0) FROM trade_positions "
+                f"WHERE status IN ('OPEN','PARTIAL') AND strategy='{strategy}'"
             ).fetchone()[0]
             locked = conn.execute(
-                "SELECT COALESCE(SUM(margin_amount),0) FROM trade_positions "
-                "WHERE status IN ('OPEN','PARTIAL') AND strategy='agent'"
+                f"SELECT COALESCE(SUM(margin_amount),0) FROM trade_positions "
+                f"WHERE status IN ('OPEN','PARTIAL') AND strategy='{strategy}'"
             ).fetchone()[0]
             equity = round(initial + realized + unrealized, 2)
             available = round(initial + realized - locked, 2)
 
-            # 今日统计（仅 Agent 策略）
+            # 今日统计
             today_opens = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions "
-                "WHERE strategy='agent' AND date(created_at, '+8 hours')=date('now', '+8 hours')"
+                f"SELECT COUNT(*) FROM trade_positions "
+                f"WHERE strategy='{strategy}' AND date(created_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_closes = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions "
-                "WHERE strategy='agent' AND status='CLOSED' AND closed_at IS NOT NULL "
-                "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
+                f"SELECT COUNT(*) FROM trade_positions "
+                f"WHERE strategy='{strategy}' AND status='CLOSED' AND closed_at IS NOT NULL "
+                f"AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_wins = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions "
-                "WHERE strategy='agent' AND status='CLOSED' AND realized_pnl > 0 AND closed_at IS NOT NULL "
-                "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
+                f"SELECT COUNT(*) FROM trade_positions "
+                f"WHERE strategy='{strategy}' AND status='CLOSED' AND realized_pnl > 0 AND closed_at IS NOT NULL "
+                f"AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_losses = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions "
-                "WHERE strategy='agent' AND status='CLOSED' AND realized_pnl <= 0 AND closed_at IS NOT NULL "
-                "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
+                f"SELECT COUNT(*) FROM trade_positions "
+                f"WHERE strategy='{strategy}' AND status='CLOSED' AND realized_pnl <= 0 AND closed_at IS NOT NULL "
+                f"AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
             today_pnl = conn.execute(
-                "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions "
-                "WHERE strategy='agent' AND status='CLOSED' AND closed_at IS NOT NULL "
-                "AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
+                f"SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions "
+                f"WHERE strategy='{strategy}' AND status='CLOSED' AND closed_at IS NOT NULL "
+                f"AND date(closed_at, '+8 hours')=date('now', '+8 hours')"
             ).fetchone()[0]
 
-            # 持仓数（仅 Agent）
+            # 持仓数
             open_count = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions "
-                "WHERE status IN ('OPEN','PARTIAL') AND strategy='agent'"
+                f"SELECT COUNT(*) FROM trade_positions "
+                f"WHERE status IN ('OPEN','PARTIAL') AND strategy='{strategy}'"
             ).fetchone()[0]
 
-            # 待处理决策
+            # 待处理决策（按 source 过滤策略）
+            src_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history"}
+            src = src_map.get(strategy, "agent_candidates")
             pending = conn.execute(
-                "SELECT COUNT(*) FROM pending_decisions WHERE status='pending'"
+                "SELECT COUNT(*) FROM pending_decisions WHERE status='pending' AND source=?",
+                (src,)
             ).fetchone()[0]
             rejected_today = conn.execute(
                 "SELECT COUNT(*) FROM pending_decisions "
-                "WHERE status='rejected' AND date(created_at, '+8 hours')=date('now', '+8 hours')"
+                "WHERE status='rejected' AND source=? AND date(created_at, '+8 hours')=date('now', '+8 hours')",
+                (src,)
             ).fetchone()[0]
 
-            # 总体胜率（仅 Agent）
+            # 总体胜率
             total_closed = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions WHERE strategy='agent' AND status='CLOSED'"
+                f"SELECT COUNT(*) FROM trade_positions WHERE strategy='{strategy}' AND status='CLOSED'"
             ).fetchone()[0]
             total_wins = conn.execute(
-                "SELECT COUNT(*) FROM trade_positions "
-                "WHERE strategy='agent' AND status='CLOSED' AND realized_pnl > 0"
+                f"SELECT COUNT(*) FROM trade_positions "
+                f"WHERE strategy='{strategy}' AND status='CLOSED' AND realized_pnl > 0"
             ).fetchone()[0]
 
-            # 最大回撤（1h 缓存）
+            # 最大回撤（1h 缓存，按策略隔离）
             global _max_dd_cache
             now = time.time()
-            if _max_dd_cache["time"] and now - _max_dd_cache["time"] < 3600:
-                max_dd = _max_dd_cache["value"]
+            dd_entry = _max_dd_cache.get(strategy)
+            if dd_entry and dd_entry.get("time") and now - dd_entry["time"] < 3600:
+                max_dd = dd_entry["value"]
             else:
                 running = float(initial or 0)
                 peak = running
                 max_dd = 0.0
-                for r in conn.execute("SELECT COALESCE(realized_pnl,0) FROM trade_positions WHERE status='CLOSED' AND strategy='agent' ORDER BY closed_at").fetchall():
+                for r in conn.execute(f"SELECT COALESCE(realized_pnl,0) FROM trade_positions WHERE status='CLOSED' AND strategy='{strategy}' ORDER BY closed_at").fetchall():
                     running += float(r[0])
                     if running > peak: peak = running
                     if peak > 0:
@@ -758,7 +753,7 @@ def api_agent_overview():
                         if dd < max_dd: max_dd = dd
                 dd = (running + unrealized - peak) / peak * 100 if peak > 0 else 0
                 if dd < max_dd: max_dd = dd
-                _max_dd_cache = {"value": round(max_dd, 1), "time": time.time()}
+                _max_dd_cache[strategy] = {"value": round(max_dd, 1), "time": time.time()}
 
         win_rate = round(total_wins / total_closed * 100, 1) if total_closed > 0 else 0
         today_wr = round(today_wins / today_closes * 100, 1) if today_closes > 0 else 0
@@ -787,25 +782,25 @@ def api_agent_overview():
             "win_rate": win_rate,
             "pending_decisions": pending, "rejected_today": rejected_today,
         }
-    return _cached("agent_overview", 15.0, compute)
+    return _cached(f"agent_overview_{strategy}", 15.0, compute)
 
 
 @app.get("/api/agent/journal")
-def api_agent_journal(limit: int = 5, offset: int = 0):
-    """操作日志：仅 journal 表（已执行的交易），按时间倒排，分页"""
+def api_agent_journal(strategy: str = "agent", limit: int = 5, offset: int = 0):
+    """操作日志：策略隔离，按时间倒排，分页"""
     with storage.get_conn() as conn:
         total = conn.execute(
-            "SELECT COUNT(*) FROM journal j "
-            "JOIN trade_positions tp ON j.order_id = tp.id "
-            "WHERE tp.strategy = 'agent'"
+            f"SELECT COUNT(*) FROM journal j "
+            f"JOIN trade_positions tp ON j.order_id = tp.id "
+            f"WHERE tp.strategy = '{strategy}'"
         ).fetchone()[0]
         rows = conn.execute(
-            "SELECT j.token, j.action, j.price, j.tier, j.pnl_pct, j.close_reason, "
-            "j.hold_duration, j.reason, j.created_at "
-            "FROM journal j "
-            "JOIN trade_positions tp ON j.order_id = tp.id "
-            "WHERE tp.strategy = 'agent' "
-            "ORDER BY j.id DESC LIMIT ? OFFSET ?",
+            f"SELECT j.token, j.action, j.price, j.tier, j.pnl_pct, j.close_reason, "
+            f"j.hold_duration, j.reason, j.created_at "
+            f"FROM journal j "
+            f"JOIN trade_positions tp ON j.order_id = tp.id "
+            f"WHERE tp.strategy = '{strategy}' "
+            f"ORDER BY j.id DESC LIMIT ? OFFSET ?",
             (limit, offset)
         ).fetchall()
     return {
@@ -815,32 +810,38 @@ def api_agent_journal(limit: int = 5, offset: int = 0):
 
 
 @app.get("/api/agent/timeline")
-def api_agent_timeline(limit: int = 30, offset: int = 0):
+def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0):
     """Agent 决策时间线：journal + pending_decisions 合并，按时间倒排，分页"""
+    # strategy → pending_decisions source 映射
+    source_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history"}
+    src = source_map.get(strategy, "agent_candidates")
     with storage.get_conn() as conn:
         journal_total = conn.execute(
-            "SELECT COUNT(*) FROM journal j "
-            "JOIN trade_positions tp ON j.order_id = tp.id "
-            "WHERE tp.strategy = 'agent'"
+            f"SELECT COUNT(*) FROM journal j "
+            f"JOIN trade_positions tp ON j.order_id = tp.id "
+            f"WHERE tp.strategy = '{strategy}'"
         ).fetchone()[0]
         journal_rows = conn.execute(
-            "SELECT j.id, j.token, j.action, j.price, j.tier, j.stop_loss, "
-            "j.tp1_price, j.tp2_price, j.reason, j.dimension_data, "
-            "j.market_overview, j.lesson_checked, j.pnl_pct, j.close_reason, "
-            "j.hold_duration, j.created_at "
-            "FROM journal j "
-            "JOIN trade_positions tp ON j.order_id = tp.id "
-            "WHERE tp.strategy = 'agent' "
+            f"SELECT j.id, j.token, j.action, j.price, j.tier, j.stop_loss, "
+            f"j.tp1_price, j.tp2_price, j.reason, j.dimension_data, "
+            f"j.market_overview, j.lesson_checked, j.pnl_pct, j.close_reason, "
+            f"j.hold_duration, j.created_at "
+            f"FROM journal j "
+            f"JOIN trade_positions tp ON j.order_id = tp.id "
+            f"WHERE tp.strategy = '{strategy}' "
             "ORDER BY j.id DESC LIMIT ? OFFSET ?",
             (limit, offset)
         ).fetchall()
 
-        decision_total = conn.execute("SELECT COUNT(*) FROM pending_decisions").fetchone()[0]
+        decision_total = conn.execute(
+            f"SELECT COUNT(*) FROM pending_decisions WHERE source='{src}'"
+        ).fetchone()[0]
         decision_rows = conn.execute(
-            "SELECT id, action, token, tier, entry_price, stop_loss, "
-            "tp1_price, tp2_price, close_reason, reason, market_overview AS market_read, "
-            "status, reject_reason, consumed_at, created_at "
-            "FROM pending_decisions ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"SELECT id, action, token, tier, entry_price, stop_loss, "
+            f"tp1_price, tp2_price, close_reason, reason, market_overview AS market_read, "
+            f"status, reject_reason, consumed_at, created_at "
+            f"FROM pending_decisions WHERE source='{src}' "
+            f"ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset)
         ).fetchall()
 
@@ -858,29 +859,33 @@ def api_agent_timeline(limit: int = 30, offset: int = 0):
         timeline.append(r)
 
     timeline.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    has_more = (offset + limit) < max(journal_total, decision_total)
+    has_more = (offset + limit) < (journal_total + decision_total)
     return {"timeline": timeline[:limit], "has_more": has_more}
 
 
 
 @app.get("/api/agent/lessons")
-def api_agent_lessons(limit: int = 20, offset: int = 0, all: int = 0):
-    """Agent 教训库 + 统计，分页。all=1 显示全部含已失效"""
+def api_agent_lessons(strategy: str = "agent", limit: int = 20, offset: int = 0, all: int = 0):
+    """Agent 教训库 + 统计（策略隔离），分页。all=1 显示全部含已失效"""
     with storage.get_conn() as conn:
         if all:
-            total = conn.execute("SELECT COUNT(*) FROM lessons").fetchone()[0]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM lessons WHERE strategy='{strategy}'"
+            ).fetchone()[0]
             rows = conn.execute(
-                "SELECT * FROM lessons ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM lessons WHERE strategy='{strategy}' ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (limit, offset)
             ).fetchall()
         else:
-            total = conn.execute("SELECT COUNT(*) FROM lessons WHERE learned=0").fetchone()[0]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM lessons WHERE learned=0 AND strategy='{strategy}'"
+            ).fetchone()[0]
             rows = conn.execute(
-                "SELECT * FROM lessons WHERE learned=0 ORDER BY severity DESC, created_at DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM lessons WHERE learned=0 AND strategy='{strategy}' ORDER BY severity DESC, created_at DESC LIMIT ? OFFSET ?",
                 (limit, offset)
             ).fetchall()
         active = [dict(r) for r in rows]
-        stats = storage.lessons_stats(conn)
+        stats = storage.lessons_stats(conn, strategy)
     return {"active": active, "stats": stats, "has_more": (offset + limit) < total}
 
 
@@ -1218,11 +1223,18 @@ tr.flash { animation: row-flash 1.5s ease-out; }
   border-bottom: 1px solid var(--border); padding-bottom: 0;
 }
 .nav-bar a {
-  padding: 10px 28px; color: var(--muted); text-decoration: none;
-  font-size: 14px; font-weight: 500; border-bottom: 2px solid transparent;
+  padding: 10px 24px; color: var(--muted); text-decoration: none;
+  font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
   transition: all 0.2s;
 }
 .nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown { position: relative; }
+.nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
+.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
+.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
 </style>
 </head>
 <body>
@@ -1232,8 +1244,14 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 
 <div class="nav-bar">
   <a href="/">📊 市场监控</a>
-  <a href="/agent">🤖 Agent 面板</a>
-  <a href="/strategies">📈 策略对比</a>
+  <a href="/strategies">📈 运行策略</a>
+  <div class="nav-dropdown">
+  <a href="#">🤖 Agent 面板 ▾</a>
+  <div class="nav-dropdown-content">
+    <a href="/agent">Agent-合约扫描</a>
+    <a href="/heat-agent">Agent-热度榜单</a>
+  </div>
+</div>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -2072,7 +2090,7 @@ AGENT_HTML = """
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>Agent 监控面板</title>
+<title>Agent-合约扫描</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -2099,6 +2117,13 @@ h2 { font-size: 14px; color: var(--accent); margin: 0 0 10px; }
   font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
 }
 .nav-bar-agent a.active, .nav-bar-agent a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-bar-agent .nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
+.nav-bar-agent .nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown { position: relative; }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
+.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
 .nav-link { color: var(--accent); text-decoration: none; font-size: 12px; }
 .nav-link:hover { text-decoration: underline; }
 
@@ -2187,14 +2212,20 @@ tr:hover { background: #1f2536; }
 
 <div class="nav-bar-agent">
   <a href="/">📊 市场监控</a>
-  <a href="/agent" class="active">🤖 Agent 面板</a>
-  <a href="/strategies">📈 策略对比</a>
+  <a href="/strategies">📈 运行策略</a>
+  <div class="nav-dropdown">
+    <a href="#">🤖 Agent 面板 ▾</a>
+    <div class="nav-dropdown-content">
+      <a href="/agent">Agent-合约扫描</a>
+      <a href="/heat-agent">Agent-热度榜单</a>
+    </div>
+  </div>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
 <div class="header">
   <div>
-    <h1>Agent 监控面板</h1>
+    <h1>Agent-合约扫描</h1>
     <span class="header-time" id="clock"></span>
   </div>
 </div>
@@ -2263,6 +2294,7 @@ tr:hover { background: #1f2536; }
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : '';
+const AGENT_STRATEGY = 'agent';
 
 function fmtPct(v) {
   if (v == null) return '—';
@@ -2640,6 +2672,32 @@ setInterval(loadPositions, 5000);
 </html>
 """
 
+# 热度 Agent 面板 —— 从 Agent 面板复制，strategy 替换为 heat_agent
+HEAT_AGENT_HTML = AGENT_HTML.replace(
+    "<title>Agent-合约扫描</title>", "<title>Agent-热度榜单</title>"
+).replace(
+    "<h1>Agent-合约扫描</h1>", "<h1>Agent-热度榜单</h1>"
+).replace(
+    "strategy_initial_agent", "strategy_initial_heat_agent"
+).replace(
+    "p.strategy === 'agent'", "p.strategy === 'heat_agent'"
+).replace(
+    "const AGENT_STRATEGY = 'agent'", "const AGENT_STRATEGY = 'heat_agent'"
+).replace(
+    "'/api/agent/overview'", "'/api/agent/overview?strategy='+AGENT_STRATEGY"
+).replace(
+    "'/api/agent/journal?limit='", "'/api/agent/journal?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/timeline?limit='", "'/api/agent/timeline?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/lessons?limit='", "'/api/agent/lessons?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    '<a href="/agent" class="active">', '<a href="/agent">'
+).replace(
+    '<a href="/heat-agent">', '<a href="/heat-agent" class="active">'
+)
+
+
 SETTINGS_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -2678,18 +2736,31 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   border-bottom: 1px solid var(--border); padding-bottom: 0;
 }
 .nav-bar a {
-  padding: 10px 28px; color: var(--muted); text-decoration: none;
-  font-size: 14px; font-weight: 500; border-bottom: 2px solid transparent;
+  padding: 10px 24px; color: var(--muted); text-decoration: none;
+  font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
   transition: all 0.2s;
 }
 .nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown { position: relative; }
+.nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
+.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
+.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
 </style>
 </head>
 <body>
 <div class="nav-bar">
   <a href="/">📊 市场监控</a>
-  <a href="/agent">🤖 Agent 面板</a>
-  <a href="/strategies">📈 策略对比</a>
+  <a href="/strategies">📈 运行策略</a>
+  <div class="nav-dropdown">
+  <a href="#">🤖 Agent 面板 ▾</a>
+  <div class="nav-dropdown-content">
+    <a href="/agent">Agent-合约扫描</a>
+    <a href="/heat-agent">Agent-热度榜单</a>
+  </div>
+</div>
   <a href="/settings" class="active">⚙ 系统设置</a>
 </div>
 
@@ -2733,6 +2804,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       <input id="trade-strategy-agent" type="number" min="1" step="1">
     </div>
     <div>
+      <label>热度Agent 初始 USDT</label>
+      <input id="trade-strategy-heat" type="number" min="1" step="1">
+    </div>
+    <div>
       <label>系统策略初始 USDT</label>
       <input id="trade-strategy-system" type="number" min="1" step="1">
     </div>
@@ -2747,18 +2822,11 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   <h2>Agent 参数</h2>
   <div class="grid2">
     <div>
-      <label>数据源</label>
-      <select id="trade-data-source" onchange="toggleDataSourceOpts()">
-        <option value="agent_candidates">面板收集器</option>
-        <option value="token_heat_history">热度榜轮次</option>
-      </select>
-    </div>
-    <div id="ds-opt-candidates">
       <label>收集间隔（分钟）</label>
       <input id="trade-collect-interval" type="number" min="5" max="60" step="1">
     </div>
-    <div id="ds-opt-heat" style="display:none">
-      <label>触发间隔（轮）</label>
+    <div>
+      <label>热度Agent触发间隔（轮）</label>
       <input id="trade-trigger-interval" type="number" min="1" max="10" step="1">
     </div>
   </div>
@@ -2791,11 +2859,6 @@ function showToast(msg, kind = 'ok', d = 2500) {
   requestAnimationFrame(() => el.classList.add('show'));
   clearTimeout(el._t); el._t = setTimeout(() => el.classList.remove('show'), d);
 }
-function toggleDataSourceOpts() {
-  const src = document.getElementById('trade-data-source').value;
-  document.getElementById('ds-opt-candidates').style.display = src === 'agent_candidates' ? '' : 'none';
-  document.getElementById('ds-opt-heat').style.display = src === 'token_heat_history' ? '' : 'none';
-}
 async function loadSettings() {
   try {
     const r = await fetch('/api/trading');
@@ -2805,13 +2868,12 @@ async function loadSettings() {
     document.getElementById('trade-mode').value = s.mode || 'paper';
     document.getElementById('trade-initial').value = s.initial_balance ?? '';
     document.getElementById('trade-leverage').value = s.leverage ?? '';
-    document.getElementById('trade-data-source').value = s.agent_data_source ?? 'agent_candidates';
     document.getElementById('trade-collect-interval').value = s.agent_collect_interval_minutes ?? 15;
     document.getElementById('trade-trigger-interval').value = s.agent_trigger_interval ?? 3;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
+    document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
     document.getElementById('trade-strategy-manual').value = s.strategy_initial_manual ?? 1000;
-    toggleDataSourceOpts();
   } catch(e) { console.error(e); }
 }
 async function saveTradingSettings() {
@@ -2821,11 +2883,11 @@ async function saveTradingSettings() {
     initial_balance: Number(document.getElementById('trade-initial').value),
     leverage: Number(document.getElementById('trade-leverage').value),
     strategy_initial_agent: Number(document.getElementById('trade-strategy-agent').value),
+    strategy_initial_heat_agent: Number(document.getElementById('trade-strategy-heat').value),
     strategy_initial_system: Number(document.getElementById('trade-strategy-system').value),
     strategy_initial_manual: Number(document.getElementById('trade-strategy-manual').value),
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
     agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
-    agent_data_source: document.getElementById('trade-data-source').value,
   };
   try {
     const resp = await fetch('/api/trading/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -2901,7 +2963,7 @@ def api_strategy_stats():
         # 各策略当前持仓 + 最近平仓
         positions = [dict(r) for r in conn.execute(
             "SELECT strategy, token, side, status, entry_price, current_price, "
-            "pnl_pct, realized_pnl, stop_loss_price, tp1_price, tp2_price, "
+            "pnl_pct, realized_pnl, unrealized_pnl, stop_loss_price, tp1_price, tp2_price, "
             "margin_amount, closed_qty, quantity, created_at, closed_at "
             "FROM trade_positions WHERE strategy IS NOT NULL "
             "ORDER BY id DESC LIMIT 500"
@@ -2920,7 +2982,7 @@ STRATEGIES_HTML = """
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>策略对比 - BSM Agent</title>
+<title>运行策略 - BSM Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -2936,6 +2998,13 @@ h2 { font-size: 15px; margin: 20px 0 12px; color: var(--accent); }
 .nav-bar { display: flex; justify-content: center; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
 .nav-bar a { padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
 .nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown { position: relative; }
+.nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
+.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
+.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
 .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
 .metric { background: #0a0e15; padding: 10px 12px; border-radius: 8px; }
 .metric .label { color: var(--muted); font-size: 11px; }
@@ -2961,12 +3030,18 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 <body>
 <div class="nav-bar">
   <a href="/">📊 市场监控</a>
-  <a href="/agent">🤖 Agent 面板</a>
-  <a href="/strategies" class="active">📈 策略对比</a>
+  <a href="/strategies" class="active">📈 运行策略</a>
+  <div class="nav-dropdown">
+    <a href="#">🤖 Agent 面板 ▾</a>
+    <div class="nav-dropdown-content">
+      <a href="/agent">Agent-合约扫描</a>
+      <a href="/heat-agent">Agent-热度榜单</a>
+    </div>
+  </div>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
-<h1>📈 策略对比</h1>
+<h1>📈 运行策略</h1>
 
 <div id="content"><div style="color:var(--muted);padding:20px">加载中...</div></div>
 
@@ -2974,6 +3049,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 const fmtUsd = v => (v!=null&&!isNaN(Number(v)))?'$'+Number(v).toFixed(2):'-';
 const fmtPct = v => (v!=null&&!isNaN(Number(v)))?(v>=0?'+':'')+Number(v).toFixed(2)+'%':'-';
 const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=1?Number(v).toFixed(4):Number(v).toFixed(6));
+const fmtTime = ts => { if (!ts) return '—'; try { const d = new Date(ts.replace(' ','T')+'Z'); const m = d.getMonth()+1; const day = d.getDate(); const h = String(d.getHours()).padStart(2,'0'); const min = String(d.getMinutes()).padStart(2,'0'); return m+'/'+day+' '+h+':'+min; } catch { return ts; } };
 
 async function load() {
   try {
@@ -2986,6 +3062,7 @@ async function load() {
     }
     const badge = {
       agent: '<span class="strategy-badge badge-agent">🤖 Agent 策略</span>',
+      heat_agent: '<span class="strategy-badge" style="background:#3a1f5f;color:#c4a0ff">📡 热度Agent</span>',
       system: '<span class="strategy-badge badge-system">⚙ 系统策略</span>',
       manual: '<span class="strategy-badge badge-manual">👆 手动策略</span>',
     };
@@ -3035,24 +3112,24 @@ async function load() {
       if (openList.length) {
         html += `<div class="toggle-section">
           <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📌 当前持仓 (${openList.length}) ▾</div>
-          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th>锁利</th><th class="right">入场</th><th class="right">现价</th><th class="right">PnL%</th><th class="right">止损</th><th class="right">TP1</th><th class="right">TP2</th><th>持仓</th></tr></thead><tbody>`;
+          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th>锁利</th><th class="right">入场</th><th class="right">现价</th><th class="right">PnL%</th><th class="right">PnL$</th><th class="right">止损</th><th class="right">TP1</th><th class="right">TP2</th><th>持仓</th></tr></thead><tbody>`;
         for (const p of openList) {
           const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
           const cq = Number(p.closed_qty||0), tq = Number(p.quantity||0);
           const lockedPct = tq > 0 ? (cq/tq*100) : 0;
           let hold = '—';
           if (p.created_at) { try { const d = new Date(p.created_at.replace(' ','T')+'Z'); const h = Math.floor((Date.now()-d)/3600000); const m = Math.floor((Date.now()-d)/60000)%60; hold = (h?h+'h':'')+m+'m'; } catch(e) {} }
-          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td style="color:var(--green);font-size:11px">${lockedPct>0?'🔒'+lockedPct.toFixed(0)+'%':'—'}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right">${fmtPrice(p.stop_loss_price)}</td><td class="right">${fmtPrice(p.tp1_price)}</td><td class="right">${fmtPrice(p.tp2_price)}</td><td style="font-size:11px;white-space:nowrap">${hold}</td></tr>`;
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td style="color:var(--green);font-size:11px">${lockedPct>0?'🔒'+lockedPct.toFixed(0)+'%':'—'}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.unrealized_pnl)}</td><td class="right">${fmtPrice(p.stop_loss_price)}</td><td class="right">${fmtPrice(p.tp1_price)}</td><td class="right">${fmtPrice(p.tp2_price)}</td><td style="font-size:11px;white-space:nowrap">${hold}</td></tr>`;
         }
         html += `</tbody></table></div></div>`;
       }
       if (closedList.length) {
         html += `<div class="toggle-section">
           <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📋 最近平仓 (${closedList.length}) ▾</div>
-          <div class="toggle-body"><table><thead><tr><th>代币</th><th>方向</th><th class="right">入场</th><th class="right">平仓</th><th class="right">PnL%</th><th class="right">盈亏</th></tr></thead><tbody>`;
+          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th class="right">入场</th><th class="right">平仓</th><th class="right">PnL%</th><th class="right">盈亏</th><th>平仓时间</th></tr></thead><tbody>`;
         for (const p of closedList) {
           const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
-          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.realized_pnl)}</td></tr>`;
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.realized_pnl)}</td><td style="font-size:11px;white-space:nowrap">${fmtTime(p.closed_at)}</td></tr>`;
         }
         html += `</tbody></table></div></div>`;
       }
@@ -3066,6 +3143,13 @@ load();
 </body>
 </html>
 """
+
+@app.get("/heat-agent", response_class=HTMLResponse)
+def heat_agent_page():
+    return HTMLResponse(
+        content=HEAT_AGENT_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
 
 @app.get("/strategies", response_class=HTMLResponse)
 def strategies_page():

@@ -9,7 +9,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Write Agent decisions to pending_decisions")
 parser.add_argument("--decisions", required=True, help="Path to Agent-generated decisions JSON file")
-parser.add_argument("--source", default="agent_candidates", help="Data source: agent_candidates / token_heat_history")
+parser.add_argument("--source", default="token_heat_history", help="Data source")
 args = parser.parse_args()
 
 # 路径：基于脚本自身位置，不依赖工作目录

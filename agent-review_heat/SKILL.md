@@ -1,6 +1,6 @@
 ---
-name: agent-review
-description: 交易复盘。读取未复盘的 journal，关联开平仓，交叉分析，提炼经验。
+name: agent-review-heat
+description: 热度策略交易复盘。读取未复盘的 journal，关联开平仓，交叉分析，提炼经验。
 tags: [crypto, trading, agent, review]
 model: deepseek
 allowed-tools: [Bash, Read, Write]
@@ -19,7 +19,7 @@ allowed-tools: [Bash, Read, Write]
 ### 第一步：读数据
 
 ```bash
-python3 /root/binance-monitor/bsm-agent/agent-review/scripts/extract_review_data.py --output /tmp/review_data.json
+python3 /root/binance-monitor/bsm-agent/agent-review_heat/scripts/extract_review_data.py --output /tmp/review_data_heat.json
 ```
 
 输出 JSON 包含：未复盘的 journal（已过滤噪音和未平仓）、开平仓记录、已平仓持仓、已有 lessons、止损标签统计。各字段含义详见 `references/复盘数据字段说明.md`。
@@ -62,7 +62,7 @@ JSON 是单行压缩的，用 Python 解析。代码写到 `/tmp/*.py` 再执行
 详见 `references/lessons字段说明.md`。
 
 ```bash
-python3 /root/binance-monitor/bsm-agent/agent-review/scripts/write_lessons.py --lessons /tmp/agent_lessons.json --strategy agent --journal-ids "从提取数据中的journal_ids字段取，逗号拼接，无论这笔单子是否生成了教训，都必须传全量 ID，以标记整批数据已处理完，防止死循环！无则传 NONE"
+python3 /root/binance-monitor/bsm-agent/agent-review_heat/scripts/write_lessons.py --lessons /tmp/agent_lessons_heat.json --strategy heat_agent --journal-ids "从提取数据中的journal_ids字段取，逗号拼接，无论这笔单子是否生成了教训，都必须传全量 ID，以标记整批数据已处理完，防止死循环！无则传 NONE"
 ```
 
 每条教训一个模式。不要写"下次小心"，也不要写"X>Y就不开仓"。用三段式描述情境、倾向和策略。

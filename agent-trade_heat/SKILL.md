@@ -1,9 +1,9 @@
 ---
-name: agent-trade
+name: agent-trade-heat
 description: |
-  加密货币合约自主交易决策。读取市场原始数据，自主分析候选币，
-  查历史教训，决定开仓/跳过。追求胜率≥55%，盈亏比≥2:1。
-  触发词：开单、看盘、选币、要不要买、仓位管理、交易决策。
+  热度榜交易决策（token_heat_history 数据源）。读取热度榜+合约快照，
+  自主分析候选币，查历史教训，决定开仓/跳过。
+  触发词：热单、热度看盘、热度选币。
   运行频率由外部 cron 决定，skill 不限定间隔。
 tags: [crypto, trading, agent, binance, futures]
 model: deepseek
@@ -33,7 +33,7 @@ allowed-tools: [Bash, Read, Write]
 ### 第一步：读数据
 
 ```bash
-python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.py --output /tmp/market_data.json
+python3 /root/binance-monitor/bsm-agent/agent-trade_heat/scripts/extract_market_data.py --output /tmp/market_data_heat.json
 ```
 
 脚本输出单行压缩 JSON。直接 Read 会截断，用 Python 脚本写到 `/tmp/*.py` 再执行（`python3 -c` 被审批拦截）。
@@ -98,7 +98,7 @@ python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.
 构造完成后执行：
 
 ```bash
-python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/write_decisions.py --decisions /tmp/agent_decisions.json --source agent_candidates
+python3 /root/binance-monitor/bsm-agent/agent-trade_heat/scripts/write_decisions.py --decisions /tmp/agent_decisions_heat.json --source token_heat_history
 ```
 
 验证输出中的 `status=`：`pending` 表示通过，`rejected` 表示被拒需修正。

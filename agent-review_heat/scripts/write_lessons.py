@@ -10,7 +10,7 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description="Write review lessons to DB")
 parser.add_argument("--lessons", required=True, help="Path to Agent-generated lessons JSON file")
 parser.add_argument("--journal-ids", required=True, help="'NONE' or comma-separated journal IDs to mark as reviewed")
-parser.add_argument("--strategy", default="agent", help="Strategy: agent / heat_agent")
+parser.add_argument("--strategy", default="heat_agent", help="Strategy")
 args = parser.parse_args()
 
 # 路径：基于脚本自身位置
