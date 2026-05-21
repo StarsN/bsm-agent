@@ -329,17 +329,19 @@ async def one_round(scraper: SquareScraper):
 
     # 触发热度 Agent（token_heat_history 数据源，间隔从 DB 读取即时生效）
     trigger_interval = getattr(config, "HEAT_AGENT_TRIGGER_INTERVAL", 3)
+    ts_heat = {}
     try:
         with storage.get_conn() as conn:
-            ts = storage.trading_settings_get(conn)
-        trigger_interval = int(ts.get("agent_trigger_interval", trigger_interval))
+            ts_heat = storage.trading_settings_get(conn)
+        trigger_interval = int(ts_heat.get("agent_trigger_interval", trigger_interval))
     except Exception:
         pass
     if _ROUND_NUMBER % trigger_interval == 0:
         try:
             import subprocess
+            heat_enabled = ts_heat.get("heat_agent_enabled", True)
             heat_job_id = getattr(config, "HEAT_AGENT_HERMES_JOB_ID", "")
-            if heat_job_id:
+            if heat_enabled and heat_job_id:
                 subprocess.run(
                     ["hermes", "cron", "run", heat_job_id],
                     timeout=10, capture_output=True, text=True,

@@ -39,6 +39,7 @@ def _build_chrome_args() -> list[str]:
             "--disable-component-extensions-with-background-pages",
             "--disable-sync",
             "--no-sandbox",
+            "--renderer-process-limit=1",
             "--js-flags=--max-old-space-size=256",
         ])
     return args

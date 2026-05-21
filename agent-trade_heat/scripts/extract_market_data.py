@@ -278,7 +278,7 @@ for r in conn.execute(
 agent_lessons = [dict(r) for r in conn.execute(
     """SELECT id, token, direction, entry_price, exit_price, pnl_pct,
        signal_error, what_missed, root_cause, lesson, rule_update, severity
-       FROM lessons WHERE learned=0
+       FROM lessons WHERE learned=2
        AND strategy = 'heat_agent'
        AND rule_update IS NOT NULL AND rule_update != ''
        ORDER BY severity DESC, created_at DESC"""

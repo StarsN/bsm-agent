@@ -225,7 +225,7 @@ def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") 
                    WHERE id = ?""",
                 (entry, sl, tp1, tp2, dec_id),
             )
-    return {"ok": ok}
+    return {"ok": ok} if ok else {"ok": False, "reason": "仓位写入DB失败（唯一索引冲突？）"}
 
 
 def execute_close(conn, decision: dict) -> dict:

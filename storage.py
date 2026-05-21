@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS token_heat_history (
     total_shares  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_heat_token ON token_heat_history(token, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_heat_round ON token_heat_history(round_number);
 
 -- 收藏入场记录：收藏时的锚定数据
 CREATE TABLE IF NOT EXISTS watchlist_entries (
@@ -299,6 +300,43 @@ CREATE TABLE IF NOT EXISTS agent_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_agent_candidates_round ON agent_candidates(round_number);
 CREATE INDEX IF NOT EXISTS idx_agent_candidates_token_round ON agent_candidates(token, round_number);
+
+-- KOL Agent 分析结果
+CREATE TABLE IF NOT EXISTS kol_analyses (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token           TEXT NOT NULL,
+    trend           TEXT,
+    timeline        TEXT,
+    price_levels    TEXT,
+    position_analysis TEXT,
+    timing          TEXT,
+    risk_control    TEXT,
+    direction       TEXT,
+    confidence      TEXT,
+    reason          TEXT,
+    raw_response    TEXT,
+    system_prompt   TEXT,
+    user_prompt     TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_kol_analyses_token ON kol_analyses(token);
+CREATE INDEX IF NOT EXISTS idx_kol_analyses_created ON kol_analyses(created_at);
+
+-- KOL Agent 候选币累积表（独立于 agent_candidates，按 KOL 自己的周期入库）
+CREATE TABLE IF NOT EXISTS kol_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number    INTEGER NOT NULL,
+    token           TEXT NOT NULL,
+    data            TEXT,
+    tier            TEXT,
+    passed          INTEGER DEFAULT 1,
+    hard_blocks     TEXT,
+    pass_count      INTEGER,
+    signal_key      TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_kol_candidates_round ON kol_candidates(round_number);
+CREATE INDEX IF NOT EXISTS idx_kol_candidates_token_round ON kol_candidates(token, round_number);
 """
 
 
@@ -408,6 +446,16 @@ def _migrate(conn):
         conn.execute("ALTER TABLE lessons ADD COLUMN strategy TEXT DEFAULT 'agent'")
     # lessons 新索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_lessons_ca ON lessons(created_at)")
+    # kol_analyses 存 prompt
+    ka_cols = [r[1] for r in conn.execute("PRAGMA table_info(kol_analyses)").fetchall()]
+    if "system_prompt" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN system_prompt TEXT")
+    if "user_prompt" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN user_prompt TEXT")
+    # round_candidates 遗留表，无人读写的弃用数据
+    conn.execute("DELETE FROM round_candidates")
+    # token_heat_history round_number 索引
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_heat_round ON token_heat_history(round_number)")
 
 
 def init_db():
@@ -597,12 +645,11 @@ def heat_history_purge_old(conn, keep_last_rounds: int = 200):
     """只保留最近 N 轮的历史（避免库无限增长）"""
     conn.execute("""
         DELETE FROM token_heat_history
-        WHERE id NOT IN (
-            SELECT id FROM token_heat_history
-            ORDER BY id DESC
-            LIMIT ?
+        WHERE round_number <= (
+            SELECT COALESCE(MAX(round_number), 0) - ?
+            FROM token_heat_history
         )
-    """, (keep_last_rounds * 500,))  # 假设每轮最多 500 个代币
+    """, (keep_last_rounds,))
 
 
 def leaderboard_signal_key(conn) -> str:
@@ -798,6 +845,11 @@ def trading_settings_defaults() -> dict:
         "strategy_initial_heat_agent": getattr(config, "STRATEGY_INITIAL_HEAT_AGENT", 1000),
         "strategy_initial_system": getattr(config, "STRATEGY_INITIAL_SYSTEM", 1000),
         "strategy_initial_manual": getattr(config, "STRATEGY_INITIAL_MANUAL", 1000),
+        "strategy_initial_kol_agent": getattr(config, "STRATEGY_INITIAL_KOL_AGENT", 1000),
+        "kol_agent_interval_minutes": getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15),
+        "agent_trade_enabled": getattr(config, "AGENT_TRADE_ENABLED", True),
+        "heat_agent_enabled": getattr(config, "HEAT_AGENT_ENABLED", True),
+        "kol_agent_enabled": getattr(config, "KOL_AGENT_ENABLED", True),
     }
 
 
@@ -806,7 +858,7 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
         elif row["key"] in {"initial_balance", "leverage", "order_amount"}:
             try:
@@ -820,7 +872,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "kol_agent_interval_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -877,6 +929,14 @@ def trade_signal_lock_acquire(conn, token: str, signal_key: str, strategy: str =
         return True
     except sqlite3.IntegrityError:
         return False
+
+
+def trade_signal_lock_release(conn, token: str, strategy: str):
+    """平仓时释放对应策略的信号锁"""
+    conn.execute(
+        "DELETE FROM trade_signal_locks WHERE token=? AND strategy=?",
+        (token.upper(), strategy),
+    )
 
 
 def trade_signal_lock_cleanup(conn, retention_hours: int = 72) -> int:
@@ -1258,3 +1318,83 @@ def watchlist_followups_purge_old(conn, days: int = 3):
     )
 
 
+
+
+# === KOL Agent ===
+
+def kol_analysis_insert(conn, analysis: dict):
+    import json as _json
+    conn.execute(
+        """INSERT INTO kol_analyses
+            (token, trend, timeline, price_levels, position_analysis,
+             timing, risk_control, direction, confidence, reason, raw_response,
+             system_prompt, user_prompt)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            analysis["token"], analysis.get("trend"),
+            _json.dumps(analysis.get("timeline"), ensure_ascii=False),
+            _json.dumps(analysis.get("price_levels"), ensure_ascii=False),
+            analysis.get("position_analysis"),
+            analysis.get("timing"),
+            _json.dumps(analysis.get("risk_control"), ensure_ascii=False),
+            analysis.get("direction"), analysis.get("confidence"),
+            analysis.get("reason"), analysis.get("raw_response"),
+            analysis.get("system_prompt"),
+            analysis.get("user_prompt"),
+        ),
+    )
+
+
+def kol_analyses_latest(conn):
+    import json as _json
+    rows = conn.execute(
+        "SELECT * FROM kol_analyses "
+        "WHERE created_at >= datetime('now', '-24 hours') "
+        "ORDER BY id DESC"
+    ).fetchall()
+    results = []
+    for r in rows:
+        d = dict(r)
+        for field in ("timeline", "price_levels", "risk_control"):
+            try:
+                d[field] = _json.loads(d[field]) if d[field] else None
+            except (Exception):
+                pass
+        results.append(d)
+    return results
+
+
+# === KOL 候选币累积 ===
+
+def kol_candidates_insert_batch(conn, round_number: int, batch: list[dict]):
+    conn.executemany(
+        """INSERT INTO kol_candidates
+            (round_number, token, data, tier, passed, hard_blocks, pass_count, signal_key)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        [(round_number, r["token"], r["data"], r.get("tier"), r.get("passed", 1),
+          r.get("hard_blocks"), r.get("pass_count", 0), r.get("signal_key"))
+         for r in batch],
+    )
+
+
+def kol_candidates_latest_round(conn):
+    """返回最新一轮的候选币，data 字段不反序列化（由调用方处理）"""
+    row = conn.execute(
+        "SELECT MAX(round_number) FROM kol_candidates"
+    ).fetchone()
+    if not row or row[0] is None:
+        return []
+    round_num = row[0]
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM kol_candidates WHERE round_number=? ORDER BY id", (round_num,)
+    ).fetchall()]
+
+
+def kol_candidates_purge_old(conn, keep_last_rounds: int = 30):
+    """只保留最近 N 轮数据"""
+    row = conn.execute(
+        "SELECT DISTINCT round_number FROM kol_candidates ORDER BY round_number DESC LIMIT 1 OFFSET ?",
+        (keep_last_rounds,)
+    ).fetchone()
+    if row:
+        conn.execute("DELETE FROM kol_candidates WHERE round_number <= ?", (row[0],))

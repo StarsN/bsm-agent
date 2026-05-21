@@ -22,6 +22,7 @@ import trade_logic
 from analyzer import compute_short_scores, compute_composite_scores
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
 from signals import analyze as analyze_signals
+import kol_agent
 
 
 app = FastAPI(title="Binance Square Monitor")
@@ -67,6 +68,12 @@ _collected = {}          # token → {token, data, tier, passed, ...}
 _last_flush = time.time()
 _flush_lock = threading.Lock()
 
+# KOL Agent 独立累积器
+_kol_collected = {}
+_kol_last_flush = 0.0
+_kol_round = 0
+_kol_running = False          # 防重叠：上一轮未完成时不触发
+
 
 def _build_data_blob(candidate: dict) -> dict:
     """组装与 extract 脚本同格式的候选币 data JSON"""
@@ -100,6 +107,7 @@ def _build_data_blob(candidate: dict) -> dict:
         "tier": candidate["tier"], "passed": candidate["passed"],
         "hard_block": candidate["hard_block"],
         "pass_count": candidate["pass_count"],
+        "signal_key": candidate.get("signal_key", ""),
         "suggestion": candidate["suggestion"], "reasons": candidate["reasons"],
     }
 
@@ -111,8 +119,21 @@ def _scan_candidates():
             conn, items, passed_only=True)
 
 
+def _run_kol_agent():
+    """后台执行 KOL Agent，不阻塞 collector"""
+    global _kol_running
+    try:
+        with storage.get_conn() as conn:
+            kol_agent.analyze_candidates(conn)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        _kol_running = False
+
+
 def _collect_loop():
-    global _collected, _last_flush
+    global _collected, _last_flush, _kol_collected, _kol_last_flush, _kol_round, _kol_running
     poll_seconds = getattr(config, "AGENT_COLLECT_POLL_SECONDS", 5)
     cache_ttl = getattr(config, "AGENT_COLLECT_CACHE_TTL", 5)
 
@@ -125,10 +146,23 @@ def _collect_loop():
         except Exception:
             return getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)
 
+    def _read_kol_interval():
+        try:
+            with storage.get_conn() as conn:
+                ts = storage.trading_settings_get(conn)
+            return int(ts.get("kol_agent_interval_minutes",
+                       getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15)))
+        except Exception:
+            return getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15)
+
     interval_seconds = _read_interval() * 60
-    _last_flush = time.time()  # 线程启动开始计时
+    kol_interval_seconds = _read_kol_interval() * 60
+    now_start = time.time()
+    _last_flush = now_start
+    _kol_last_flush = now_start
     _last_heartbeat = 0
-    print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库", flush=True)
+    ts_settings = {}  # 心跳刷新，供 flush 点读取开关
+    print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库，KOL 每 {kol_interval_seconds // 60} 分钟触发", flush=True)
 
     while True:
         try:
@@ -145,6 +179,17 @@ def _collect_loop():
                     "pass_count": c.get("pass_count", 0),
                     "signal_key": c.get("signal_key", ""),
                 }
+                # KOL Agent：独立累积（开关关闭时跳过，passed 的才收，用 _build_data_blob 展平）
+                if ts_settings.get("kol_agent_enabled", True) and c.get("passed"):
+                    _kol_collected[c["token"]] = {
+                        "token": c["token"],
+                        "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
+                        "tier": c.get("tier", ""),
+                        "passed": 1,
+                        "hard_blocks": json.dumps(c.get("hard_block", [])),
+                        "pass_count": c.get("pass_count", 0),
+                        "signal_key": c.get("signal_key", ""),
+                    }
 
             now = time.time()
             if now - _last_heartbeat >= 60:
@@ -152,8 +197,8 @@ def _collect_loop():
                 # 即时生效：从 DB 重读间隔
                 try:
                     with storage.get_conn() as conn:
-                        ts = storage.trading_settings_get(conn)
-                    new_interval = int(ts.get("agent_collect_interval_minutes",
+                        ts_settings = storage.trading_settings_get(conn)
+                    new_interval = int(ts_settings.get("agent_collect_interval_minutes",
                                getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
                     new_interval *= 60
                 except Exception:
@@ -161,9 +206,20 @@ def _collect_loop():
                 if new_interval != interval_seconds:
                     print(f"[collect] 间隔变更: {interval_seconds//60} → {new_interval//60} 分钟", flush=True)
                     interval_seconds = new_interval
+                try:
+                    new_kol_interval = int(ts_settings.get("kol_agent_interval_minutes",
+                                           getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15))) * 60
+                except Exception:
+                    new_kol_interval = _read_kol_interval() * 60
+                if new_kol_interval != kol_interval_seconds:
+                    print(f"[kol-collect] KOL间隔变更: {kol_interval_seconds//60} → {new_kol_interval//60} 分钟", flush=True)
+                    kol_interval_seconds = new_kol_interval
                 remaining = max(0, interval_seconds - (now - _last_flush))
+                kol_remaining = max(0, kol_interval_seconds - (now - _kol_last_flush))
                 print(f"[collect] 距下次入库约 {remaining/60:.0f} 分钟"
-                      f"（已收集 {len(_collected)} 个）", flush=True)
+                      f"（已收集 {len(_collected)} 个），"
+                      f"KOL 距触发约 {kol_remaining/60:.0f} 分钟"
+                      f"（已累积 {len(_kol_collected)} 个）", flush=True)
 
             with _flush_lock:
                 if now - _last_flush >= interval_seconds and _collected:
@@ -180,15 +236,32 @@ def _collect_loop():
                     _collected.clear()
                     _last_flush = now
 
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    print(f"[collect] {ts} 入库 {len(batch)} 个候选"
+                    ts_str = datetime.now().strftime("%H:%M:%S")
+                    print(f"[collect] {ts_str} 入库 {len(batch)} 个候选"
                           f"（距上次 {elapsed/60:.0f} 分钟），已触发 Agent", flush=True)
-                    job_id = getattr(config, "AGENT_HERMES_JOB_ID", "")
-                    if job_id:
-                        subprocess.run(
-                            ["hermes", "cron", "run", job_id],
-                            timeout=10, capture_output=True, text=True,
-                        )
+                    if ts_settings.get("agent_trade_enabled", True):
+                        job_id = getattr(config, "AGENT_HERMES_JOB_ID", "")
+                        if job_id:
+                            subprocess.run(
+                                ["hermes", "cron", "run", job_id],
+                                timeout=10, capture_output=True, text=True,
+                            )
+
+            # === KOL Agent 独立定时触发 ===
+            if (ts_settings.get("kol_agent_enabled", True) and _kol_collected
+                    and not _kol_running and now - _kol_last_flush >= kol_interval_seconds):
+                _kol_last_flush = now
+                _kol_running = True
+                _kol_round += 1
+                batch = list(_kol_collected.values())
+                with storage.get_conn() as conn:
+                    storage.kol_candidates_insert_batch(conn, _kol_round, batch)
+                    storage.kol_candidates_purge_old(conn, keep_last_rounds=30)
+                _kol_collected.clear()
+                ts_str = datetime.now().strftime("%H:%M:%S")
+                print(f"[kol-collect] {ts_str} 入库 {len(batch)} 个KOL候选"
+                      f"（第{_kol_round}轮），触发 DeepSeek", flush=True)
+                threading.Thread(target=_run_kol_agent, daemon=True).start()
 
         except Exception:
             import traceback
@@ -217,6 +290,11 @@ class TradingSettingsBody(BaseModel):
     strategy_initial_heat_agent: float | None = None
     strategy_initial_system: float | None = None
     strategy_initial_manual: float | None = None
+    kol_agent_interval_minutes: int | None = None
+    strategy_initial_kol_agent: float | None = None
+    agent_trade_enabled: bool | None = None
+    heat_agent_enabled: bool | None = None
+    kol_agent_enabled: bool | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -607,7 +685,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "kol_agent_interval_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1250,6 +1328,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
   <div class="nav-dropdown-content">
     <a href="/agent">Agent-合约扫描</a>
     <a href="/heat-agent">Agent-热度榜单</a>
+    <a href="/kol">Agent-KOL</a>
   </div>
 </div>
   <a href="/settings">⚙ 系统设置</a>
@@ -1919,6 +1998,7 @@ async function saveTradingSettings() {
     leverage: Number(document.getElementById('trade-leverage').value),
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
     agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
+    kol_agent_interval_minutes: Number(document.getElementById('trade-kol-interval').value),
     agent_data_source: document.getElementById('trade-data-source').value,
   };
   try {
@@ -2218,6 +2298,7 @@ tr:hover { background: #1f2536; }
     <div class="nav-dropdown-content">
       <a href="/agent">Agent-合约扫描</a>
       <a href="/heat-agent">Agent-热度榜单</a>
+      <a href="/kol">Agent-KOL</a>
     </div>
   </div>
   <a href="/settings">⚙ 系统设置</a>
@@ -2733,19 +2814,19 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .toast.err { background: var(--red); }
 .nav-bar {
   display: flex; justify-content: center; gap: 0; margin-bottom: 20px;
-  border-bottom: 1px solid var(--border); padding-bottom: 0;
+  border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap;
 }
 .nav-bar a {
-  padding: 10px 24px; color: var(--muted); text-decoration: none;
-  font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
-  transition: all 0.2s;
+  padding: 8px 16px; color: var(--muted); text-decoration: none;
+  font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent;
+  transition: all 0.2s; white-space: nowrap;
 }
 .nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
 .nav-dropdown { position: relative; }
-.nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
+.nav-dropdown > a { display: inline-block; padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
 .nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
-.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 140px; z-index: 100; padding: 4px 0; }
+.nav-dropdown-content a { display: block; padding: 6px 14px; color: var(--text); border-bottom: none !important; font-size: 12px; white-space: nowrap; }
 .nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
 .nav-dropdown:hover .nav-dropdown-content { display: block; }
 </style>
@@ -2759,6 +2840,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   <div class="nav-dropdown-content">
     <a href="/agent">Agent-合约扫描</a>
     <a href="/heat-agent">Agent-热度榜单</a>
+    <a href="/kol">Agent-KOL</a>
   </div>
 </div>
   <a href="/settings" class="active">⚙ 系统设置</a>
@@ -2815,6 +2897,37 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       <label>手动策略初始 USDT</label>
       <input id="trade-strategy-manual" type="number" min="1" step="1">
     </div>
+    <div>
+      <label>KOL 策略初始 USDT</label>
+      <input id="trade-strategy-kol" type="number" min="1" step="1">
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Agent 开关</h2>
+  <div class="grid2">
+    <div>
+      <label>Agent-合约扫描</label>
+      <select id="trade-agent-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
+      <label>Agent-热度榜单</label>
+      <select id="trade-heat-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
+      <label>Agent-KOL</label>
+      <select id="trade-kol-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
   </div>
 </div>
 
@@ -2828,6 +2941,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <div>
       <label>热度Agent触发间隔（轮）</label>
       <input id="trade-trigger-interval" type="number" min="1" max="10" step="1">
+    </div>
+    <div>
+      <label>KOL Agent 触发间隔（分钟）</label>
+      <input id="trade-kol-interval" type="number" min="10" max="480" step="5">
     </div>
   </div>
 </div>
@@ -2870,10 +2987,15 @@ async function loadSettings() {
     document.getElementById('trade-leverage').value = s.leverage ?? '';
     document.getElementById('trade-collect-interval').value = s.agent_collect_interval_minutes ?? 15;
     document.getElementById('trade-trigger-interval').value = s.agent_trigger_interval ?? 3;
+    document.getElementById('trade-kol-interval').value = s.kol_agent_interval_minutes ?? 15;
+    document.getElementById('trade-agent-switch').value = s.agent_trade_enabled ?? true;
+    document.getElementById('trade-heat-switch').value = s.heat_agent_enabled ?? true;
+    document.getElementById('trade-kol-switch').value = s.kol_agent_enabled ?? true;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
     document.getElementById('trade-strategy-manual').value = s.strategy_initial_manual ?? 1000;
+    document.getElementById('trade-strategy-kol').value = s.strategy_initial_kol_agent ?? 1000;
   } catch(e) { console.error(e); }
 }
 async function saveTradingSettings() {
@@ -2886,8 +3008,13 @@ async function saveTradingSettings() {
     strategy_initial_heat_agent: Number(document.getElementById('trade-strategy-heat').value),
     strategy_initial_system: Number(document.getElementById('trade-strategy-system').value),
     strategy_initial_manual: Number(document.getElementById('trade-strategy-manual').value),
+    strategy_initial_kol_agent: Number(document.getElementById('trade-strategy-kol').value),
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
     agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
+    kol_agent_interval_minutes: Number(document.getElementById('trade-kol-interval').value),
+    agent_trade_enabled: document.getElementById('trade-agent-switch').value === 'true',
+    heat_agent_enabled: document.getElementById('trade-heat-switch').value === 'true',
+    kol_agent_enabled: document.getElementById('trade-kol-switch').value === 'true',
   };
   try {
     const resp = await fetch('/api/trading/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -2977,6 +3104,206 @@ def api_strategy_stats():
     return {"strategies": strategies}
 
 
+# === KOL Agent API ===
+
+@app.get("/api/kol/analyses")
+def api_kol_analyses():
+    with storage.get_conn() as conn:
+        rows = storage.kol_analyses_latest(conn)
+    tokens = list(dict.fromkeys(r["token"] for r in rows))
+    by_token = {}
+    for r in rows:
+        by_token.setdefault(r["token"], []).append(r)
+    return {"tokens": tokens, "by_token": by_token}
+
+
+KOL_AGENT_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent-KOL 分析 - BSM Agent</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
+  --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
+  --yellow: #d29922;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Inter','JetBrains Mono',-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif; padding: 20px; max-width: 1200px; margin: 0 auto; font-size: 13px; }
+h1 { font-size: 20px; margin-bottom: 4px; }
+h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
+.nav-bar {
+  display: flex; justify-content: center; gap: 0; margin-bottom: 16px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap;
+}
+.nav-bar a {
+  padding: 8px 16px; color: var(--muted); text-decoration: none;
+  font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent;
+  transition: all 0.2s; white-space: nowrap;
+}
+.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown { position: relative; }
+.nav-dropdown > a { display: inline-block; padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
+.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 140px; z-index: 100; padding: 4px 0; }
+.nav-dropdown-content a { display: block; padding: 6px 14px; color: var(--text); border-bottom: none !important; font-size: 12px; white-space: nowrap; }
+.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.header-time { color: var(--muted); font-size: 12px; }
+.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.card-token { font-size: 16px; font-weight: 700; color: var(--accent); }
+.card-badges { display: flex; gap: 6px; }
+.badge { padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+.badge-short { background: #3a1a1a; color: var(--red); }
+.badge-long { background: #1a3a1a; color: var(--green); }
+.badge-none { background: #1a1a2a; color: var(--muted); }
+.badge-high { background: #1a3a1a; color: var(--green); }
+.badge-medium { background: #3a3a1a; color: var(--yellow); }
+.badge-low { background: #3a1a1a; color: var(--red); }
+.price-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 10px; }
+.price-table td { padding: 3px 6px; border-bottom: 1px solid var(--border); }
+.price-table .label { color: var(--muted); }
+.price-table .value { text-align: right; font-weight: 500; }
+.section-title { font-size: 12px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+.timeline-item { padding: 3px 0; font-size: 12px; display: flex; gap: 8px; }
+.timeline-time { color: var(--muted); min-width: 50px; }
+.timeline-event { padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; min-width: 48px; text-align: center; }
+.event-SHORT { background: #3a1a1a; color: var(--red); }
+.event-LONG { background: #1a3a1a; color: var(--green); }
+.event-WAIT { background: #1a1a2a; color: var(--muted); }
+.event-NOTE { background: #1a2a3a; color: var(--accent); }
+.analysis-text { font-size: 12px; color: var(--text); line-height: 1.5; margin: 4px 0; }
+.token-tab { padding: 6px 16px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+.token-tab:hover { border-color: var(--accent); }
+.empty { text-align: center; color: var(--muted); padding: 40px; }
+</style>
+</head>
+<body>
+
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/strategies">📈 运行策略</a>
+  <div class="nav-dropdown">
+    <a href="#">🤖 Agent 面板 ▾</a>
+    <div class="nav-dropdown-content">
+      <a href="/agent">Agent-合约扫描</a>
+      <a href="/heat-agent">Agent-热度榜单</a>
+      <a href="/kol" class="active">Agent-KOL</a>
+    </div>
+  </div>
+  <a href="/settings">⚙ 系统设置</a>
+</div>
+
+<div class="header">
+  <div>
+    <h1>Agent-KOL 分析</h1>
+    <span style="color:var(--muted);font-size:12px">基于KOL交易体系蒸馏的盘面结构分析</span>
+  </div>
+  <span class="header-time" id="clock"></span>
+</div>
+
+<div id="token-tabs"></div>
+<div id="content"><div class="empty">加载中...</div></div>
+
+<script>
+const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':Number(v).toFixed(6);
+const esc = s => s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : '';
+let _byToken = {};
+let _activeToken = '';
+
+function renderCard(a, showToken) {
+  const dirBadge = a.direction === 'long' ? '<span class="badge badge-long">LONG</span>'
+    : a.direction === 'short' ? '<span class="badge badge-short">SHORT</span>'
+    : '<span class="badge badge-none">NONE</span>';
+  const confScore = Number(a.confidence) || 0;
+  const confClass = confScore >= 80 ? 'badge-high' : confScore >= 50 ? 'badge-medium' : 'badge-low';
+  const confBadge = '<span class="badge ' + confClass + '">' + confScore + '</span>';
+  const timeStr = a.created_at ? a.created_at.replace('T',' ').substring(5,16) : '';
+
+  let priceHtml = '';
+  const pl = a.price_levels || {};
+  const priceKeys = [
+    ['现价','current'],['支撑','support'],['阻力','resistance'],
+    ['入场','entry'],['止损','stop_loss'],['止盈','take_profit']
+  ];
+  for (const [label, key] of priceKeys) {
+    const v = pl[key];
+    priceHtml += '<tr><td class="label">'+label+'</td><td class="value">'+(v!=null?fmtPrice(v):'—')+'</td></tr>';
+  }
+
+  let riskHtml = '';
+  const rc = a.risk_control || {};
+  if (rc.stop_loss_rule) riskHtml += '<div style="font-size:11px;margin:2px 0"><span style="color:var(--muted)">止损：</span>'+esc(rc.stop_loss_rule)+'</div>';
+  if (rc.tp1) riskHtml += '<div style="font-size:11px;margin:2px 0"><span style="color:var(--muted)">TP1：</span>'+esc(rc.tp1)+'</div>';
+  if (rc.tp2) riskHtml += '<div style="font-size:11px;margin:2px 0"><span style="color:var(--muted)">TP2：</span>'+esc(rc.tp2)+'</div>';
+
+  return '<div class="card">'
+    + '<div class="card-header"><span class="card-token">'+(showToken?esc(a.token):'')+'</span><span style="color:var(--muted);font-size:11px">'+timeStr+'</span><div class="card-badges">'+dirBadge+confBadge+'</div></div>'
+    + '<div class="section-title">价格位</div>'
+    + '<table class="price-table">'+priceHtml+'</table>'
+    + (a.position_analysis ? '<div class="analysis-text">'+esc(a.position_analysis)+'</div>' : '')
+    + (a.timing ? '<div class="analysis-text"><span style="color:var(--yellow)">时机：</span>'+esc(a.timing)+'</div>' : '')
+    + (riskHtml ? '<div class="section-title">风控</div>'+riskHtml : '')
+    + (a.reason ? '<div class="analysis-text" style="color:var(--muted);font-size:11px;margin-top:8px">'+esc(a.reason)+'</div>' : '')
+    + '</div>';
+}
+
+function renderTabs(tokens) {
+  let html = '<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">';
+  for (const t of tokens) {
+    const active = t === _activeToken ? ' style="background:var(--accent);color:#fff"' : ' style="background:var(--panel);color:var(--text)"';
+    html += '<button class="token-tab" data-token="'+esc(t)+'"'+active+'>'+esc(t)+'</button>';
+  }
+  html += '</div>';
+  document.getElementById('token-tabs').innerHTML = html;
+  for (const btn of document.querySelectorAll('.token-tab')) {
+    btn.addEventListener('click', function() { selectToken(this.dataset.token); });
+  }
+}
+
+function selectToken(token) {
+  _activeToken = token;
+  renderTabs(Object.keys(_byToken));
+  const list = _byToken[token] || [];
+  document.getElementById('content').innerHTML = list.map(function(a) { return renderCard(a, false); }).join('');
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/kol/analyses');
+    const d = await r.json();
+    const tokens = d.tokens || [];
+    _byToken = d.by_token || {};
+    if (!tokens.length) {
+      document.getElementById('content').innerHTML = '<div class="empty">暂无KOL分析数据<br><span style="font-size:11px;color:var(--muted)">等待 collector 触发分析后刷新</span></div>';
+      return;
+    }
+    _activeToken = tokens[0];
+    renderTabs(tokens);
+    selectToken(_activeToken);
+  } catch(e) {
+    document.getElementById('content').innerHTML = '<div class="empty" style="color:var(--red)">加载失败: '+esc(e.message)+'</div>';
+  }
+}
+
+function updateClock() {
+  try { document.getElementById('clock').textContent = new Date().toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai'}); } catch(e) {}
+}
+setInterval(updateClock, 1000);
+updateClock();
+load();
+</script>
+</body>
+</html>
+"""
+
+
 STRATEGIES_HTML = """
 <!DOCTYPE html>
 <html lang="zh">
@@ -3036,6 +3363,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
     <div class="nav-dropdown-content">
       <a href="/agent">Agent-合约扫描</a>
       <a href="/heat-agent">Agent-热度榜单</a>
+      <a href="/kol">Agent-KOL</a>
     </div>
   </div>
   <a href="/settings">⚙ 系统设置</a>
@@ -3065,6 +3393,7 @@ async function load() {
       heat_agent: '<span class="strategy-badge" style="background:#3a1f5f;color:#c4a0ff">📡 热度Agent</span>',
       system: '<span class="strategy-badge badge-system">⚙ 系统策略</span>',
       manual: '<span class="strategy-badge badge-manual">👆 手动策略</span>',
+      kol_agent: '<span class="strategy-badge" style="background:#1a2a4a;color:#58a6ff">🧠 KOL策略</span>',
     };
     let html = '';
     for (const s of strategies) {
@@ -3148,6 +3477,13 @@ load();
 def heat_agent_page():
     return HTMLResponse(
         content=HEAT_AGENT_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+@app.get("/kol", response_class=HTMLResponse)
+def kol_agent_page():
+    return HTMLResponse(
+        content=KOL_AGENT_HTML,
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 

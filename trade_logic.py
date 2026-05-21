@@ -732,6 +732,7 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
             "advice": "取消收藏触发：按市价平仓",
             "closed_at": "__CURRENT_TIMESTAMP__",
         })
+        storage.trade_signal_lock_release(conn, token, pos["strategy"])
         closed += 1
 
         # 写平仓 journal
@@ -849,6 +850,7 @@ def update_paper_positions(conn):
                         "closed_at": "__CURRENT_TIMESTAMP__",
                     }
                     storage.trade_position_update(conn, pos["id"], fields)
+                    storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
                 continue
 
             # 同步交易所数据
@@ -931,6 +933,7 @@ def update_paper_positions(conn):
                 "closed_at": "__CURRENT_TIMESTAMP__",
             })
             storage.trade_position_update(conn, pos["id"], fields)
+            storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
             # 写平仓 journal
             _cs_snap = get_market_snapshot(pos["token"], heavy=True)
             _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
@@ -1003,6 +1006,7 @@ def update_paper_positions(conn):
                     "closed_at": "__CURRENT_TIMESTAMP__",
                 })
                 storage.trade_position_update(conn, pos["id"], fields)
+                storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
                 # 写平仓 journal
                 _cs_snap = get_market_snapshot(pos["token"], heavy=True)
                 _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}

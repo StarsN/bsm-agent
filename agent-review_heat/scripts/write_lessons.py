@@ -76,7 +76,7 @@ for l in lessons:
             (order_id, token, direction, entry_price, exit_price, pnl_pct,
              market_snapshot, macro_context, signal_error, what_missed,
              root_cause, lesson, rule_update, severity, learned, strategy)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)""",
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             l.get("order_id"), l["token"], l.get("direction"),
             l.get("entry_price"), l.get("exit_price"), l.get("pnl_pct"),
@@ -84,7 +84,7 @@ for l in lessons:
             l.get("signal_error"), l.get("what_missed"),
             l.get("root_cause"), l.get("lesson", ""),
             _safe_str(rule) or None, l.get("severity", "medium"),
-            args.strategy,
+            0, args.strategy,
         ),
     )
     written += 1
