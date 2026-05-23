@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS trade_positions (
     tp1_price          REAL,
     tp2_price          REAL,
     highest_price      REAL,
+    lowest_price       REAL,
     trailing_stop_price REAL,
     closed_qty         REAL DEFAULT 0,
     realized_pnl       REAL DEFAULT 0,
@@ -168,7 +169,7 @@ CREATE TABLE IF NOT EXISTS trade_positions (
 
 CREATE INDEX IF NOT EXISTS idx_trade_positions_status ON trade_positions(status, token);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_one_active_token
-ON trade_positions(token)
+ON trade_positions(token, side, strategy)
 WHERE status IN ('PENDING', 'OPEN', 'PARTIAL');
 
 CREATE TABLE IF NOT EXISTS trade_signal_locks (
@@ -337,6 +338,38 @@ CREATE TABLE IF NOT EXISTS kol_candidates (
 );
 CREATE INDEX IF NOT EXISTS idx_kol_candidates_round ON kol_candidates(round_number);
 CREATE INDEX IF NOT EXISTS idx_kol_candidates_token_round ON kol_candidates(token, round_number);
+
+-- 无教训版 Agent 候选币累积表
+CREATE TABLE IF NOT EXISTS nl_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number    INTEGER NOT NULL,
+    token           TEXT NOT NULL,
+    data            TEXT,
+    tier            TEXT,
+    passed          INTEGER DEFAULT 1,
+    hard_blocks     TEXT,
+    pass_count      INTEGER,
+    signal_key      TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_nl_candidates_round ON nl_candidates(round_number);
+CREATE INDEX IF NOT EXISTS idx_nl_candidates_token_round ON nl_candidates(token, round_number);
+
+-- KOL LLM 调用日志
+CREATE TABLE IF NOT EXISTS kol_llm_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider        TEXT,
+    model           TEXT,
+    candidate_count INTEGER,
+    prompt_chars    INTEGER,
+    response_chars  INTEGER,
+    duration_ms     INTEGER,
+    success         INTEGER DEFAULT 0,
+    error           TEXT,
+    analyses_count  INTEGER,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_kol_llm_logs_created ON kol_llm_logs(created_at);
 """
 
 
@@ -417,6 +450,15 @@ def _migrate(conn):
         conn.execute("ALTER TABLE trade_positions ADD COLUMN exchange_order_id TEXT")
     if "strategy" not in tp_cols:
         conn.execute("ALTER TABLE trade_positions ADD COLUMN strategy TEXT DEFAULT 'agent'")
+    if "lowest_price" not in tp_cols:
+        conn.execute("ALTER TABLE trade_positions ADD COLUMN lowest_price REAL")
+    # 更新唯一索引为 (token, side, strategy) 实现策略级数据隔离
+    conn.execute("DROP INDEX IF EXISTS idx_trade_one_active_token")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_one_active_token
+        ON trade_positions(token, side, strategy)
+        WHERE status IN ('PENDING', 'OPEN', 'PARTIAL')
+    """)
     # signal_lock 策略隔离：重建唯一约束为 (token, signal_key, strategy)
     sl_cols = [r[1] for r in conn.execute("PRAGMA table_info(trade_signal_locks)").fetchall()]
     if "strategy" not in sl_cols:
@@ -843,13 +885,21 @@ def trading_settings_defaults() -> dict:
         "agent_trigger_interval": getattr(config, "HEAT_AGENT_TRIGGER_INTERVAL", 3),
         "strategy_initial_agent": getattr(config, "STRATEGY_INITIAL_AGENT", 1000),
         "strategy_initial_heat_agent": getattr(config, "STRATEGY_INITIAL_HEAT_AGENT", 1000),
+        "strategy_initial_heat_agent_lessons": getattr(config, "STRATEGY_INITIAL_HEAT_AGENT_LESSONS", 1000),
         "strategy_initial_system": getattr(config, "STRATEGY_INITIAL_SYSTEM", 1000),
         "strategy_initial_manual": getattr(config, "STRATEGY_INITIAL_MANUAL", 1000),
         "strategy_initial_kol_agent": getattr(config, "STRATEGY_INITIAL_KOL_AGENT", 1000),
+        "strategy_initial_agent_no_lessons": getattr(config, "STRATEGY_INITIAL_AGENT_NO_LESSONS", 1000),
         "kol_agent_interval_minutes": getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15),
+        "nl_agent_interval_minutes": getattr(config, "NL_AGENT_INTERVAL_MINUTES", 30),
+        "heat_agent_lessons_trigger_interval": getattr(config, "HEAT_AGENT_LESSONS_TRIGGER_INTERVAL", 3),
+        "ai_regime_interval_minutes": getattr(config, "AI_REGIME_INTERVAL_MINUTES", 30),
+        "kol_llm_provider": getattr(config, "KOL_LLM_PROVIDER", "deepseek"),
         "agent_trade_enabled": getattr(config, "AGENT_TRADE_ENABLED", True),
         "heat_agent_enabled": getattr(config, "HEAT_AGENT_ENABLED", True),
         "kol_agent_enabled": getattr(config, "KOL_AGENT_ENABLED", True),
+        "nl_agent_enabled": getattr(config, "NL_AGENT_ENABLED", True),
+        "heat_agent_lessons_enabled": getattr(config, "HEAT_AGENT_LESSONS_ENABLED", True),
     }
 
 
@@ -858,7 +908,7 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
         elif row["key"] in {"initial_balance", "leverage", "order_amount"}:
             try:
@@ -872,7 +922,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "kol_agent_interval_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -999,16 +1049,18 @@ def trade_open_positions_by_sector(conn) -> dict:
 
 def trade_position_insert(conn, position: dict):
     try:
+        if "lowest_price" not in position:
+            position["lowest_price"] = None
         conn.execute("""
         INSERT INTO trade_positions
             (token, symbol, side, status, mode, margin_amount, leverage, notional,
              quantity, entry_price, limit_price, current_price, stop_loss_price,
-             tp1_price, tp2_price, highest_price, trailing_stop_price,
+             tp1_price, tp2_price, highest_price, lowest_price, trailing_stop_price,
              signal_snapshot, open_reason, advice, strategy)
         VALUES
             (:token, :symbol, :side, :status, :mode, :margin_amount, :leverage,
              :notional, :quantity, :entry_price, :limit_price, :current_price,
-             :stop_loss_price, :tp1_price, :tp2_price, :highest_price,
+             :stop_loss_price, :tp1_price, :tp2_price, :highest_price, :lowest_price,
              :trailing_stop_price, :signal_snapshot, :open_reason, :advice,
              :strategy)
         """, position)
@@ -1348,8 +1400,10 @@ def kol_analysis_insert(conn, analysis: dict):
 def kol_analyses_latest(conn):
     import json as _json
     rows = conn.execute(
-        "SELECT * FROM kol_analyses "
-        "WHERE created_at >= datetime('now', '-24 hours') "
+        "SELECT id, token, trend, price_levels, position_analysis, timing, "
+        "risk_control, direction, confidence, reason, created_at "
+        "FROM kol_analyses "
+        "WHERE created_at >= datetime('now', '-12 hours') "
         "ORDER BY id DESC"
     ).fetchall()
     results = []
@@ -1362,6 +1416,25 @@ def kol_analyses_latest(conn):
                 pass
         results.append(d)
     return results
+
+
+def kol_llm_log_insert(conn, log: dict):
+    conn.execute(
+        """INSERT INTO kol_llm_logs
+            (provider, model, candidate_count, prompt_chars, response_chars,
+             duration_ms, success, error, analyses_count)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (log.get("provider"), log.get("model"), log.get("candidate_count"),
+         log.get("prompt_chars"), log.get("response_chars"), log.get("duration_ms"),
+         log.get("success", 0), log.get("error"), log.get("analyses_count", 0)),
+    )
+
+
+def kol_llm_logs_recent(conn, limit: int = 30):
+    rows = conn.execute(
+        "SELECT * FROM kol_llm_logs ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # === KOL 候选币累积 ===
@@ -1398,3 +1471,25 @@ def kol_candidates_purge_old(conn, keep_last_rounds: int = 30):
     ).fetchone()
     if row:
         conn.execute("DELETE FROM kol_candidates WHERE round_number <= ?", (row[0],))
+
+
+# === 无教训版 Agent 候选币累积 ===
+
+def nl_candidates_insert_batch(conn, round_number: int, batch: list[dict]):
+    conn.executemany(
+        """INSERT INTO nl_candidates
+            (round_number, token, data, tier, passed, hard_blocks, pass_count, signal_key)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        [(round_number, r["token"], r["data"], r.get("tier"), r.get("passed", 1),
+          r.get("hard_blocks"), r.get("pass_count", 0), r.get("signal_key"))
+         for r in batch],
+    )
+
+
+def nl_candidates_purge_old(conn, keep_last_rounds: int = 30):
+    row = conn.execute(
+        "SELECT DISTINCT round_number FROM nl_candidates ORDER BY round_number DESC LIMIT 1 OFFSET ?",
+        (keep_last_rounds,)
+    ).fetchone()
+    if row:
+        conn.execute("DELETE FROM nl_candidates WHERE round_number <= ?", (row[0],))

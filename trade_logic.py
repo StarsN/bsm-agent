@@ -391,11 +391,12 @@ def _build_account_context(conn, strategy: str = None) -> risk.AccountContext:
         last_sl_map = storage.trade_last_stop_loss_map(
             conn, hours=max(2, config.TRADING_COOLDOWN_MINUTES_AFTER_LOSS // 30 + 1))
 
-    # 按板块聚合
+    # 按板块+方向聚合（做多和做空互不计入同向仓位）
     by_sector = {}
     for pos in open_positions:
         sec = risk.sector_of(pos["token"])
-        by_sector[sec] = by_sector.get(sec, 0) + 1
+        key = (sec, pos.get("side", "LONG"))
+        by_sector[key] = by_sector.get(key, 0) + 1
 
     return risk.AccountContext(
         equity=summary["equity"],
@@ -422,9 +423,9 @@ def _debug_reject(token: str, reason: str, candidate: dict = None):
     print(f"[trade-debug] REJECT {token}: {reason}{extra}", file=sys.stderr, flush=True)
 
 
-def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "agent") -> bool | dict:
+def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "agent", side: str = "LONG") -> bool | dict:
     """
-    v2：接入风控中枢的开仓。
+    v2：接入风控中枢的开仓。side="SHORT" 时做空（需 SHORT_SELLING_ENABLED=True）。
 
     决策流程：
       1. 基础去重（是否已有持仓 / signal lock）
@@ -437,6 +438,9 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
     失败原因在 TRADING_DEBUG=True 时会打印到 stderr。
     """
     token = (candidate.get("token") or "").upper() or "?"
+    if side == "SHORT" and not getattr(config, "SHORT_SELLING_ENABLED", False):
+        _debug_reject(token, "做空功能未启用", candidate)
+        return False
 
     if not candidate.get("passed"):
         _debug_reject(token, "candidate.passed=False（信号评估不通过）", candidate)
@@ -456,7 +460,7 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
 
     # 账户级风控（策略隔离）
     account = _build_account_context(conn, strategy)
-    risk_decision = risk.check_account_risk(account, token)
+    risk_decision = risk.check_account_risk(account, token, side=side)
     if not risk_decision.allowed:
         _debug_reject(token, f"账户风控: {risk_decision.reason}", candidate)
         return False
@@ -466,12 +470,20 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
     if not raw_price or raw_price <= 0:
         _debug_reject(token, f"价格无效 ({raw_price})", candidate)
         return False
-    entry_price = raw_price * (1 + config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
+    # 入场价（做多含正滑点，做空含负滑点）
+    if side == "LONG":
+        entry_price = raw_price * (1 + config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
+    else:
+        entry_price = raw_price * (1 - config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
 
     # 计算 ATR 止损
     klines = get_klines_1h(token, limit=max(30, config.TRADING_ATR_PERIOD + 2))
     stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
-    stop_loss_price = entry_price * (1 + stop_pct / 100)
+    # stop_pct 为负数（如 -2.0），做多: entry*(1+stop_pct/100)=下方, 做空: entry*(1-stop_pct/100)=上方
+    if side == "LONG":
+        stop_loss_price = entry_price * (1 + stop_pct / 100)
+    else:
+        stop_loss_price = entry_price * (1 - stop_pct / 100)
 
     # 抢 signal lock
     signal_key = candidate.get("signal_key") or storage.leaderboard_signal_key(conn)
@@ -481,7 +493,7 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
 
     # 计算仓位
     leverage = float(settings.get("leverage") or config.TRADING_LEVERAGE)
-    sizing = risk.compute_position_size(account, entry_price, stop_loss_price, leverage, tier)
+    sizing = risk.compute_position_size(account, entry_price, stop_loss_price, leverage, tier, side=side)
     if sizing.get("quantity", 0) <= 0:
         _debug_reject(token, f"仓位计算: {sizing.get('note')}", candidate)
         return False
@@ -513,7 +525,7 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
     position = {
         "token": token,
         "symbol": f"{token}USDT",
-        "side": "LONG",
+        "side": side,
         "status": "OPEN",
         "mode": settings.get("mode") or "paper",
         "margin_amount": margin,
@@ -526,7 +538,8 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
         "stop_loss_price": stop_loss_price,
         "tp1_price": tp1_price,
         "tp2_price": tp2_price,
-        "highest_price": entry_price,
+        "highest_price": entry_price if side == "LONG" else None,
+        "lowest_price": entry_price if side == "SHORT" else None,
         "trailing_stop_price": None,
         "signal_snapshot": json.dumps(snapshot, default=str, ensure_ascii=False),
         "open_reason": (
@@ -537,7 +550,7 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
             f"风险 ${risk_amount:.2f} ({(risk_amount/account.equity*100) if account.equity else 0:.2f}% equity)"
         ),
         "advice": (
-            f"{'满仓' if tier == 'full' else '半仓'}持有：等待 +{config.TRADING_TP1_R}R 止盈 / "
+            f"{'满仓' if tier == 'full' else '半仓'}{'做多' if side == 'LONG' else '做空'}持有：等待 +{config.TRADING_TP1_R}R 止盈 / "
             f"{sizing.get('stop_distance_pct', 0):.2f}% 止损"
         ),
         "strategy": strategy,
@@ -875,6 +888,8 @@ def update_paper_positions(conn):
             continue
 
         status = pos["status"]
+        side = pos.get("side", "LONG")
+        is_short = side == "SHORT"
         qty = float(pos.get("quantity") or 0)
         closed_qty = float(pos.get("closed_qty") or 0)
         open_qty = max(qty - closed_qty, 0)
@@ -908,18 +923,27 @@ def update_paper_positions(conn):
         if entry <= 0 or open_qty <= 0:
             continue
 
-        highest = max(float(pos.get("highest_price") or entry), price)
-        fields["highest_price"] = highest
+        if is_short:
+            lowest = min(float(pos.get("lowest_price") or entry), price)
+            fields["lowest_price"] = lowest
+        else:
+            highest = max(float(pos.get("highest_price") or entry), price)
+            fields["highest_price"] = highest
         tp1 = float(pos.get("tp1_price") or 0)
         tp2 = float(pos.get("tp2_price") or 0)
         stop = float(pos.get("stop_loss_price") or 0)
 
         # ---- 止损：考虑滑点（比 stop 价更差的价格成交）----
-        if stop > 0 and price <= stop:
+        stop_triggered = (stop > 0 and price >= stop) if is_short else (stop > 0 and price <= stop)
+        if stop_triggered:
             # 真实场景止损触发时常有滑点；paper 交易模拟更保守的成交价
-            slip_factor = 1 - config.TRADING_STOP_SLIPPAGE_PCT / 100
-            fill_price = min(price, stop * slip_factor)
-            realized += (fill_price - entry) * open_qty
+            if is_short:
+                fill_price = max(price, stop * (1 + config.TRADING_STOP_SLIPPAGE_PCT / 100))
+                realized += (entry - fill_price) * open_qty
+            else:
+                slip_factor = 1 - config.TRADING_STOP_SLIPPAGE_PCT / 100
+                fill_price = min(price, stop * slip_factor)
+                realized += (fill_price - entry) * open_qty
             if realized < 0:
                 _archive_stop_loss(conn, pos, fill_price, realized, market, realtime)
             fields.update({
@@ -955,27 +979,32 @@ def update_paper_positions(conn):
         tp1_done = closed_ratio >= tp1_pct - 1e-6
         tp2_done = closed_ratio >= (tp1_pct + tp2_pct) - 1e-6
 
-        if not tp1_done and tp1 > 0 and price >= tp1:
+        tp1_triggered = (tp1 > 0 and price <= tp1) if is_short else (tp1 > 0 and price >= tp1)
+        if not tp1_done and tp1_triggered:
             close_qty = qty * tp1_pct
-            realized += (tp1 - entry) * close_qty
+            realized += ((entry - tp1) if is_short else (tp1 - entry)) * close_qty
             closed_qty += close_qty
             open_qty = qty - closed_qty
             fields.update({
                 "status": "PARTIAL",
                 "closed_qty": closed_qty,
                 "realized_pnl": realized,
-                "stop_loss_price": entry,  # 保本
+                "stop_loss_price": entry,  # 保本（做多做空都移到入场价）
                 "advice": f"+{config.TRADING_TP1_R}R 已平 {config.TRADING_TP1_CLOSE_PCT:.0f}%，止损移到保本",
             })
             tp1_done = True
 
         # ---- 止盈 TP2：只在 TP1 已触发且 TP2 未触发时考虑 ----
-        if tp1_done and not tp2_done and tp2 > 0 and price >= tp2:
+        tp2_triggered = (tp2 > 0 and price <= tp2) if is_short else (tp2 > 0 and price >= tp2)
+        if tp1_done and not tp2_done and tp2_triggered:
             close_qty = qty * tp2_pct
-            realized += (tp2 - entry) * close_qty
+            realized += ((entry - tp2) if is_short else (tp2 - entry)) * close_qty
             closed_qty += close_qty
             open_qty = qty - closed_qty
-            trailing = highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100)
+            if is_short:
+                trailing = lowest * (1 + config.TRADING_TRAIL_CALLBACK_PCT / 100)
+            else:
+                trailing = highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100)
             fields.update({
                 "status": "PARTIAL",
                 "closed_qty": closed_qty,
@@ -987,14 +1016,23 @@ def update_paper_positions(conn):
 
         # ---- 剩余仓位：跟踪止盈 ----
         if tp2_done and open_qty > 0:
-            trailing = max(float(pos.get("trailing_stop_price") or 0),
-                           highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100))
+            if is_short:
+                trailing = min(float(pos.get("trailing_stop_price") or float('inf')),
+                               lowest * (1 + config.TRADING_TRAIL_CALLBACK_PCT / 100))
+            else:
+                trailing = max(float(pos.get("trailing_stop_price") or 0),
+                               highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100))
             fields["trailing_stop_price"] = trailing
-            if price <= trailing:
+            trail_triggered = (price >= trailing) if is_short else (price <= trailing)
+            if trail_triggered:
                 # 跟踪止盈触发，也假设一点滑点
-                slip_factor = 1 - config.TRADING_STOP_SLIPPAGE_PCT / 100
-                fill_price = min(price, trailing * slip_factor)
-                realized += (fill_price - entry) * open_qty
+                if is_short:
+                    fill_price = max(price, trailing * (1 + config.TRADING_STOP_SLIPPAGE_PCT / 100))
+                    realized += (entry - fill_price) * open_qty
+                else:
+                    slip_factor = 1 - config.TRADING_STOP_SLIPPAGE_PCT / 100
+                    fill_price = min(price, trailing * slip_factor)
+                    realized += (fill_price - entry) * open_qty
                 fields.update({
                     "status": "CLOSED",
                     "current_price": fill_price,
@@ -1020,7 +1058,7 @@ def update_paper_positions(conn):
                 )
                 continue
 
-        unrealized = (price - entry) * open_qty
+        unrealized = ((entry - price) if is_short else (price - entry)) * open_qty
         fields.update({
             "unrealized_pnl": unrealized,
             "pnl_pct": _margin_pnl_pct(realized, unrealized, float(pos.get("margin_amount") or 1)),

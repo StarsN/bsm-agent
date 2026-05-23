@@ -367,7 +367,7 @@ def one_scan():
             "LIMIT 5"
         ).fetchall()
 
-    source_map = {"agent_candidates": "agent", "token_heat_history": "heat_agent"}
+    source_map = {"agent_candidates": "agent", "token_heat_history": "heat_agent", "token_heat_history_lessons": "heat_agent_lessons", "nl_candidates": "agent_no_lessons"}
     executed = 0
     for dec in pending:
         dec = dict(dec)

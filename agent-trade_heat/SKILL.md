@@ -42,7 +42,7 @@ python3 /root/binance-monitor/bsm-agent/agent-trade_heat/scripts/extract_market_
 
 脚本自动完成：DB 定位 → worker 状态检查 → 候选币读取 → 市场快照关联 → 持仓/账户/教训全量读取。
 
-输出 JSON 包含：`candidates`, `candidate_count`, `total_candidates`, `positions`, `account`, `archive_lessons`, `tag_stats`, `agent_lessons`, `today_journal`, `current_round`, `latest_round`, `btc`（BTC 走势），`fear_greed`（恐惧贪婪指数），`session`（交易时段）。
+输出 JSON 包含：`candidates`, `candidate_count`, `total_candidates`, `positions`, `account`, `archive_lessons`, `tag_stats`, `agent_lessons`, `today_journal`, `current_round`, `latest_round`, `btc`（BTC 走势），`fear_greed`（恐惧贪婪指数），`session`（交易时段），`current_time`（当前 UTC+8 时间，报告直接用）。
 
 参考：`references/数据库表结构.md`、`references/snapshot字段说明.md`。
 
@@ -85,11 +85,13 @@ python3 /root/binance-monitor/bsm-agent/agent-trade_heat/scripts/extract_market_
 
 命中模式时，读它的倾向和策略，作为参考输入你的判断。不是强制规则——你结合当前市场上下文自主决定。
 
+**活跃标签但未命中**：当 `tag_stats` 中某标签计数很高（如 `oi4h_reversed: 6`）但当前候选币未触发该标签，说明市场整体存在这个风险模式。此时应将该标签视为"环境级警告"——不是直接拒单，而是将开仓门槛提高一档（如档位从 full → half，或要求更严格的信号确认）。这是"环境有风险但我选了个没踩坑的"的折中处理，而非"没匹配所以安全"。
+
 ### 第四步：写决策
 
 你决定开哪个币、什么档位。入场价和止损止盈由系统按实时价格自动计算，你不需要填。
 
-**先加载参考**：`skill_view(name='agent-trade', file_path='assets/决策JSON格式.md')`，按其中完整格式构造 JSON。**必须用信封格式**：`{"market_read": "...", "decisions": [...]}`。空决策也必须带 `market_read`，不能只写 `[]`。
+**先加载参考**：`skill_view(name='agent-trade_heat', file_path='assets/决策JSON格式.md')`，按其中完整格式构造 JSON。**必须用信封格式**：`{"market_read": "...", "decisions": [...]}`。空决策也必须带 `market_read`，不能只写 `[]`。
 
 **常见 reject 原因**：详见 `references/数据操作要点.md`。
 

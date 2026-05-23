@@ -350,6 +350,24 @@ async def one_round(scraper: SquareScraper):
         except Exception as e:
             console.print(f"[dim]热度 Agent 触发失败: {e}[/dim]")
 
+    # 触发热度有教训版 Agent（独立间隔，从 DB 读取即时生效）
+    lessons_trigger = int(ts_heat.get("heat_agent_lessons_trigger_interval",
+                          getattr(config, "HEAT_AGENT_LESSONS_TRIGGER_INTERVAL", 3)))
+    # offset=+1: 与热度 Agent (offset=0) 永不撞车
+    if (_ROUND_NUMBER + 1) % lessons_trigger == 0:
+        try:
+            import subprocess
+            lessons_enabled = ts_heat.get("heat_agent_lessons_enabled", True)
+            lessons_job_id = getattr(config, "HEAT_AGENT_LESSONS_HERMES_JOB_ID", "")
+            if lessons_enabled and lessons_job_id:
+                subprocess.run(
+                    ["hermes", "cron", "run", lessons_job_id],
+                    timeout=10, capture_output=True, text=True,
+                )
+                console.print(f"[dim]已触发热度有教训 Agent (round {_ROUND_NUMBER})[/dim]")
+        except Exception as e:
+            console.print(f"[dim]热度有教训 Agent 触发失败: {e}[/dim]")
+
     elapsed = time.time() - round_start
     console.print(f"[green]本轮 #{_ROUND_NUMBER} 总耗时 {elapsed:.0f}s[/green]\n")
 

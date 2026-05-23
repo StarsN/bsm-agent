@@ -5,7 +5,7 @@ import sqlite3
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -278,6 +278,7 @@ output = {
     "worker_stage": stage,
     "btc": btc,
     "fear_greed": fng,
+    "current_time": (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%m-%d %H:%M UTC+8"),
     "session": session,
 }
 

@@ -1,9 +1,9 @@
 ---
-name: agent-trade
+name: agent-trade-heat-lessons
 description: |
-  加密货币合约自主交易决策。读取市场原始数据，自主分析候选币，
-  查历史教训，决定开仓/跳过。追求胜率≥55%，盈亏比≥2:1。
-  触发词：开单、看盘、选币、要不要买、仓位管理、交易决策。
+  热度榜有教训版。读取热度榜+合约快照+历史教训，
+  自主分析候选币，查历史教训，决定开仓/跳过。
+  触发词：热单、热度看盘、热度选币。
   运行频率由外部 cron 决定，skill 不限定间隔。
 tags: [crypto, trading, agent, binance, futures]
 model: deepseek
@@ -33,7 +33,7 @@ allowed-tools: [Bash, Read, Write]
 ### 第一步：读数据
 
 ```bash
-python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.py --output /tmp/market_data.json
+python3 /root/binance-monitor/bsm-agent/agent-trade_heat_lessons/scripts/extract_market_data.py --output /tmp/market_data_heat_lessons.json
 ```
 
 脚本输出单行压缩 JSON。直接 Read 会截断，用 Python 脚本写到 `/tmp/*.py` 再执行（`python3 -c` 被审批拦截）。
@@ -89,7 +89,7 @@ python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.
 
 你决定开哪个币、什么档位。入场价和止损止盈由系统按实时价格自动计算，你不需要填。
 
-**先加载参考**：`skill_view(name='agent-trade', file_path='assets/决策JSON格式.md')`，按其中完整格式构造 JSON。**必须用信封格式**：`{"market_read": "...", "decisions": [...]}`。空决策也必须带 `market_read`，不能只写 `[]`。
+**先加载参考**：`skill_view(name='agent-trade_heat_lessons', file_path='assets/决策JSON格式.md')`，按其中完整格式构造 JSON。**必须用信封格式**：`{"market_read": "...", "decisions": [...]}`。空决策也必须带 `market_read`，不能只写 `[]`。
 
 **常见 reject 原因**：详见 `references/数据操作要点.md`。
 
@@ -98,7 +98,7 @@ python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.
 构造完成后执行：
 
 ```bash
-python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/write_decisions.py --decisions /tmp/agent_decisions.json --source agent_candidates
+python3 /root/binance-monitor/bsm-agent/agent-trade_heat_lessons/scripts/write_decisions.py --decisions /tmp/agent_decisions_heat_lessons.json --source token_heat_history_lessons
 ```
 
 验证输出中的 `status=`：`pending` 表示通过，`rejected` 表示被拒需修正。

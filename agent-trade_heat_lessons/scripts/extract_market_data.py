@@ -216,28 +216,28 @@ positions = [dict(p) for p in conn.execute(
        tp1_price, tp2_price, pnl_pct, margin_amount, highest_price, status
        FROM trade_positions
        WHERE status IN ('OPEN','PARTIAL')
-       AND strategy = 'heat_agent'"""
+       AND strategy = 'heat_agent_lessons'"""
 )]
 
 # ---- 账户（仅 Agent 策略）----
 settings = {r["key"]: r["value"] for r in conn.execute(
     "SELECT * FROM trading_settings"
 )}
-initial = float(settings.get("strategy_initial_heat_agent", 1000))
+initial = float(settings.get("strategy_initial_heat_agent_lessons", 1000))
 realized = conn.execute(
-    "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions WHERE strategy='heat_agent'"
+    "SELECT COALESCE(SUM(realized_pnl),0) FROM trade_positions WHERE strategy='heat_agent_lessons'"
 ).fetchone()[0]
 unrealized = conn.execute(
     "SELECT COALESCE(SUM(unrealized_pnl),0) FROM trade_positions "
-    "WHERE status IN ('OPEN','PARTIAL') AND strategy='heat_agent'"
+    "WHERE status IN ('OPEN','PARTIAL') AND strategy='heat_agent_lessons'"
 ).fetchone()[0]
 locked = conn.execute(
     "SELECT COALESCE(SUM(margin_amount),0) FROM trade_positions "
-    "WHERE status IN ('OPEN','PARTIAL') AND strategy='heat_agent'"
+    "WHERE status IN ('OPEN','PARTIAL') AND strategy='heat_agent_lessons'"
 ).fetchone()[0]
 today_count = conn.execute(
     "SELECT COUNT(*) FROM trade_positions "
-    "WHERE strategy='heat_agent' AND date(created_at, '+8 hours') = date('now', '+8 hours')"
+    "WHERE strategy='heat_agent_lessons' AND date(created_at, '+8 hours') = date('now', '+8 hours')"
 ).fetchone()[0]
 
 account = {
@@ -257,7 +257,7 @@ for r in conn.execute(
     """SELECT la.token, la.pnl_pct, la.failed_reason, la.reason_tags
        FROM trade_loss_archive la
        JOIN trade_positions tp ON la.position_id = tp.id
-       WHERE tp.strategy = 'heat_agent'
+       WHERE tp.strategy = 'heat_agent_lessons'
        ORDER BY la.created_at DESC LIMIT 10"""
 ):
     archive_lessons.append({
@@ -270,7 +270,7 @@ tag_stats = {}
 for r in conn.execute(
     """SELECT la.reason_tags FROM trade_loss_archive la
        JOIN trade_positions tp ON la.position_id = tp.id
-       WHERE la.reason_tags IS NOT NULL AND tp.strategy = 'heat_agent'"""
+       WHERE la.reason_tags IS NOT NULL AND tp.strategy = 'heat_agent_lessons'"""
 ):
     for t in json.loads(r["reason_tags"]):
         tag_stats[t] = tag_stats.get(t, 0) + 1
@@ -278,8 +278,8 @@ for r in conn.execute(
 agent_lessons = [dict(r) for r in conn.execute(
     """SELECT id, token, direction, entry_price, exit_price, pnl_pct,
        signal_error, what_missed, root_cause, lesson, rule_update, severity
-       FROM lessons WHERE learned=2
-       AND strategy = 'heat_agent'
+       FROM lessons WHERE learned=0
+       AND strategy = 'heat_agent_lessons'
        AND rule_update IS NOT NULL AND rule_update != ''
        ORDER BY severity DESC, created_at DESC"""
 )]
@@ -291,7 +291,7 @@ today_journal = [dict(r) for r in conn.execute(
     "FROM journal j "
     "LEFT JOIN trade_positions tp ON j.order_id = tp.id "
     "WHERE date(j.created_at, '+8 hours') = date('now', '+8 hours') "
-    "AND tp.strategy = 'heat_agent' "
+    "AND tp.strategy = 'heat_agent_lessons' "
     "ORDER BY j.id"
 )]
 

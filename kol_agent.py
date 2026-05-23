@@ -188,22 +188,32 @@ def build_user_prompt(candidates: list[dict]) -> str:
 
 def call_deepseek(system: str, user: str, max_tokens: int = 4096) -> Optional[str]:
     """返回 LLM 回复文本，失败返回 None"""
-    api_key = config.DEEPSEEK_API_KEY
+    provider = getattr(config, "KOL_LLM_PROVIDER", "deepseek")
+    if provider == "nvidia":
+        api_key = config.NVIDIA_API_KEY
+        model = config.NVIDIA_MODEL
+        api_base = config.NVIDIA_API_BASE
+    else:
+        api_key = config.DEEPSEEK_API_KEY
+        model = config.DEEPSEEK_MODEL
+        api_base = config.DEEPSEEK_API_BASE
     if not api_key:
-        print("[kol_agent] DEEPSEEK_API_KEY 未配置，跳过")
+        print(f"[kol_agent] {provider} API Key 未配置，跳过")
         return None
 
-    body = json.dumps({
-        "model": config.DEEPSEEK_MODEL,
+    body_data = {
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         "max_tokens": max_tokens,
         "temperature": 0.3,
-    }).encode("utf-8")
+    }
+    body_data["reasoning_effort"] = "max"
+    body = json.dumps(body_data).encode("utf-8")
 
-    url = f"{config.DEEPSEEK_API_BASE.rstrip('/')}/chat/completions"
+    url = f"{api_base.rstrip('/')}/chat/completions"
     req = urllib.request.Request(url, data=body, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -241,12 +251,20 @@ def _parse_response(raw: str) -> list[dict]:
 
 
 def get_kol_candidates(conn: sqlite3.Connection) -> list[dict]:
-    """从 kol_candidates 最新一轮读取候选币，还原完整 dict"""
-    rows = storage.kol_candidates_latest_round(conn)
+    """从 kol_candidates 读取候选币（按时间窗口，跟主 Agent 一致）"""
+    import json as _json
+    ts = storage.trading_settings_get(conn)
+    inter_min = int(ts.get("kol_agent_interval_minutes",
+                    getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15)))
+    rows = conn.execute(
+        f"SELECT data FROM kol_candidates "
+        f"WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
+        "ORDER BY id"
+    ).fetchall()
     candidates = []
     for r in rows:
         try:
-            c = json.loads(r["data"])
+            c = _json.loads(r["data"])
             candidates.append(c)
         except (json.JSONDecodeError, TypeError):
             pass
@@ -283,11 +301,30 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
     print(f"[kol_agent] 分析 {len(candidates)} 个候选币（{len(kol_data)} 位KOL）")
 
     # 调 API
-    raw = call_deepseek(system, user, max_tokens=12288)
+    import time as _time
+    _t0 = _time.time()
+    provider = getattr(config, "KOL_LLM_PROVIDER", "deepseek")
+    model = config.NVIDIA_MODEL if provider == "nvidia" else config.DEEPSEEK_MODEL
+    raw = call_deepseek(system, user, max_tokens=32768)
+    _elapsed = int((_time.time() - _t0) * 1000)
+    analyses = _parse_response(raw) if raw else []
+
+    # 写 LLM 调用日志
+    storage.kol_llm_log_insert(conn, {
+        "provider": provider,
+        "model": model,
+        "candidate_count": len(candidates),
+        "prompt_chars": len(system) + len(user),
+        "response_chars": len(raw) if raw else 0,
+        "duration_ms": _elapsed,
+        "success": 1 if (raw and analyses) else 0,
+        "error": "" if raw else "API调用失败" if not analyses else "解析失败",
+        "analyses_count": len(analyses),
+    })
+
     if not raw:
         return []
 
-    analyses = _parse_response(raw)
     if not analyses:
         return []
 
@@ -326,7 +363,7 @@ def _execute_kol_trades(conn, analyses, candidates):
     for a in analyses:
         direction = a.get("direction", "")
         confidence = int(a.get("confidence", 0) or 0)
-        if direction != "long" or confidence < min_conf:
+        if direction not in ("long", "short") or confidence < min_conf:
             continue
         token = a.get("token", "").upper()
         if not token:
@@ -335,8 +372,10 @@ def _execute_kol_trades(conn, analyses, candidates):
         if not original:
             print(f"[kol_agent] 下单跳过 {token}: 无原始行情数据")
             continue
+        side = "LONG" if direction == "long" else "SHORT"
         candidate = {
             "token": token,
+            "side": side,
             "passed": True,
             "has_active_position": False,
             "tier": "full" if confidence >= 80 else "half",
@@ -345,9 +384,21 @@ def _execute_kol_trades(conn, analyses, candidates):
             "analysis_score": confidence,
             "pass_count": confidence,
         }
-        ok = open_paper_position(conn, candidate, settings, strategy="kol_agent")
+        action = "open_long" if side == "LONG" else "open_short"
+        reason = a.get("reason", "") or f"KOL {direction} conf={confidence}"
+        ok = open_paper_position(conn, candidate, settings, strategy="kol_agent", side=side)
+        # 写入 pending_decisions，决策时间线可查
+        status = "consumed" if ok else "rejected"
+        reject_reason = "" if ok else "系统拒绝"
+        conn.execute(
+            "INSERT INTO pending_decisions "
+            "(action, token, tier, reason, status, source, reject_reason, social_score, mentions) "
+            "VALUES (?, ?, ?, ?, ?, 'kol_agent', ?, ?, ?)",
+            (action, token, candidate["tier"], reason, status,
+             reject_reason, original.get("social_score", 0), original.get("mentions", 0)),
+        )
         if ok:
-            print(f"[kol_agent] 下单成功 {token} conf={confidence} tier={candidate['tier']}")
+            print(f"[kol_agent] 下单成功 {token} {side} conf={confidence} tier={candidate['tier']}")
             opened += 1
     return opened
 

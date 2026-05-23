@@ -74,6 +74,12 @@ _kol_last_flush = 0.0
 _kol_round = 0
 _kol_running = False          # 防重叠：上一轮未完成时不触发
 
+# 无教训版 Agent 独立累积器
+_nl_collected = {}
+_nl_last_flush = 0.0
+_nl_round = 0
+_nl_running = False
+
 
 def _build_data_blob(candidate: dict) -> dict:
     """组装与 extract 脚本同格式的候选币 data JSON"""
@@ -132,8 +138,25 @@ def _run_kol_agent():
         _kol_running = False
 
 
+def _run_nl_agent():
+    """后台触发无教训版 Agent（hermes cron）"""
+    global _nl_running
+    try:
+        job_id = getattr(config, "NL_AGENT_HERMES_JOB_ID", "")
+        if job_id:
+            subprocess.run(
+                ["hermes", "cron", "run", job_id],
+                timeout=10, capture_output=True, text=True,
+            )
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        _nl_running = False
+
+
 def _collect_loop():
-    global _collected, _last_flush, _kol_collected, _kol_last_flush, _kol_round, _kol_running
+    global _collected, _last_flush, _kol_collected, _kol_last_flush, _kol_round, _kol_running, _nl_collected, _nl_last_flush, _nl_round, _nl_running
     poll_seconds = getattr(config, "AGENT_COLLECT_POLL_SECONDS", 5)
     cache_ttl = getattr(config, "AGENT_COLLECT_CACHE_TTL", 5)
 
@@ -151,18 +174,39 @@ def _collect_loop():
             with storage.get_conn() as conn:
                 ts = storage.trading_settings_get(conn)
             return int(ts.get("kol_agent_interval_minutes",
-                       getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15)))
+                       getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 8)))
         except Exception:
-            return getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15)
+            return getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 8)
+
+    def _read_nl_interval():
+        try:
+            with storage.get_conn() as conn:
+                ts = storage.trading_settings_get(conn)
+            return int(ts.get("nl_agent_interval_minutes",
+                       getattr(config, "NL_AGENT_INTERVAL_MINUTES", 30)))
+        except Exception:
+            return getattr(config, "NL_AGENT_INTERVAL_MINUTES", 30)
 
     interval_seconds = _read_interval() * 60
     kol_interval_seconds = _read_kol_interval() * 60
+    nl_interval_seconds = _read_nl_interval() * 60
     now_start = time.time()
-    _last_flush = now_start
-    _kol_last_flush = now_start
+    # 偏移量防撞车: KOL(8,offset=0) 主(16,offset=1) NL(16,offset=3) 永不重叠
+    _last_flush       = now_start - (16*60 - 1*60)   # 首次 1 分钟后
+    _kol_last_flush   = now_start                      # 首次 8 分钟后
+    _nl_last_flush    = now_start - (16*60 - 3*60)   # 首次 3 分钟后
     _last_heartbeat = 0
     ts_settings = {}  # 心跳刷新，供 flush 点读取开关
-    print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库，KOL 每 {kol_interval_seconds // 60} 分钟触发", flush=True)
+    # 从 DB 恢复 _kol_round 和 _nl_round，防止重启后读到旧轮数据
+    try:
+        with storage.get_conn() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(round_number), 0) FROM kol_candidates").fetchone()
+            _kol_round = row[0] if row else 0
+            row = conn.execute("SELECT COALESCE(MAX(round_number), 0) FROM nl_candidates").fetchone()
+            _nl_round = row[0] if row else 0
+    except Exception:
+        pass
+    print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库，KOL 每 {kol_interval_seconds // 60} 分钟触发，NL 每 {nl_interval_seconds // 60} 分钟触发", flush=True)
 
     while True:
         try:
@@ -190,6 +234,17 @@ def _collect_loop():
                         "pass_count": c.get("pass_count", 0),
                         "signal_key": c.get("signal_key", ""),
                     }
+                # 无教训版 Agent：独立累积（开关关闭时跳过，passed 的才收）
+                if ts_settings.get("nl_agent_enabled", True) and c.get("passed"):
+                    _nl_collected[c["token"]] = {
+                        "token": c["token"],
+                        "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
+                        "tier": c.get("tier", ""),
+                        "passed": 1,
+                        "hard_blocks": json.dumps(c.get("hard_block", [])),
+                        "pass_count": c.get("pass_count", 0),
+                        "signal_key": c.get("signal_key", ""),
+                    }
 
             now = time.time()
             if now - _last_heartbeat >= 60:
@@ -208,18 +263,27 @@ def _collect_loop():
                     interval_seconds = new_interval
                 try:
                     new_kol_interval = int(ts_settings.get("kol_agent_interval_minutes",
-                                           getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15))) * 60
+                                           getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 8))) * 60
                 except Exception:
                     new_kol_interval = _read_kol_interval() * 60
                 if new_kol_interval != kol_interval_seconds:
                     print(f"[kol-collect] KOL间隔变更: {kol_interval_seconds//60} → {new_kol_interval//60} 分钟", flush=True)
                     kol_interval_seconds = new_kol_interval
+                try:
+                    new_nl_interval = int(ts_settings.get("nl_agent_interval_minutes",
+                                           getattr(config, "NL_AGENT_INTERVAL_MINUTES", 30))) * 60
+                except Exception:
+                    new_nl_interval = _read_nl_interval() * 60
+                if new_nl_interval != nl_interval_seconds:
+                    print(f"[nl-collect] NL间隔变更: {nl_interval_seconds//60} → {new_nl_interval//60} 分钟", flush=True)
+                    nl_interval_seconds = new_nl_interval
                 remaining = max(0, interval_seconds - (now - _last_flush))
                 kol_remaining = max(0, kol_interval_seconds - (now - _kol_last_flush))
+                nl_remaining = max(0, nl_interval_seconds - (now - _nl_last_flush))
                 print(f"[collect] 距下次入库约 {remaining/60:.0f} 分钟"
                       f"（已收集 {len(_collected)} 个），"
-                      f"KOL 距触发约 {kol_remaining/60:.0f} 分钟"
-                      f"（已累积 {len(_kol_collected)} 个）", flush=True)
+                      f"KOL 距触发约 {kol_remaining/60:.0f} 分钟（{len(_kol_collected)}），"
+                      f"NL 距触发约 {nl_remaining/60:.0f} 分钟（{len(_nl_collected)}）", flush=True)
 
             with _flush_lock:
                 if now - _last_flush >= interval_seconds and _collected:
@@ -263,6 +327,22 @@ def _collect_loop():
                       f"（第{_kol_round}轮），触发 DeepSeek", flush=True)
                 threading.Thread(target=_run_kol_agent, daemon=True).start()
 
+            # === 无教训版 Agent 独立定时触发 ===
+            if (ts_settings.get("nl_agent_enabled", True) and _nl_collected
+                    and not _nl_running and now - _nl_last_flush >= nl_interval_seconds):
+                _nl_last_flush = now
+                _nl_running = True
+                _nl_round += 1
+                batch = list(_nl_collected.values())
+                with storage.get_conn() as conn:
+                    storage.nl_candidates_insert_batch(conn, _nl_round, batch)
+                    storage.nl_candidates_purge_old(conn, keep_last_rounds=30)
+                _nl_collected.clear()
+                ts_str = datetime.now().strftime("%H:%M:%S")
+                print(f"[nl-collect] {ts_str} 入库 {len(batch)} 个NL候选"
+                      f"（第{_nl_round}轮），触发无教训版 Agent", flush=True)
+                threading.Thread(target=_run_nl_agent, daemon=True).start()
+
         except Exception:
             import traceback
             traceback.print_exc()
@@ -291,10 +371,18 @@ class TradingSettingsBody(BaseModel):
     strategy_initial_system: float | None = None
     strategy_initial_manual: float | None = None
     kol_agent_interval_minutes: int | None = None
+    nl_agent_interval_minutes: int | None = None
+    heat_agent_lessons_trigger_interval: int | None = None
+    ai_regime_interval_minutes: int | None = None
+    kol_llm_provider: str | None = None
     strategy_initial_kol_agent: float | None = None
+    strategy_initial_agent_no_lessons: float | None = None
+    strategy_initial_heat_agent_lessons: float | None = None
     agent_trade_enabled: bool | None = None
     heat_agent_enabled: bool | None = None
     kol_agent_enabled: bool | None = None
+    nl_agent_enabled: bool | None = None
+    heat_agent_lessons_enabled: bool | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -682,10 +770,16 @@ def api_trading():
     return _cached("trading", 2.0, compute)
 
 
+@app.get("/api/settings")
+def api_settings():
+    with storage.get_conn() as conn:
+        return storage.trading_settings_get(conn)
+
+
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "kol_agent_interval_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -792,7 +886,9 @@ def api_agent_overview(strategy: str = "agent"):
             ).fetchone()[0]
 
             # 待处理决策（按 source 过滤策略）
-            src_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history"}
+            src_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history",
+                       "agent_no_lessons": "nl_candidates", "heat_agent_lessons": "token_heat_history_lessons",
+                       "kol_agent": "kol_agent"}
             src = src_map.get(strategy, "agent_candidates")
             pending = conn.execute(
                 "SELECT COUNT(*) FROM pending_decisions WHERE status='pending' AND source=?",
@@ -891,7 +987,9 @@ def api_agent_journal(strategy: str = "agent", limit: int = 5, offset: int = 0):
 def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0):
     """Agent 决策时间线：journal + pending_decisions 合并，按时间倒排，分页"""
     # strategy → pending_decisions source 映射
-    source_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history"}
+    source_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history",
+                  "agent_no_lessons": "nl_candidates", "heat_agent_lessons": "token_heat_history_lessons",
+                  "kol_agent": "kol_agent"}
     src = source_map.get(strategy, "agent_candidates")
     with storage.get_conn() as conn:
         journal_total = conn.execute(
@@ -1328,9 +1426,12 @@ tr.flash { animation: row-flash 1.5s ease-out; }
   <div class="nav-dropdown-content">
     <a href="/agent">Agent-合约扫描</a>
     <a href="/heat-agent">Agent-热度榜单</a>
-    <a href="/kol">Agent-KOL</a>
-  </div>
+    <a href="/agent-heat-lessons">Agent-热度有教训</a>
+    <a href="/agent-nl">Agent-无教训</a>
+      <a href="/agent-kol">Agent-KOL 监控</a>
+          </div>
 </div>
+  <a href="/dashboard">📊 市场全景</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -2298,9 +2399,12 @@ tr:hover { background: #1f2536; }
     <div class="nav-dropdown-content">
       <a href="/agent">Agent-合约扫描</a>
       <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/kol">Agent-KOL</a>
-    </div>
+    <a href="/agent-heat-lessons">Agent-热度有教训</a>
+    <a href="/agent-nl">Agent-无教训</a>
+      <a href="/agent-kol">Agent-KOL 监控</a>
+              </div>
   </div>
+  <a href="/dashboard">📊 市场全景</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -2519,7 +2623,7 @@ async function loadLessons(reset = false) {
           '<span class="lesson-token">' + esc(l.token) + '</span>' +
           (isNew ? '<span style="background:#3a1f5f;color:#c4a0ff;padding:1px 5px;border-radius:2px;font-size:10px;margin-left:4px">NEW</span>' : '') +
           '<span class="lesson-sev ' + sev + '">' + sev + '</span>' +
-          '<span style="font-size:10px;color:var(--muted);margin-left:auto">' + (l.created_at ? l.created_at.substr(0,16) : '') + '</span>' +
+          '<span style="font-size:10px;color:var(--muted);margin-left:auto">' + fmtDateTime(l.created_at) + '</span>' +
           '<span style="font-size:11px;color:var(--' + learnedCls + ');margin-left:8px;cursor:pointer" onclick="toggleLearned(' + (l.id || 0) + ')" title="点击切换">' + learned + '</span>' +
         '</div>' +
         '<div class="lesson-body">' + truncText(l.lesson, 120) + '</div>' +
@@ -2778,6 +2882,54 @@ HEAT_AGENT_HTML = AGENT_HTML.replace(
     '<a href="/heat-agent">', '<a href="/heat-agent" class="active">'
 )
 
+HEAT_LESSONS_HTML = AGENT_HTML.replace(
+    "<title>Agent-合约扫描</title>", "<title>Agent-热度有教训</title>"
+).replace(
+    "<h1>Agent-合约扫描</h1>", "<h1>Agent-热度有教训</h1>"
+).replace(
+    "strategy_initial_agent", "strategy_initial_heat_agent_lessons"
+).replace(
+    "p.strategy === 'agent'", "p.strategy === 'heat_agent_lessons'"
+).replace(
+    "const AGENT_STRATEGY = 'agent'", "const AGENT_STRATEGY = 'heat_agent_lessons'"
+).replace(
+    "'/api/agent/overview'", "'/api/agent/overview?strategy='+AGENT_STRATEGY"
+).replace(
+    "'/api/agent/journal?limit='", "'/api/agent/journal?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/timeline?limit='", "'/api/agent/timeline?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/lessons?limit='", "'/api/agent/lessons?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    '<a href="/agent" class="active">', '<a href="/agent">'
+).replace(
+    '<a href="/agent-heat-lessons">', '<a href="/agent-heat-lessons" class="active">'
+)
+
+NL_AGENT_HTML = AGENT_HTML.replace(
+    "<title>Agent-合约扫描</title>", "<title>Agent-无教训对照</title>"
+).replace(
+    "<h1>Agent-合约扫描</h1>", "<h1>Agent-无教训对照</h1>"
+).replace(
+    "strategy_initial_agent", "strategy_initial_agent_no_lessons"
+).replace(
+    "p.strategy === 'agent'", "p.strategy === 'agent_no_lessons'"
+).replace(
+    "const AGENT_STRATEGY = 'agent'", "const AGENT_STRATEGY = 'agent_no_lessons'"
+).replace(
+    "'/api/agent/overview'", "'/api/agent/overview?strategy='+AGENT_STRATEGY"
+).replace(
+    "'/api/agent/journal?limit='", "'/api/agent/journal?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/timeline?limit='", "'/api/agent/timeline?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/lessons?limit='", "'/api/agent/lessons?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    '<a href="/agent" class="active">', '<a href="/agent">'
+).replace(
+    '<a href="/agent-nl">', '<a href="/agent-nl" class="active">'
+)
+
 
 SETTINGS_HTML = """
 <!DOCTYPE html>
@@ -2799,7 +2951,7 @@ h1 { font-size: 20px; margin-bottom: 20px; }
 h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
 label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px; }
-input, select { width: 100%; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 14px; margin-bottom: 14px; }
+input, select { width: 100%; box-sizing: border-box; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 14px; height: 40px; margin-bottom: 14px; }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
@@ -2840,9 +2992,13 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   <div class="nav-dropdown-content">
     <a href="/agent">Agent-合约扫描</a>
     <a href="/heat-agent">Agent-热度榜单</a>
-    <a href="/kol">Agent-KOL</a>
+    <a href="/agent-heat-lessons">Agent-热度有教训</a>
+    <a href="/agent-nl">Agent-无教训</a>
+    <a href="/agent-kol">Agent-KOL 监控</a>
+    <a href="/kol">Agent-KOL 分析</a>
   </div>
 </div>
+  <a href="/dashboard">📊 市场全景</a>
   <a href="/settings" class="active">⚙ 系统设置</a>
 </div>
 
@@ -2901,6 +3057,14 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       <label>KOL 策略初始 USDT</label>
       <input id="trade-strategy-kol" type="number" min="1" step="1">
     </div>
+    <div>
+      <label>无教训版初始 USDT</label>
+      <input id="trade-strategy-nl" type="number" min="1" step="1">
+    </div>
+    <div>
+      <label>热度有教训初始 USDT</label>
+      <input id="trade-strategy-heat-lessons" type="number" min="1" step="1">
+    </div>
   </div>
 </div>
 
@@ -2928,6 +3092,20 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <option value="false">关闭</option>
       </select>
     </div>
+    <div>
+      <label>Agent-无教训</label>
+      <select id="trade-nl-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
+      <label>Agent-热度有教训</label>
+      <select id="trade-heat-lessons-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
   </div>
 </div>
 
@@ -2945,6 +3123,25 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <div>
       <label>KOL Agent 触发间隔（分钟）</label>
       <input id="trade-kol-interval" type="number" min="10" max="480" step="5">
+    </div>
+    <div>
+      <label>KOL Agent LLM 提供商</label>
+      <select id="trade-kol-provider">
+        <option value="deepseek">DeepSeek</option>
+        <option value="nvidia">NVIDIA</option>
+      </select>
+    </div>
+    <div>
+      <label>NL Agent 触发间隔（分钟）</label>
+      <input id="trade-nl-interval" type="number" min="10" max="480" step="5">
+    </div>
+    <div>
+      <label>热度有教训 触发间隔（轮）</label>
+      <input id="trade-heat-lessons-interval" type="number" min="1" max="20" step="1">
+    </div>
+    <div>
+      <label>AI 研判间隔（分钟）</label>
+      <input id="trade-ai-regime-interval" type="number" min="10" max="240" step="5">
     </div>
   </div>
 </div>
@@ -2978,9 +3175,8 @@ function showToast(msg, kind = 'ok', d = 2500) {
 }
 async function loadSettings() {
   try {
-    const r = await fetch('/api/trading');
-    const d = await r.json();
-    const s = d.account.settings || {};
+    const r = await fetch('/api/settings');
+    const s = await r.json();
     document.getElementById('trade-enabled').value = s.enabled ? 'true' : 'false';
     document.getElementById('trade-mode').value = s.mode || 'paper';
     document.getElementById('trade-initial').value = s.initial_balance ?? '';
@@ -2988,14 +3184,22 @@ async function loadSettings() {
     document.getElementById('trade-collect-interval').value = s.agent_collect_interval_minutes ?? 15;
     document.getElementById('trade-trigger-interval').value = s.agent_trigger_interval ?? 3;
     document.getElementById('trade-kol-interval').value = s.kol_agent_interval_minutes ?? 15;
+    document.getElementById('trade-nl-interval').value = s.nl_agent_interval_minutes ?? 30;
+    document.getElementById('trade-heat-lessons-interval').value = s.heat_agent_lessons_trigger_interval ?? 3;
+    document.getElementById('trade-ai-regime-interval').value = s.ai_regime_interval_minutes ?? 30;
+    document.getElementById('trade-kol-provider').value = s.kol_llm_provider || 'deepseek';
     document.getElementById('trade-agent-switch').value = s.agent_trade_enabled ?? true;
     document.getElementById('trade-heat-switch').value = s.heat_agent_enabled ?? true;
     document.getElementById('trade-kol-switch').value = s.kol_agent_enabled ?? true;
+    document.getElementById('trade-nl-switch').value = s.nl_agent_enabled ?? true;
+    document.getElementById('trade-heat-lessons-switch').value = s.heat_agent_lessons_enabled ?? true;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
     document.getElementById('trade-strategy-manual').value = s.strategy_initial_manual ?? 1000;
     document.getElementById('trade-strategy-kol').value = s.strategy_initial_kol_agent ?? 1000;
+    document.getElementById('trade-strategy-nl').value = s.strategy_initial_agent_no_lessons ?? 1000;
+    document.getElementById('trade-strategy-heat-lessons').value = s.strategy_initial_heat_agent_lessons ?? 1000;
   } catch(e) { console.error(e); }
 }
 async function saveTradingSettings() {
@@ -3009,12 +3213,19 @@ async function saveTradingSettings() {
     strategy_initial_system: Number(document.getElementById('trade-strategy-system').value),
     strategy_initial_manual: Number(document.getElementById('trade-strategy-manual').value),
     strategy_initial_kol_agent: Number(document.getElementById('trade-strategy-kol').value),
+    strategy_initial_agent_no_lessons: Number(document.getElementById('trade-strategy-nl').value),
+    strategy_initial_heat_agent_lessons: Number(document.getElementById('trade-strategy-heat-lessons').value),
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
     agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
     kol_agent_interval_minutes: Number(document.getElementById('trade-kol-interval').value),
+    nl_agent_interval_minutes: Number(document.getElementById('trade-nl-interval').value),
+    heat_agent_lessons_trigger_interval: Number(document.getElementById('trade-heat-lessons-interval').value),
+    kol_llm_provider: document.getElementById('trade-kol-provider').value,
     agent_trade_enabled: document.getElementById('trade-agent-switch').value === 'true',
     heat_agent_enabled: document.getElementById('trade-heat-switch').value === 'true',
     kol_agent_enabled: document.getElementById('trade-kol-switch').value === 'true',
+    nl_agent_enabled: document.getElementById('trade-nl-switch').value === 'true',
+    heat_agent_lessons_enabled: document.getElementById('trade-heat-lessons-switch').value === 'true',
   };
   try {
     const resp = await fetch('/api/trading/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -3106,6 +3317,33 @@ def api_strategy_stats():
 
 # === KOL Agent API ===
 
+# === 市场全景 Dashboard API ===
+
+@app.get("/api/risk-metrics")
+def api_risk_metrics():
+    import dashboard
+    return dashboard.get_risk_metrics()
+
+
+@app.get("/api/macro-events")
+def api_macro_events():
+    import dashboard
+    return dashboard.get_macro_events()
+
+
+@app.get("/api/ai-regime")
+def api_ai_regime():
+    import dashboard
+    alpha = dashboard.get_alpha_breadth()
+    return dashboard.get_ai_regime(alpha)
+
+
+@app.get("/api/kol/llm-logs")
+def api_kol_llm_logs(limit: int = 30):
+    with storage.get_conn() as conn:
+        return storage.kol_llm_logs_recent(conn, limit)
+
+
 @app.get("/api/kol/analyses")
 def api_kol_analyses():
     with storage.get_conn() as conn:
@@ -3114,6 +3352,8 @@ def api_kol_analyses():
     by_token = {}
     for r in rows:
         by_token.setdefault(r["token"], []).append(r)
+    for t in by_token:
+        by_token[t] = by_token[t][:8]
     return {"tokens": tokens, "by_token": by_token}
 
 
@@ -3155,10 +3395,10 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .header-time { color: var(--muted); font-size: 12px; }
 .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-.card-token { font-size: 16px; font-weight: 700; color: var(--accent); }
-.card-badges { display: flex; gap: 6px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+.card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.card-time { color: var(--muted); font-size: 11px; }
+.card-badges { display: flex; gap: 6px; margin-left: auto; }
 .badge { padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 .badge-short { background: #3a1a1a; color: var(--red); }
 .badge-long { background: #1a3a1a; color: var(--green); }
@@ -3166,22 +3406,20 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 .badge-high { background: #1a3a1a; color: var(--green); }
 .badge-medium { background: #3a3a1a; color: var(--yellow); }
 .badge-low { background: #3a1a1a; color: var(--red); }
-.price-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 10px; }
-.price-table td { padding: 3px 6px; border-bottom: 1px solid var(--border); }
-.price-table .label { color: var(--muted); }
-.price-table .value { text-align: right; font-weight: 500; }
-.section-title { font-size: 12px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: 0.5px; }
-.timeline-item { padding: 3px 0; font-size: 12px; display: flex; gap: 8px; }
-.timeline-time { color: var(--muted); min-width: 50px; }
-.timeline-event { padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; min-width: 48px; text-align: center; }
-.event-SHORT { background: #3a1a1a; color: var(--red); }
-.event-LONG { background: #1a3a1a; color: var(--green); }
-.event-WAIT { background: #1a1a2a; color: var(--muted); }
-.event-NOTE { background: #1a2a3a; color: var(--accent); }
+.price-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-bottom: 10px; }
+.price-box { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; text-align: center; }
+.price-box .plabel { font-size: 10px; color: var(--muted); margin-bottom: 2px; }
+.price-box .pvalue { font-size: 12px; font-weight: 600; color: var(--text); }
 .analysis-text { font-size: 12px; color: var(--text); line-height: 1.5; margin: 4px 0; }
+.analysis-timing { font-size: 12px; color: var(--yellow); line-height: 1.5; margin: 4px 0; }
+.analysis-risk { font-size: 11px; color: var(--green); margin: 2px 0; }
 .token-tab { padding: 6px 16px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s; font-family: inherit; }
 .token-tab:hover { border-color: var(--accent); }
 .empty { text-align: center; color: var(--muted); padding: 40px; }
+#main-layout { display: flex; gap: 16px; height: 600px; }
+#chart-panel { width: 380px; min-width: 320px; flex-shrink: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+#cards-panel { flex: 1; overflow-y: auto; padding-right: 4px; }
+@media (max-width: 900px) { #main-layout { flex-direction: column; height: auto; } #chart-panel { width: 100%; height: 300px; } #cards-panel { max-height: 600px; overflow-y: auto; } }
 </style>
 </head>
 <body>
@@ -3194,9 +3432,12 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
     <div class="nav-dropdown-content">
       <a href="/agent">Agent-合约扫描</a>
       <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/kol" class="active">Agent-KOL</a>
-    </div>
+    <a href="/agent-heat-lessons">Agent-热度有教训</a>
+    <a href="/agent-nl">Agent-无教训</a>
+      <a href="/agent-kol">Agent-KOL 监控</a>
+          </div>
   </div>
+  <a href="/dashboard">📊 市场全景</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -3209,7 +3450,13 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 </div>
 
 <div id="token-tabs"></div>
-<div id="content"><div class="empty">加载中...</div></div>
+
+<div id="main-layout">
+  <div id="chart-panel">
+    <iframe id="tv-chart" src="about:blank" style="width:100%;height:100%;border:none;border-radius:8px" allowfullscreen></iframe>
+  </div>
+  <div id="cards-panel"><div class="empty">加载中...</div></div>
+</div>
 
 <script>
 const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':Number(v).toFixed(6);
@@ -3224,7 +3471,10 @@ function renderCard(a, showToken) {
   const confScore = Number(a.confidence) || 0;
   const confClass = confScore >= 80 ? 'badge-high' : confScore >= 50 ? 'badge-medium' : 'badge-low';
   const confBadge = '<span class="badge ' + confClass + '">' + confScore + '</span>';
-  const timeStr = a.created_at ? a.created_at.replace('T',' ').substring(5,16) : '';
+  const timeStr = (function(ts) {
+    if (!ts) return '';
+    try { const d = new Date(ts.replace(' ','T')+'Z'); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); } catch { return ts.substr(5,11); }
+  })(a.created_at);
 
   let priceHtml = '';
   const pl = a.price_levels || {};
@@ -3234,22 +3484,21 @@ function renderCard(a, showToken) {
   ];
   for (const [label, key] of priceKeys) {
     const v = pl[key];
-    priceHtml += '<tr><td class="label">'+label+'</td><td class="value">'+(v!=null?fmtPrice(v):'—')+'</td></tr>';
+    priceHtml += '<div class="price-box"><div class="plabel">'+label+'</div><div class="pvalue">'+(v!=null?fmtPrice(v):'—')+'</div></div>';
   }
 
   let riskHtml = '';
   const rc = a.risk_control || {};
-  if (rc.stop_loss_rule) riskHtml += '<div style="font-size:11px;margin:2px 0"><span style="color:var(--muted)">止损：</span>'+esc(rc.stop_loss_rule)+'</div>';
-  if (rc.tp1) riskHtml += '<div style="font-size:11px;margin:2px 0"><span style="color:var(--muted)">TP1：</span>'+esc(rc.tp1)+'</div>';
-  if (rc.tp2) riskHtml += '<div style="font-size:11px;margin:2px 0"><span style="color:var(--muted)">TP2：</span>'+esc(rc.tp2)+'</div>';
+  if (rc.stop_loss_rule) riskHtml += '<div class="analysis-risk">止损：'+esc(rc.stop_loss_rule)+'</div>';
+  if (rc.tp1) riskHtml += '<div class="analysis-risk">TP1：'+esc(rc.tp1)+'</div>';
+  if (rc.tp2) riskHtml += '<div class="analysis-risk">TP2：'+esc(rc.tp2)+'</div>';
 
   return '<div class="card">'
-    + '<div class="card-header"><span class="card-token">'+(showToken?esc(a.token):'')+'</span><span style="color:var(--muted);font-size:11px">'+timeStr+'</span><div class="card-badges">'+dirBadge+confBadge+'</div></div>'
-    + '<div class="section-title">价格位</div>'
-    + '<table class="price-table">'+priceHtml+'</table>'
+    + '<div class="card-header"><span class="card-time">'+timeStr+'</span><div class="card-badges">'+dirBadge+confBadge+'</div></div>'
+    + '<div class="price-grid">'+priceHtml+'</div>'
     + (a.position_analysis ? '<div class="analysis-text">'+esc(a.position_analysis)+'</div>' : '')
-    + (a.timing ? '<div class="analysis-text"><span style="color:var(--yellow)">时机：</span>'+esc(a.timing)+'</div>' : '')
-    + (riskHtml ? '<div class="section-title">风控</div>'+riskHtml : '')
+    + (a.timing ? '<div class="analysis-timing">时机：'+esc(a.timing)+'</div>' : '')
+    + riskHtml
     + (a.reason ? '<div class="analysis-text" style="color:var(--muted);font-size:11px;margin-top:8px">'+esc(a.reason)+'</div>' : '')
     + '</div>';
 }
@@ -3267,28 +3516,33 @@ function renderTabs(tokens) {
   }
 }
 
+function setChart(token) {
+  document.getElementById('tv-chart').src = 'https://s.tradingview.com/widgetembed/?symbol=BINANCE%3A'+token+'USDT.P&interval=15&theme=dark&style=1&width=100%25&height=100%25&hide_side_toolbar=1&withdateranges=1&save_image=0&studies=';
+}
+
 function selectToken(token) {
   _activeToken = token;
   renderTabs(Object.keys(_byToken));
-  const list = _byToken[token] || [];
-  document.getElementById('content').innerHTML = list.map(function(a) { return renderCard(a, false); }).join('');
+  setChart(token);
+  var list = _byToken[token] || [];
+  document.getElementById('cards-panel').innerHTML = list.map(function(a) { return renderCard(a, false); }).join('');
 }
 
 async function load() {
   try {
-    const r = await fetch('/api/kol/analyses');
-    const d = await r.json();
-    const tokens = d.tokens || [];
+    var r = await fetch('/api/kol/analyses');
+    var d = await r.json();
+    var tokens = d.tokens || [];
     _byToken = d.by_token || {};
     if (!tokens.length) {
-      document.getElementById('content').innerHTML = '<div class="empty">暂无KOL分析数据<br><span style="font-size:11px;color:var(--muted)">等待 collector 触发分析后刷新</span></div>';
+      document.getElementById('cards-panel').innerHTML = '<div class="empty">暂无KOL分析数据<br><span style="font-size:11px;color:var(--muted)">等待 collector 触发分析后刷新</span></div>';
       return;
     }
     _activeToken = tokens[0];
     renderTabs(tokens);
     selectToken(_activeToken);
   } catch(e) {
-    document.getElementById('content').innerHTML = '<div class="empty" style="color:var(--red)">加载失败: '+esc(e.message)+'</div>';
+    document.getElementById('cards-panel').innerHTML = '<div class="empty" style="color:var(--red)">加载失败: '+esc(e.message)+'</div>';
   }
 }
 
@@ -3363,9 +3617,12 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
     <div class="nav-dropdown-content">
       <a href="/agent">Agent-合约扫描</a>
       <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/kol">Agent-KOL</a>
-    </div>
+    <a href="/agent-heat-lessons">Agent-热度有教训</a>
+    <a href="/agent-nl">Agent-无教训</a>
+      <a href="/agent-kol">Agent-KOL 监控</a>
+              </div>
   </div>
+  <a href="/dashboard">📊 市场全景</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -3377,7 +3634,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 const fmtUsd = v => (v!=null&&!isNaN(Number(v)))?'$'+Number(v).toFixed(2):'-';
 const fmtPct = v => (v!=null&&!isNaN(Number(v)))?(v>=0?'+':'')+Number(v).toFixed(2)+'%':'-';
 const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=1?Number(v).toFixed(4):Number(v).toFixed(6));
-const fmtTime = ts => { if (!ts) return '—'; try { const d = new Date(ts.replace(' ','T')+'Z'); const m = d.getMonth()+1; const day = d.getDate(); const h = String(d.getHours()).padStart(2,'0'); const min = String(d.getMinutes()).padStart(2,'0'); return m+'/'+day+' '+h+':'+min; } catch { return ts; } };
+const fmtTime = ts => { if (!ts) return '—'; try { const d = new Date(ts.replace(' ','T')+'Z'); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); } catch { return ts; } };
 
 async function load() {
   try {
@@ -3394,6 +3651,8 @@ async function load() {
       system: '<span class="strategy-badge badge-system">⚙ 系统策略</span>',
       manual: '<span class="strategy-badge badge-manual">👆 手动策略</span>',
       kol_agent: '<span class="strategy-badge" style="background:#1a2a4a;color:#58a6ff">🧠 KOL策略</span>',
+      heat_agent_lessons: '<span class="strategy-badge" style="background:#3a2a1a;color:#f0a040">🔥 热度有教训</span>',
+      agent_no_lessons: '<span class="strategy-badge" style="background:#2a2a1a;color:#d29922">📋 无教训对照</span>',
     };
     let html = '';
     for (const s of strategies) {
@@ -3473,10 +3732,101 @@ load();
 </html>
 """
 
+
+KOL_MONITOR_HTML = AGENT_HTML.replace(
+    "<title>Agent-合约扫描</title>", "<title>Agent-KOL 监控</title>"
+).replace(
+    "<h1>Agent-合约扫描</h1>", "<h1>Agent-KOL 监控</h1>"
+).replace(
+    "合约扫描 · 自主决策开仓", "合约扫描 · 决策时间线 · LLM日志 · <a href=\"/kol\" style=\"color:var(--accent);text-decoration:none\">📊 查看K线分析 →</a>"
+).replace(
+    "strategy_initial_agent", "strategy_initial_kol_agent"
+).replace(
+    "  loadLessons(true);\n", ""
+).replace(
+    "p.strategy === 'agent'", "p.strategy === 'kol_agent'"
+).replace(
+    "const AGENT_STRATEGY = 'agent'", "const AGENT_STRATEGY = 'kol_agent'"
+).replace(
+    "'/api/agent/overview'", "'/api/agent/overview?strategy='+AGENT_STRATEGY"
+).replace(
+    "'/api/agent/journal?limit='", "'/api/agent/journal?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/timeline?limit='", "'/api/agent/timeline?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/lessons?limit='", "'/api/agent/lessons?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    '<a href="/agent" class="active">', '<a href="/agent">'
+).replace(
+    '<a href="/agent-kol">', '<a href="/agent-kol" class="active">'
+).replace(
+    '''<!-- 底部：教训库 + 决策时间线 -->
+<div class="grid-bottom">
+  <div class="panel">
+    <h2>教训库</h2>
+    <div class="stats-bar" id="lesson-stats"></div>
+    <div id="lessons-list"></div>
+  </div>
+
+  <div class="panel">
+    <h2>决策时间线</h2>''',
+    '''<!-- 底部：LLM日志 + 决策时间线 -->
+<div class="grid-bottom">
+  <div class="panel">
+    <h2>LLM 调用日志</h2>
+    <div id="llm-logs"></div>
+  </div>
+  <div class="panel">
+    <h2>决策时间线</h2>'''
+).replace(
+    '</body>', '''<script>
+async function loadLLMLogs(){
+  try{
+    const r=await fetch("/api/kol/llm-logs?limit=30");
+    const logs=await r.json();
+    if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
+    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th></tr>";
+    for(const l of logs){
+      const t=l.created_at?l.created_at.replace("T"," ").substring(5,16):"";
+      const ok=l.success?"<span class=green>OK("+l.analyses_count+"条)</span>":"<span class=red>FAIL</span>";
+      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td></tr>";
+    }
+    document.getElementById("llm-logs").innerHTML=h+"</table>";
+  }catch(e){}
+}
+loadLLMLogs();
+setInterval(loadLLMLogs,60000);
+</script>
+</body>'''
+)
+
+
+
 @app.get("/heat-agent", response_class=HTMLResponse)
 def heat_agent_page():
     return HTMLResponse(
         content=HEAT_AGENT_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+@app.get("/agent-nl", response_class=HTMLResponse)
+def agent_nl_page():
+    return HTMLResponse(
+        content=NL_AGENT_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+@app.get("/agent-kol", response_class=HTMLResponse)
+def agent_kol_page():
+    return HTMLResponse(
+        content=KOL_MONITOR_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+@app.get("/agent-heat-lessons", response_class=HTMLResponse)
+def agent_heat_lessons_page():
+    return HTMLResponse(
+        content=HEAT_LESSONS_HTML,
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -3486,6 +3836,194 @@ def kol_agent_page():
         content=KOL_AGENT_HTML,
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page():
+    return HTMLResponse(
+        content=DASHBOARD_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>市场全景分析 — BSM Agent</title>
+<style>
+:root{--bg:#0a0e14;--panel:#11161d;--border:#1e2530;--text:#c9d1d9;--muted:#6e7681;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--orange:#f0883e}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Inter',-apple-system,"Microsoft YaHei",sans-serif;padding:16px;max-width:1400px;margin:0 auto;font-size:13px}
+h1{font-size:18px;margin-bottom:2px}h2{font-size:14px;color:var(--accent);margin-bottom:6px}
+.nav-bar{display:flex;justify-content:center;gap:0;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:0;flex-wrap:wrap}
+.nav-bar a{padding:8px 14px;color:var(--muted);text-decoration:none;font-size:12px;font-weight:500;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}
+.nav-bar a.active,.nav-bar a:hover{color:var(--accent);border-bottom-color:var(--accent)}
+.header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.status-badge{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:600}
+.status-warning{background:#3a2a0a;color:var(--yellow);border:1px solid var(--yellow);animation:breathe 2s ease-in-out infinite}
+.status-normal{background:#1a3a1a;color:var(--green);border:1px solid var(--green)}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.6}}
+.main-grid{display:grid;grid-template-columns:1fr;gap:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card-title{font-size:13px;color:var(--muted);margin-bottom:2px}
+.metrics-row{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:10px}
+.mini-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;text-align:center}
+.mini-card .label{font-size:10px;color:var(--muted);margin-bottom:4px}
+.mini-card .value{font-size:22px;font-weight:700}
+.mini-card .desc{font-size:10px;color:var(--muted);margin-top:2px}
+.macro-inner{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;margin:8px 0}
+.macro-4col{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+.macro-col{padding:6px}
+.macro-col .m-label{font-size:10px;color:var(--muted);margin-bottom:2px}
+.macro-col .m-value{font-size:13px;font-weight:600}
+.events-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.event-item{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px}
+.event-name{font-weight:700;font-size:13px;margin-bottom:4px}
+.event-meta{font-size:11px;color:var(--muted)}
+.event-tag{padding:2px 6px;border-radius:3px;font-size:10px;margin-left:6px}
+.tag-observe{border:1px solid var(--accent);color:var(--accent);background:#0a1a2a}
+.tag-core{border:1px solid var(--red);color:var(--red);background:#2a0a0a}
+.anomaly-bar{background:#2a1a0a;border:1px solid var(--yellow);border-radius:6px;padding:10px;margin-top:8px;font-size:12px}
+.anomaly-bar .a-title{font-weight:700;color:var(--yellow);margin-bottom:2px}
+.anomaly-bar .a-desc{color:var(--text)}
+.anomaly-bar .a-tag{margin-top:4px;font-size:10px;color:var(--muted)}
+.evidence-left{border-left:3px solid var(--green);padding-left:12px;margin:8px 0;background:#0a1a0a;padding:10px;border-radius:0 4px 4px 0}
+.evidence-right{border-left:3px solid var(--red);padding-left:12px;margin:8px 0;background:#1a0a0a;padding:10px;border-radius:0 4px 4px 0}
+.evidence-left ul{margin:0;padding-left:16px;font-size:12px}
+.evidence-right p{font-size:12px;line-height:1.5}
+.pills{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.pill{background:#1a1f2e;color:var(--muted);padding:3px 10px;border-radius:12px;font-size:10px}
+.timeline-bar{display:flex;gap:2px;margin:8px 0}
+.timeline-block{width:18px;height:18px;border-radius:2px}
+.legend{display:flex;gap:12px;font-size:10px;color:var(--muted)}
+.legend span{display:flex;align-items:center;gap:4px}
+.legend-dot{width:10px;height:10px;border-radius:2px;display:inline-block}
+.refresh-info{font-size:11px;color:var(--muted)}
+.empty{text-align:center;color:var(--muted);padding:20px}
+@media(max-width:768px){.metrics-row{grid-template-columns:repeat(3,1fr)}.macro-4col{grid-template-columns:1fr 1fr}.events-grid{grid-template-columns:1fr}}
+.nav-dropdown{position:relative}.nav-dropdown>a{display:inline-block;padding:8px 14px;color:var(--muted);text-decoration:none;font-size:12px;font-weight:500;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}.nav-dropdown>a:hover{color:var(--accent);border-bottom-color:var(--accent)}.nav-dropdown-content{display:none;position:absolute;top:100%;left:0;background:var(--panel);border:1px solid var(--border);border-radius:6px;min-width:140px;z-index:100;padding:4px 0}.nav-dropdown-content a{display:block;padding:6px 14px;color:var(--text);border-bottom:none!important;font-size:12px;white-space:nowrap}.nav-dropdown-content a:hover{background:#1a1f2e;color:var(--accent)!important}.nav-dropdown:hover .nav-dropdown-content{display:block}
+</style></head><body>
+
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/strategies">📈 运行策略</a>
+  <div class="nav-dropdown"><a href="#">🤖 Agent 面板 ▾</a>
+    <div class="nav-dropdown-content">
+      <a href="/agent">Agent-合约扫描</a>
+      <a href="/heat-agent">Agent-热度榜单</a>
+      <a href="/agent-heat-lessons">Agent-热度有教训</a>
+      <a href="/agent-nl">Agent-无教训</a>
+      <a href="/agent-kol">Agent-KOL 监控</a>
+      <a href="/kol">Agent-KOL 分析</a>
+    </div>
+  </div>
+  <a href="/settings">⚙ 系统设置</a>
+  <a href="/dashboard" class="active">📊 市场全景</a>
+</div>
+
+<div class="header-row">
+  <div><h1>📊 市场全景分析</h1></div>
+  <div id="status-badge"></div>
+</div>
+
+<div class="main-grid">
+  <div class="card">
+    <div class="header-row">
+      <div><h2>风控 / 异常窗口</h2><span class="card-title">流动性门禁、宏观事件窗口、Macro AI 标记</span></div>
+      <span class="refresh-info">每15s刷新</span>
+    </div>
+    <div class="metrics-row" id="metrics"></div>
+    <div class="macro-inner">
+      <div class="header-row" style="margin-bottom:6px"><span style="font-weight:600">宏观事件窗口</span><span class="status-badge status-normal" id="macro-status">正常</span></div>
+      <div class="macro-4col" id="macro-next"></div>
+    </div>
+    <div class="events-grid" id="recent-events"></div>
+    <div id="anomaly" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <div class="header-row">
+      <div><h2 style="display:inline">V3 AI Regime</h2> <span id="regime-tag" style="font-size:12px;margin-left:8px"></span> <span id="model-tag" style="font-size:10px;color:var(--muted)"></span></div>
+      <span class="refresh-info" id="ai-updated">更新中...</span>
+    </div>
+    <div id="judgment" style="font-size:13px;line-height:1.6;margin:10px 0;padding:10px;background:var(--bg);border-radius:6px">加载中...</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="evidence-left"><b style="color:var(--green);font-size:12px">✓ 支持证据</b><div id="evidence-support"></div></div>
+      <div class="evidence-right"><b style="color:var(--red);font-size:12px">✗ 反面证据</b><div id="evidence-counter"></div></div>
+    </div>
+    <div class="pills" id="data-sources"></div>
+    <div class="timeline-bar" id="timeline-bar"></div>
+    <div class="legend">
+      <span><span class="legend-dot" style="background:#3fb950"></span>山寨行情</span>
+      <span><span class="legend-dot" style="background:#d29922"></span>回调兑现</span>
+      <span><span class="legend-dot" style="background:#f85149"></span>趋势空</span>
+      <span><span class="legend-dot" style="background:#8b949e"></span>震荡死水</span>
+      <span><span class="legend-dot" style="background:#6e7681"></span>崩盘</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const R={"alt_season":"#3fb950","alt_pullback":"#d29922","chop":"#8b949e","risk_off":"#f85149","crash":"#6e7681"};
+const RN={"alt_season":"山寨行情","alt_pullback":"回调兑现","chop":"震荡死水","risk_off":"趋势空","crash":"崩盘"};
+const MLAB={"liquidity":"流动性状态","z_depth":"当前 z_depth","macro_1h":"1h 大局","macro_3h":"3h 大局","data_age":"数据年龄"};
+async function loadAll(){
+  try{
+    const[rm,me,ai]=await Promise.all([fetch("/api/risk-metrics"),fetch("/api/macro-events"),fetch("/api/ai-regime")]);
+    const r=await rm.json(),m=await me.json(),a=await ai.json();
+    const hasWarning=r.global_status==="warning"||m.current_risk==="high"||m.current_risk==="medium";
+    document.getElementById("status-badge").innerHTML=hasWarning?'<span class="status-badge status-warning">⚠ 有警告</span>':'<span class="status-badge status-normal">✓ 正常</span>';
+    const mt=r.metrics||{};let mh="";
+    for(const[k,v]of Object.entries(mt)){
+      const c=v.color||"var(--text)";
+      mh+=`<div class="mini-card"><div class="label">${MLAB[k]||k}</div><div class="value" style="color:${c}">${v.value??v.status}</div><div class="desc">${v.desc||""}</div></div>`;
+    }
+    document.getElementById("metrics").innerHTML=mh;
+    document.getElementById("macro-status").textContent=m.current_risk==="high"?"⚠ 高风险":m.current_risk==="medium"?"● 注意":"✓ 正常";
+    document.getElementById("macro-status").className="status-badge "+(m.current_risk==="high"?"status-warning":"status-normal");
+    if(m.next_event){
+      document.getElementById("macro-next").innerHTML=
+        `<div class="macro-col"><div class="m-label">当前宏观风险</div><div class="m-value" style="color:${m.current_risk==="high"?"var(--red)":"var(--green)"}">${m.current_risk==="high"?"高风险":m.current_risk==="medium"?"注意":"正常"}</div></div>`+
+        `<div class="macro-col"><div class="m-label">下个事件</div><div class="m-value">${m.next_event.name||""}</div><div style="font-size:10px;color:var(--muted)">${(m.next_event.time||"").substring(0,16)}</div></div>`+
+        `<div class="macro-col"><div class="m-label">倒计时</div><div class="m-value" style="color:var(--yellow)">${m.countdown_str||"即将"}</div><div style="font-size:10px;color:var(--muted)">预测:${m.next_event.forecast||"N/A"} 前值:${m.next_event.previous||"N/A"}</div></div>`+
+        `<div class="macro-col"><div class="m-label">面板动作</div><div class="m-value" style="color:var(--accent)">仅提示</div></div>`;
+    }else{
+      document.getElementById("macro-next").innerHTML=`<div class="macro-col" style="grid-column:1/-1;text-align:center;color:var(--muted)">暂无未来宏观事件</div>`;
+    }
+    const evts=m.recent_events||[];let eh="";
+    for(const e of evts){
+      const tag=e.tag==="核心"?"tag-core":"tag-observe";
+      eh+=`<div class="event-item"><div class="event-name">${e.name}${e.tag?`<span class="event-tag ${tag}">${e.tag}</span>`:""}</div><div class="event-meta">${(e.time||"").substring(0,16)} · ${e.region||""}</div></div>`;
+    }
+    document.getElementById("recent-events").innerHTML=eh||"<div class='empty'>暂无宏观事件</div>";
+    let anomalyHtml="";
+    const liq=r.metrics?.liquidity;
+    if(liq&&liq.color!=="green"){
+      anomalyHtml+=`<div class="anomaly-bar"><div class="a-title">⚠ 流动性警戒</div><div class="a-desc">${liq.status}: ${liq.desc}</div><div class="a-tag">rolling_liquidity</div></div>`;
+    }
+    if(r.global_status==="warning"&&m.current_risk==="high"){
+      anomalyHtml+=`<div class="anomaly-bar"><div class="a-title">⚠ 宏观风险 + 流动性双重警戒</div><div class="a-desc">当前宏观风险评级为高，同时流动性出现异常</div><div class="a-tag">macro_risk + liquidity</div></div>`;
+    }
+    document.getElementById("anomaly").innerHTML=anomalyHtml;
+    const tag=a.current_regime||"";
+    document.getElementById("regime-tag").innerHTML=`<span style="color:${R[tag]||'var(--muted)'}">●</span> ${RN[tag]||tag} <span style="color:var(--muted);font-size:11px">conf ${a.confidence||0}</span>`;
+    document.getElementById("model-tag").textContent=a.model||"deepseek";
+    document.getElementById("ai-updated").textContent=`每${a.refresh_interval_min||32}分钟 · ${a.updated_at||""}`;
+    document.getElementById("judgment").innerHTML=(a.judgment_text||"AI研判加载中...").replace(/\\n/g,"<br>");
+    let sl="";for(const s of(a.evidence_support||[]))sl+=`<li>${s}</li>`;
+    document.getElementById("evidence-support").innerHTML=`<ul>${sl}</ul>`;
+    document.getElementById("evidence-counter").innerHTML=`<p>${a.evidence_counter||"暂无反面证据"}</p>`;
+    let pl="";for(const s of(a.data_sources||[]))pl+=`<span class="pill">${s}</span>`;
+    document.getElementById("data-sources").innerHTML=pl;
+    const tl=a.timeline_24h||[];
+    let th="";for(const t of tl)th+=`<span class="timeline-block" style="background:${R[t]||"#30363d"}" title="${RN[t]||t}"></span>`;
+    for(let i=tl.length;i<24;i++)th+=`<span class="timeline-block" style="background:#1a1f2e" title="无数据"></span>`;
+    document.getElementById("timeline-bar").innerHTML=th;
+  }catch(e){console.error(e);document.getElementById("judgment").innerHTML='<span style="color:var(--red)">数据加载失败，15s后重试...</span>';document.getElementById("status-badge").innerHTML='<span class="status-badge status-warning">⚠ 数据异常</span>'}
+}
+loadAll();setInterval(loadAll,15000);
+</script></body></html>"""
+
 
 @app.get("/strategies", response_class=HTMLResponse)
 def strategies_page():

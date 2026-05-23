@@ -147,6 +147,7 @@ def compute_position_size(
     stop_price: float,
     leverage: float,
     tier: Literal["full", "half"] = "full",
+    side: str = "LONG",
 ) -> dict:
     """
     基于风险反推仓位。
@@ -161,8 +162,12 @@ def compute_position_size(
     返回：{"quantity", "notional", "margin", "risk_amount", "stop_distance_pct", "note"}
     若无法下单返回 {"quantity": 0, "note": "原因"}
     """
-    if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
-        return {"quantity": 0, "note": "stop_price 不合法（>=entry）"}
+    if entry_price <= 0 or stop_price <= 0:
+        return {"quantity": 0, "note": "entry/stop 价格不合法"}
+    if side == "LONG" and stop_price >= entry_price:
+        return {"quantity": 0, "note": "做多止损应低于入场价"}
+    if side == "SHORT" and stop_price <= entry_price:
+        return {"quantity": 0, "note": "做空止损应高于入场价"}
 
     risk_pct = config.TRADING_RISK_PER_TRADE_PCT / 100.0
     if tier == "half":
@@ -179,7 +184,7 @@ def compute_position_size(
             margin *= 0.5
         notional = margin * leverage
         quantity = notional / entry_price
-        risk_amount = (entry_price - stop_price) * quantity
+        risk_amount = abs(entry_price - stop_price) * quantity
         stop_distance_pct = (stop_price - entry_price) / entry_price * 100
         return {
             "quantity": quantity,
@@ -192,7 +197,7 @@ def compute_position_size(
 
     # risk_based（默认）
     risk_amount = equity * risk_pct
-    per_unit_risk = entry_price - stop_price  # > 0
+    per_unit_risk = abs(entry_price - stop_price)
     quantity = risk_amount / per_unit_risk
     notional = quantity * entry_price
     margin = notional / leverage
@@ -426,6 +431,7 @@ def check_account_risk(
     bypass_max_concurrent: bool = False,
     bypass_sector_limit: bool = False,
     bypass_cooldown: bool = False,
+    side: str = "LONG",
 ) -> RiskDecision:
     """
     在开仓前检查账户级风险。不通过则返回 allowed=False。
@@ -491,7 +497,7 @@ def check_account_risk(
     # 5. 板块集中度
     if not bypass_sector_limit:
         sector = sector_of(token)
-        sector_count = account.open_positions_by_sector.get(sector, 0)
+        sector_count = account.open_positions_by_sector.get((sector, side), 0)
         if sector != "other" and sector_count >= config.TRADING_CORRELATED_LIMIT:
             return RiskDecision(
                 allowed=False,
