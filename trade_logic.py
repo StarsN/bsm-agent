@@ -398,6 +398,14 @@ def _build_account_context(conn, strategy: str = None) -> risk.AccountContext:
         key = (sec, pos.get("side", "LONG"))
         by_sector[key] = by_sector.get(key, 0) + 1
 
+    # 日交易限制开关
+    dle = True
+    try:
+        ts = storage.trading_settings_get(conn)
+        dle = str(ts.get("trading_daily_limit_enabled", True)).lower() in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+
     return risk.AccountContext(
         equity=summary["equity"],
         available_balance=summary["available_balance"],
@@ -406,6 +414,7 @@ def _build_account_context(conn, strategy: str = None) -> risk.AccountContext:
         open_positions_count=len(open_positions),
         open_positions_by_sector=by_sector,
         trades_opened_today=trades_today,
+        daily_limit_enabled=dle,
         last_stop_loss_by_token=last_sl_map,
     )
 
@@ -558,6 +567,25 @@ def open_paper_position(conn, candidate: dict, settings: dict, strategy: str = "
     ok = storage.trade_position_insert(conn, position)
     if not ok:
         _debug_reject(token, "DB insert 失败（唯一索引冲突？）", candidate)
+        return ok
+
+    # 写开仓 journal（KOL Agent 等策略依赖此表做操作日志和时间线）
+    pos_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    snap_json = json.dumps({
+        "price": entry_price, "stop_loss": stop_loss_price,
+        "tp1": tp1_price, "tp2": tp2_price,
+        "margin": margin, "notional": notional, "leverage": leverage,
+        "stop_mode": stop_mode,
+        "stop_distance_pct": sizing.get("stop_distance_pct"),
+        "risk_amount": risk_amount,
+    }, ensure_ascii=False)
+    storage.journal_add_open(
+        conn, position_id=pos_id, token=token, price=entry_price,
+        tier=tier, stop_loss=stop_loss_price,
+        tp1_price=tp1_price, tp2_price=tp2_price,
+        reason=position["open_reason"],
+        dimension_data=snap_json,
+    )
     return ok
 
 

@@ -172,6 +172,14 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("24h成交额", c.get("vol_24h")),
             ("OI(USD)", c.get("oi_usd")),
             ("上币时长", c.get("age")),
+            # 全景字段
+            ("vol/OI", f"{c.get('vol_oi'):.2f}" if c.get("vol_oi") is not None else None),
+            ("上线天数", f"{c.get('listing_days'):.0f}d" if c.get("listing_days") is not None else None),
+            ("品类", c.get("sector")),
+            ("链", c.get("chain")),
+            ("基差", f"{c.get('basis')}%" if c.get("basis") is not None else None),
+            ("OKX 资金费率", f"{c.get('okx_funding')}%" if c.get("okx_funding") is not None else None),
+            ("多空爆仓(USD)", f"多{c.get('liq_long_usd') or 0:.0f}/{(c.get('liq_long_cnt') or 0):.0f}笔 空{c.get('liq_short_usd') or 0:.0f}/{(c.get('liq_short_cnt') or 0):.0f}笔" if (c.get('liq_long_usd') or c.get('liq_short_usd')) else None),
             ("信号标签", c.get("tags")),
         ]
         for label, val in fields:
@@ -186,9 +194,9 @@ def build_user_prompt(candidates: list[dict]) -> str:
 # 3. 调用 DeepSeek API
 # ------------------------------------------------------------
 
-def call_deepseek(system: str, user: str, max_tokens: int = 4096) -> Optional[str]:
+def call_deepseek(system: str, user: str, max_tokens: int = 4096, provider: str = "") -> Optional[str]:
     """返回 LLM 回复文本，失败返回 None"""
-    provider = getattr(config, "KOL_LLM_PROVIDER", "deepseek")
+    provider = provider or getattr(config, "KOL_LLM_PROVIDER", "deepseek")
     if provider == "nvidia":
         api_key = config.NVIDIA_API_KEY
         model = config.NVIDIA_MODEL
@@ -219,13 +227,22 @@ def call_deepseek(system: str, user: str, max_tokens: int = 4096) -> Optional[st
         "Authorization": f"Bearer {api_key}",
     })
 
+    raw_body = b""
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=getattr(config, "KOL_LLM_TIMEOUT", 600)) as resp:
+            raw_body = resp.read()
+            data = json.loads(raw_body.decode("utf-8"))
             content = data["choices"][0]["message"]["content"]
             return content
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500]
+        print(f"[kol_agent] HTTP {e.code}: {err_body}")
+        return None
     except Exception as e:
-        print(f"[kol_agent] API 调用失败: {e}")
+        detail = str(e)
+        if raw_body:
+            detail += f" | body={raw_body.decode('utf-8', errors='replace')[:300]}"
+        print(f"[kol_agent] API 调用失败: {detail}")
         return None
 
 
@@ -275,6 +292,72 @@ def get_kol_candidates(conn: sqlite3.Connection) -> list[dict]:
 # 4. 主入口：分析候选币 → 写入 DB
 # ------------------------------------------------------------
 
+def _build_panorama_context() -> str:
+    """获取市场全景数据（除 AI Regime），格式化为 KOL prompt header"""
+    lines = ["## 市场全景环境"]
+    # 恐惧贪婪
+    try:
+        import json as _json
+        import urllib.request as _req
+        url = "https://api.alternative.me/fng/?limit=1"
+        r = _req.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _req.urlopen(r, timeout=5) as resp:
+            d = _json.loads(resp.read().decode("utf-8"))
+            if d.get("data"):
+                fng = d["data"][0]
+                lines.append(f"- 恐惧贪婪: {fng.get('value')} ({fng.get('value_classification', '')})")
+    except Exception:
+        pass
+    # BTC / 流动性 / 宏观
+    try:
+        from dashboard import get_risk_metrics, get_macro_events
+        rm = get_risk_metrics()
+        m1h = rm["metrics"]["macro_1h"]
+        m3h = rm["metrics"]["macro_3h"]
+        zd = rm["metrics"]["z_depth"]
+        liq = rm["metrics"]["liquidity"]
+        lines.append(f"- BTC 1h: {m1h['value']}% ({m1h['desc']}) | BTC 3h: {m3h['value']}% ({m3h['desc']})")
+        lines.append(f"- z_depth: ${zd['value']}M ({zd['desc']})")
+        lines.append(f"- 流动性: {liq['status']} (价差{liq['desc']})")
+        # V3 AI Regime（只有缓存命中才附加，loading 中不喂）
+        try:
+            from dashboard import get_alpha_breadth, get_ai_regime
+            alpha = get_alpha_breadth()
+            regime = get_ai_regime(alpha)
+            jt = regime.get("judgment_text", "")
+            if "生成中" in jt or not jt:
+                pass  # loading 或空，不喂给 KOL
+            else:
+                regime_cn = {"alt_season": "山寨行情", "alt_pullback": "回调兑现",
+                             "chop": "震荡死水", "risk_off": "趋势空"}.get(regime.get("current_regime", ""), regime.get("current_regime", ""))
+                lines.append(f"- AI 市场研判: {regime_cn} (conf {regime.get('confidence', 0)})")
+                lines.append(f"  {jt[:200]}")
+        except Exception:
+            pass
+        me = get_macro_events()
+        risk_label = {"high": "高风险", "medium": "注意", "normal": "正常"}.get(me["current_risk"], me["current_risk"])
+        lines.append(f"- 宏观风险评级: {risk_label}")
+        if me.get("next_event"):
+            ne = me["next_event"]
+            lines.append(f"- 即将: {ne['name']} ({me.get('countdown_str', '')})")
+        # 完整事件列表
+        events = me.get("all_events", me.get("recent_events", []))
+        if events:
+            lines.append("- 未来一周宏观事件:")
+            for e in events:
+                tag = e.get("tag", "")
+                forecast = e.get("forecast", "")
+                previous = e.get("previous", "")
+                extra = ""
+                if forecast or previous:
+                    extra = f" 预测:{forecast or 'N/A'} 前值:{previous or 'N/A'}"
+                lines.append(f"  [{tag}] {e['name']} @ {e['time'][:16]}{extra}")
+    except Exception:
+        pass
+    lines.append("")
+    return "\n".join(lines)
+
+
 def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
     """读候选币 → 加载KOL知识 → 调DeepSeek分析 → 写kol_analyses → 返回结果列表"""
     # 加载 KOL 知识（缓存 5 分钟，KOL 文件不会频繁变）
@@ -294,22 +377,24 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
         print("[kol_agent] kol_candidates 无数据")
         return []
 
-    # 拼接 prompt
+    # 拼接 prompt（全景 header + 候选币数据）
     system = build_system_prompt(kol_data)
-    user = build_user_prompt(candidates)
+    panorama = _build_panorama_context()
+    user = panorama + "\n" + build_user_prompt(candidates)
 
     print(f"[kol_agent] 分析 {len(candidates)} 个候选币（{len(kol_data)} 位KOL）")
 
     # 调 API
     import time as _time
     _t0 = _time.time()
-    provider = getattr(config, "KOL_LLM_PROVIDER", "deepseek")
+    ts = storage.trading_settings_get(conn)
+    provider = ts.get("kol_llm_provider", getattr(config, "KOL_LLM_PROVIDER", "deepseek"))
     model = config.NVIDIA_MODEL if provider == "nvidia" else config.DEEPSEEK_MODEL
-    raw = call_deepseek(system, user, max_tokens=32768)
+    raw = call_deepseek(system, user, max_tokens=32768, provider=provider)
     _elapsed = int((_time.time() - _t0) * 1000)
     analyses = _parse_response(raw) if raw else []
 
-    # 写 LLM 调用日志
+    # 写 LLM 调用日志（prompt + response 只存一次，不再按分析行数重复）
     storage.kol_llm_log_insert(conn, {
         "provider": provider,
         "model": model,
@@ -320,7 +405,11 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
         "success": 1 if (raw and analyses) else 0,
         "error": "" if raw else "API调用失败" if not analyses else "解析失败",
         "analyses_count": len(analyses),
+        "system_prompt": system,
+        "user_prompt": user,
+        "raw_response": raw,
     })
+    log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     if not raw:
         return []
@@ -334,9 +423,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
         token = a.get("token", "").upper()
         if not token:
             continue
-        a["raw_response"] = raw
-        a["system_prompt"] = system
-        a["user_prompt"] = user
+        a["llm_log_id"] = log_id
         storage.kol_analysis_insert(conn, a)
         written += 1
 
@@ -358,7 +445,7 @@ def _execute_kol_trades(conn, analyses, candidates):
     from trade_logic import open_paper_position
     candidate_map = {c["token"]: c for c in candidates}
     settings = storage.trading_settings_get(conn)
-    min_conf = getattr(config, "KOL_AGENT_MIN_CONFIDENCE", 70)
+    min_conf = int(settings.get("kol_agent_min_confidence", 70) or 70)
     opened = 0
     for a in analyses:
         direction = a.get("direction", "")

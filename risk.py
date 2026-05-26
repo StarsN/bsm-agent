@@ -57,6 +57,7 @@ class AccountContext:
     open_positions_count: int = 0                  # 当前活跃仓位数（含 PENDING/OPEN/PARTIAL）
     open_positions_by_sector: dict = field(default_factory=dict)  # {sector: count}
     trades_opened_today: int = 0                   # 今日已开仓次数
+    daily_limit_enabled: bool = True               # 日交易次数限制开关
     last_stop_loss_by_token: dict = field(default_factory=dict)   # {token: datetime} 最近一次止损时间
 
 
@@ -453,8 +454,8 @@ def check_account_risk(
                 details={"daily_loss_pct": daily_loss_pct},
             )
 
-    # 2. 日交易次数上限（永不豁免）
-    if account.trades_opened_today >= config.TRADING_MAX_DAILY_TRADES:
+    # 2. 日交易次数上限（永不豁免，开关可控）
+    if account.daily_limit_enabled and account.trades_opened_today >= config.TRADING_MAX_DAILY_TRADES:
         return RiskDecision(
             allowed=False,
             reason=f"日交易次数已达上限 {config.TRADING_MAX_DAILY_TRADES}",

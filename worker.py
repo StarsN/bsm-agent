@@ -22,6 +22,7 @@ from scraper import SquareScraper
 from analyzer import extract_tokens_from_text, compute_short_scores
 from filters import is_likely_human, post_passes_quality
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
+import liquidation
 from signals import analyze as analyze_signals
 
 
@@ -55,6 +56,10 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
     """
     if not tokens_to_check:
         return 0
+    # 确保爆仓流已启动
+    liquidation.start()
+    # 取本轮爆仓聚合数据
+    liq_data = liquidation.get_and_reset()
     try:
         futures_set = get_futures_symbols()
     except Exception as e:
@@ -70,7 +75,14 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
         short_scores = compute_short_scores(conn)
         social_map = {s["token"]: s["score"] for s in short_scores}
 
-    # Step 2：逐个 token 处理，网络请求在事务外，写库用独立小事务
+    # Step 2：批量拉 OKX 衍生数据（一次调用覆盖所有候选币）
+    try:
+        import dashboard
+        okx_extra = dashboard.get_multi_token_okx_metrics(tokens_to_check, heavy=heavy)
+    except Exception:
+        okx_extra = {}
+
+    # Step 3：逐个 token 处理，网络请求在事务外，写库用独立小事务
     for token in tokens_to_check:
         up = token.upper()
         if up not in futures_set:
@@ -84,6 +96,20 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
             continue
         if not snap:
             continue
+
+        # 合并 OKX 衍生数据
+        extra = okx_extra.get(up, {})
+        if extra:
+            for k, v in extra.items():
+                if k not in snap or snap.get(k) is None:
+                    snap[k] = v
+
+        # 合并爆仓数据
+        lq = liq_data.get(up, {})
+        if lq:
+            for k, v in lq.items():
+                if k not in snap:
+                    snap[k] = v
 
         social_score = social_map.get(token, 0.0)
         try:

@@ -11,6 +11,7 @@
 - /fapi/v1/klines               合约 K 线（算短期动量/波动）
 """
 from __future__ import annotations
+import os
 import random
 import time
 from typing import Optional
@@ -25,6 +26,7 @@ FAPI_BASE = "https://fapi.binance.com"
 
 # 简单内存缓存：合约上市列表几小时才变一次，没必要每轮都请求
 _FUTURES_SYMBOLS_CACHE: dict = {"ts": 0.0, "symbols": set()}
+_LISTING_CACHE: dict = {"ts": 0.0, "open_times": {}}  # token → openTime(ms)
 _CACHE_TTL = 3600  # 1 小时
 
 # 请求频率限制：所有 _http_get 调用都走这里，确保不超过 MAX_RPS
@@ -118,7 +120,7 @@ def _http_get(url: str, params: dict = None, timeout: int = 15,
 
 def get_futures_symbols() -> set[str]:
     """返回币安 USDT 永续合约上市的所有 base 币种 set，比如 {'BTC', 'ETH', 'PEPE', ...}"""
-    global _FUTURES_SYMBOLS_CACHE
+    global _FUTURES_SYMBOLS_CACHE, _LISTING_CACHE
     now = time.time()
     if now - _FUTURES_SYMBOLS_CACHE["ts"] < _CACHE_TTL and _FUTURES_SYMBOLS_CACHE["symbols"]:
         return _FUTURES_SYMBOLS_CACHE["symbols"]
@@ -128,19 +130,59 @@ def get_futures_symbols() -> set[str]:
         return _FUTURES_SYMBOLS_CACHE["symbols"]  # 返回上次的缓存
 
     symbols = set()
+    open_times = {}  # token → openTime (Unix ms)
     for s in data.get("symbols", []):
         # 只收 USDT 永续、状态为 TRADING
         if (s.get("contractType") == "PERPETUAL"
                 and s.get("quoteAsset") == "USDT"
                 and s.get("status") == "TRADING"):
-            symbols.add(s.get("baseAsset", "").upper())
+            token = s.get("baseAsset", "").upper()
+            symbols.add(token)
+            ot = s.get("onboardDate")  # 合约接口用 onboardDate，非 openTime
+            if ot:
+                open_times[token] = int(ot)
 
     _FUTURES_SYMBOLS_CACHE = {"ts": now, "symbols": symbols}
+    _LISTING_CACHE = {"ts": now, "open_times": open_times}
     return symbols
 
 
 def has_perpetual(token: str) -> bool:
     return token.upper() in get_futures_symbols()
+
+
+def _load_token_tags() -> dict:
+    """加载 token 类型/链 静态配置"""
+    global _TOKEN_TAGS_CACHE
+    if _TOKEN_TAGS_CACHE is not None:
+        return _TOKEN_TAGS_CACHE
+    import json
+    tag_path = os.path.join(os.path.dirname(__file__), "extra", "token_tags.json")
+    try:
+        with open(tag_path, encoding="utf-8") as f:
+            _TOKEN_TAGS_CACHE = json.load(f)
+    except Exception:
+        _TOKEN_TAGS_CACHE = {}
+    return _TOKEN_TAGS_CACHE
+
+
+_TOKEN_TAGS_CACHE: dict | None = None
+
+
+def get_token_tags(token: str) -> dict:
+    """返回币种的品类和公链 {'sector': 'Layer1', 'chain': 'Ethereum'}"""
+    tags = _load_token_tags()
+    return tags.get(token.upper(), {"sector": None, "chain": None})
+
+
+def get_listing_age_days(token: str) -> float | None:
+    """返回币种在 Binance 上线的天数，从 exchangeInfo.openTime 计算"""
+    get_futures_symbols()  # 确保缓存已填充
+    global _LISTING_CACHE
+    ot = _LISTING_CACHE.get("open_times", {}).get(token.upper())
+    if not ot:
+        return None
+    return (time.time() * 1000 - ot) / (86400 * 1000)
 
 
 def _perp_symbol(token: str) -> str:
@@ -509,5 +551,17 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
         {"symbol": symbol, "limit": config.DEPTH_LIMIT},
     )
     snap.update(_depth_metrics(depth, snap.get("mark_price")))
+
+    # token 类型/链 + 上线天数
+    tags = get_token_tags(token)
+    snap["sector"] = tags.get("sector")
+    snap["chain"] = tags.get("chain")
+    snap["listing_age_days"] = get_listing_age_days(token)
+
+    # vol/OI 比值 — 衡量市场换手率与投机热度
+    snap["vol_oi_ratio"] = (
+        snap["volume_24h_usd"] / snap["oi_usd"]
+        if snap.get("volume_24h_usd") and snap.get("oi_usd") else None
+    )
 
     return snap

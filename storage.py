@@ -367,6 +367,9 @@ CREATE TABLE IF NOT EXISTS kol_llm_logs (
     success         INTEGER DEFAULT 0,
     error           TEXT,
     analyses_count  INTEGER,
+    system_prompt   TEXT,
+    user_prompt     TEXT,
+    raw_response    TEXT,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_kol_llm_logs_created ON kol_llm_logs(created_at);
@@ -494,6 +497,16 @@ def _migrate(conn):
         conn.execute("ALTER TABLE kol_analyses ADD COLUMN system_prompt TEXT")
     if "user_prompt" not in ka_cols:
         conn.execute("ALTER TABLE kol_analyses ADD COLUMN user_prompt TEXT")
+    if "llm_log_id" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN llm_log_id INTEGER")
+    # kol_llm_logs 存 prompt（从 kol_analyses 迁出，减少冗余）
+    kll_cols = [r[1] for r in conn.execute("PRAGMA table_info(kol_llm_logs)").fetchall()]
+    if "system_prompt" not in kll_cols:
+        conn.execute("ALTER TABLE kol_llm_logs ADD COLUMN system_prompt TEXT")
+    if "user_prompt" not in kll_cols:
+        conn.execute("ALTER TABLE kol_llm_logs ADD COLUMN user_prompt TEXT")
+    if "raw_response" not in kll_cols:
+        conn.execute("ALTER TABLE kol_llm_logs ADD COLUMN raw_response TEXT")
     # round_candidates 遗留表，无人读写的弃用数据
     conn.execute("DELETE FROM round_candidates")
     # token_heat_history round_number 索引
@@ -895,11 +908,13 @@ def trading_settings_defaults() -> dict:
         "heat_agent_lessons_trigger_interval": getattr(config, "HEAT_AGENT_LESSONS_TRIGGER_INTERVAL", 3),
         "ai_regime_interval_minutes": getattr(config, "AI_REGIME_INTERVAL_MINUTES", 30),
         "kol_llm_provider": getattr(config, "KOL_LLM_PROVIDER", "deepseek"),
+        "kol_agent_min_confidence": getattr(config, "KOL_AGENT_MIN_CONFIDENCE", 70),
         "agent_trade_enabled": getattr(config, "AGENT_TRADE_ENABLED", True),
         "heat_agent_enabled": getattr(config, "HEAT_AGENT_ENABLED", True),
         "kol_agent_enabled": getattr(config, "KOL_AGENT_ENABLED", True),
         "nl_agent_enabled": getattr(config, "NL_AGENT_ENABLED", True),
         "heat_agent_lessons_enabled": getattr(config, "HEAT_AGENT_LESSONS_ENABLED", True),
+        "trading_daily_limit_enabled": getattr(config, "TRADING_DAILY_LIMIT_ENABLED", True),
     }
 
 
@@ -908,9 +923,9 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
-        elif row["key"] in {"initial_balance", "leverage", "order_amount"}:
+        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence"}:
             try:
                 settings[row["key"]] = float(raw)
             except (TypeError, ValueError):
@@ -918,11 +933,12 @@ def trading_settings_get(conn) -> dict:
         else:
             settings[row["key"]] = raw
     settings["leverage"] = int(settings.get("leverage") or config.TRADING_LEVERAGE)
+    settings["kol_agent_min_confidence"] = int(settings.get("kol_agent_min_confidence") or 70)
     return settings
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -1170,6 +1186,77 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
     }
 
 
+def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None = None) -> dict:
+    """
+    按策略重置：只清该策略的数据，不影响其他策略。
+
+    清理内容：
+      - trade_positions WHERE strategy = ?
+      - trade_signal_locks WHERE strategy = ?
+      - pending_decisions WHERE source = ?
+      - 策略专属候选池表（agent→agent_candidates, nl→nl_candidates, kol→kol_candidates）
+      - KOL 专属表（kol_analyses, kol_llm_logs）
+
+    保留：
+      - lessons / journal / trade_loss_archive
+      - 其他策略的全部数据
+    """
+    source_map = {
+        "agent": "agent_candidates",
+        "heat_agent": "token_heat_history",
+        "heat_agent_lessons": "token_heat_history_lessons",
+        "agent_no_lessons": "nl_candidates",
+        "kol_agent": "kol_agent",
+    }
+
+    # 更新策略初始金额
+    balance_key = f"strategy_initial_{strategy}"
+    if new_initial_balance is not None and new_initial_balance > 0:
+        trading_settings_update(conn, {balance_key: new_initial_balance})
+
+    journal_marked = conn.execute(
+        "UPDATE journal SET reviewed = 1 WHERE order_id IN "
+        "(SELECT id FROM trade_positions WHERE strategy = ?)", (strategy,)
+    ).rowcount or 0
+    lesson_marked = conn.execute(
+        "UPDATE lessons SET learned = 1 WHERE strategy = ?", (strategy,)
+    ).rowcount or 0
+
+    pos_del = conn.execute(
+        "DELETE FROM trade_positions WHERE strategy = ?", (strategy,)
+    ).rowcount or 0
+    lock_del = conn.execute(
+        "DELETE FROM trade_signal_locks WHERE strategy = ?", (strategy,)
+    ).rowcount or 0
+
+    src = source_map.get(strategy, "")
+    dec_del = 0
+    if src:
+        dec_del = conn.execute(
+            "DELETE FROM pending_decisions WHERE source = ?", (src,)
+        ).rowcount or 0
+
+    cand_del = 0
+    if strategy == "agent":
+        cand_del = conn.execute("DELETE FROM agent_candidates").rowcount or 0
+    elif strategy == "agent_no_lessons":
+        cand_del = conn.execute("DELETE FROM nl_candidates").rowcount or 0
+    elif strategy == "kol_agent":
+        cand_del = conn.execute("DELETE FROM kol_candidates").rowcount or 0
+        conn.execute("DELETE FROM kol_analyses")
+        conn.execute("DELETE FROM kol_llm_logs")
+
+    settings = trading_settings_get(conn)
+    return {
+        "strategy": strategy,
+        "positions_deleted": pos_del,
+        "locks_deleted": lock_del,
+        "decisions_deleted": dec_del,
+        "candidates_deleted": cand_del,
+        "settings": settings,
+    }
+
+
 # === Agent 教训库 ===
 
 def lessons_add(conn, lesson: dict):
@@ -1379,9 +1466,8 @@ def kol_analysis_insert(conn, analysis: dict):
     conn.execute(
         """INSERT INTO kol_analyses
             (token, trend, timeline, price_levels, position_analysis,
-             timing, risk_control, direction, confidence, reason, raw_response,
-             system_prompt, user_prompt)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             timing, risk_control, direction, confidence, reason, llm_log_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (
             analysis["token"], analysis.get("trend"),
             _json.dumps(analysis.get("timeline"), ensure_ascii=False),
@@ -1390,9 +1476,8 @@ def kol_analysis_insert(conn, analysis: dict):
             analysis.get("timing"),
             _json.dumps(analysis.get("risk_control"), ensure_ascii=False),
             analysis.get("direction"), analysis.get("confidence"),
-            analysis.get("reason"), analysis.get("raw_response"),
-            analysis.get("system_prompt"),
-            analysis.get("user_prompt"),
+            analysis.get("reason"),
+            analysis.get("llm_log_id"),
         ),
     )
 
@@ -1422,17 +1507,21 @@ def kol_llm_log_insert(conn, log: dict):
     conn.execute(
         """INSERT INTO kol_llm_logs
             (provider, model, candidate_count, prompt_chars, response_chars,
-             duration_ms, success, error, analyses_count)
-        VALUES (?,?,?,?,?,?,?,?,?)""",
+             duration_ms, success, error, analyses_count,
+             system_prompt, user_prompt, raw_response)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (log.get("provider"), log.get("model"), log.get("candidate_count"),
          log.get("prompt_chars"), log.get("response_chars"), log.get("duration_ms"),
-         log.get("success", 0), log.get("error"), log.get("analyses_count", 0)),
+         log.get("success", 0), log.get("error"), log.get("analyses_count", 0),
+         log.get("system_prompt"), log.get("user_prompt"), log.get("raw_response")),
     )
 
 
 def kol_llm_logs_recent(conn, limit: int = 30):
     rows = conn.execute(
-        "SELECT * FROM kol_llm_logs ORDER BY id DESC LIMIT ?", (limit,)
+        "SELECT id, provider, model, candidate_count, prompt_chars, response_chars, "
+        "duration_ms, success, error, analyses_count, created_at "
+        "FROM kol_llm_logs ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     return [dict(r) for r in rows]
 

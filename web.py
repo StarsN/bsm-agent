@@ -118,6 +118,26 @@ def _build_data_blob(candidate: dict) -> dict:
     }
 
 
+def _build_kol_data_blob(candidate: dict) -> dict:
+    """KOL Agent 专用 — 通用 blob + 全景字段"""
+    blob = _build_data_blob(candidate)
+    snap = candidate["market"]["snapshot"]
+    blob.update({
+        "vol_oi": snap.get("vol_oi_ratio"),
+        "listing_days": snap.get("listing_age_days"),
+        "sector": snap.get("sector"),
+        "chain": snap.get("chain"),
+        "basis": snap.get("basis_pct"),
+        "okx_funding": snap.get("okx_funding_pct"),
+        "funding_hist": snap.get("funding_history"),
+        "liq_long_usd": snap.get("liq_long_usd"),
+        "liq_short_usd": snap.get("liq_short_usd"),
+        "liq_long_cnt": snap.get("liq_long_count"),
+        "liq_short_cnt": snap.get("liq_short_count"),
+    })
+    return blob
+
+
 def _scan_candidates():
     with storage.get_conn() as conn:
         items, skipped = _build_leaderboard_items(conn)
@@ -223,11 +243,11 @@ def _collect_loop():
                     "pass_count": c.get("pass_count", 0),
                     "signal_key": c.get("signal_key", ""),
                 }
-                # KOL Agent：独立累积（开关关闭时跳过，passed 的才收，用 _build_data_blob 展平）
+                # KOL Agent：独立累积（开关关闭时跳过，passed 的才收，用 _build_kol_data_blob 展平含全景字段）
                 if ts_settings.get("kol_agent_enabled", True) and c.get("passed"):
                     _kol_collected[c["token"]] = {
                         "token": c["token"],
-                        "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
+                        "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
                         "tier": c.get("tier", ""),
                         "passed": 1,
                         "hard_blocks": json.dumps(c.get("hard_block", [])),
@@ -383,11 +403,19 @@ class TradingSettingsBody(BaseModel):
     kol_agent_enabled: bool | None = None
     nl_agent_enabled: bool | None = None
     heat_agent_lessons_enabled: bool | None = None
+    trading_daily_limit_enabled: bool | None = None
+    kol_agent_min_confidence: int | None = None
 
 
 class TradingResetBody(BaseModel):
     confirm: bool = False                    # 必须为 True 才执行，防误触
     new_initial_balance: float | None = None  # 可选：顺便改初始金额
+
+
+class TradingResetStrategyBody(BaseModel):
+    strategy: str
+    confirm: bool = False
+    new_initial_balance: float | None = None
 
 
 def _load_snapshot(conn, token: str) -> dict | None:
@@ -779,7 +807,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -814,6 +842,22 @@ def api_trading_reset(body: TradingResetBody):
     with storage.get_conn() as conn:
         result = storage.trade_reset_all(conn, body.new_initial_balance)
     _cache_invalidate()  # 全清，立即看到空状态
+    return {"ok": True, **result}
+
+
+@app.post("/api/trading/reset-strategy")
+def api_trading_reset_strategy(body: TradingResetStrategyBody):
+    """按策略重置交易数据"""
+    if not body.confirm:
+        raise HTTPException(400, "需要 confirm=true 以确认重置")
+    strategy = body.strategy.strip().lower()
+    valid = {"agent", "heat_agent", "heat_agent_lessons", "agent_no_lessons",
+             "kol_agent", "system", "manual"}
+    if strategy not in valid:
+        raise HTTPException(400, f"无效策略: {body.strategy}")
+    with storage.get_conn() as conn:
+        result = storage.trade_reset_strategy(conn, strategy, body.new_initial_balance)
+    _cache_invalidate()
     return {"ok": True, **result}
 
 
@@ -1021,6 +1065,13 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
             (limit, offset)
         ).fetchall()
 
+        # 哪些 token 已有 journal open 记录（用于避免时间线重复显示 consumed）
+        j_open_tokens = {r["token"] for r in conn.execute(
+            f"SELECT DISTINCT j.token FROM journal j "
+            f"JOIN trade_positions tp ON j.order_id = tp.id "
+            f"WHERE tp.strategy = '{strategy}' AND j.action = 'open'"
+        ).fetchall()}
+
     timeline = []
     for r in journal_rows:
         r = dict(r)
@@ -1028,8 +1079,8 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
         timeline.append(r)
     for r in decision_rows:
         r = dict(r)
-        # consumed 的决策已反映在 journal 里，跳过避免重复
-        if r.get("status") == "consumed":
+        # consumed 且已有 journal open → 跳过；无 journal open 的旧数据 → 保留
+        if r.get("status") == "consumed" and r["token"] in j_open_tokens:
             continue
         r["source"] = "decision"
         timeline.append(r)
@@ -1728,6 +1779,13 @@ function renderDeepAnalysis(items) {
           <div class="metric"><div class="label">多空比(散户)</div><div class="value">${s.long_short_ratio ? s.long_short_ratio.toFixed(2) : '-'}</div></div>
           <div class="metric"><div class="label">多空比(大户)</div><div class="value">${s.top_trader_ls_ratio ? s.top_trader_ls_ratio.toFixed(2) : '-'}</div></div>
           <div class="metric"><div class="label">24h 成交额</div><div class="value">${fmtUsd(s.volume_24h_usd)}</div></div>
+          <div class="metric"><div class="label">vol/OI 比值</div><div class="value">${s.vol_oi_ratio ? s.vol_oi_ratio.toFixed(2) : '-'}</div></div>
+          <div class="metric"><div class="label">上线天数</div><div class="value">${s.listing_age_days ? Math.round(s.listing_age_days) + 'd' : '-'}</div></div>
+          <div class="metric"><div class="label">品类/链</div><div class="value" style="font-size:11px">${s.sector||'-'} / ${s.chain||'-'}</div></div>
+          <div class="metric"><div class="label">Basis 基差</div><div class="value">${fmtPct2(s.basis_pct)}</div></div>
+          <div class="metric"><div class="label">OKX 费率</div><div class="value">${fmtFR2(s.okx_funding_pct)}</div></div>
+          <div class="metric"><div class="label">爆仓(多/空)</div><div class="value" style="font-size:11px">${(s.liq_long_usd||s.liq_short_usd) ? fmtUsd((s.liq_long_usd||0)+(s.liq_short_usd||0)) : '-'}<br><span style="color:var(--green)">${s.liq_long_count ? s.liq_long_count+'笔' : ''}</span> / <span style="color:var(--red)">${s.liq_short_count ? s.liq_short_count+'笔' : ''}</span></div></div>
+          <div class="metric"><div class="label">OKX 费率趋势</div><div class="value" style="font-size:11px">${(()=>{const h=s.funding_history;if(!h||!h.length)return'-';return h.slice(-4).map(x=>(x.r>0?'+':'')+x.r.toFixed(4)+'%').join(' → ')})()}</div></div>
         </div>
         ${a.oi_divergence ? `
           <div class="divergence-banner ${a.oi_divergence.type}">
@@ -2289,6 +2347,7 @@ h1 { font-size: 20px; color: var(--accent); margin: 0 0 4px; }
 h2 { font-size: 14px; color: var(--accent); margin: 0 0 10px; }
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .header-time { color: var(--muted); font-size: 12px; }
+.subtitle { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .nav-bar-agent {
   display: flex; justify-content: center; gap: 0; margin-bottom: 16px;
   border-bottom: 1px solid var(--border); padding-bottom: 0;
@@ -2412,6 +2471,7 @@ tr:hover { background: #1f2536; }
   <div>
     <h1>Agent-合约扫描</h1>
     <span class="header-time" id="clock"></span>
+    <div class="subtitle">合约扫描 · 自主决策开仓</div>
   </div>
 </div>
 </div>
@@ -2951,7 +3011,11 @@ h1 { font-size: 20px; margin-bottom: 20px; }
 h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
 label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px; }
-input, select { width: 100%; box-sizing: border-box; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 14px; height: 40px; margin-bottom: 14px; }
+input, select { width: 100%; box-sizing: border-box; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 14px; height: 40px; margin-bottom: 14px; vertical-align: middle; }
+select { -webkit-appearance: none; appearance: none; background-image: url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%238b949e' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m2 5 6 6 6-6'/%3e%3c/svg%3e\"); background-repeat: no-repeat; background-position: right 8px center; background-size: 16px 12px; padding-right: 30px; }
+input[type=\"number\"] { -moz-appearance: textfield; }
+input[type=\"number\"]::-webkit-outer-spin-button,
+input[type=\"number\"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
@@ -2995,7 +3059,6 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
     <a href="/agent-kol">Agent-KOL 监控</a>
-    <a href="/kol">Agent-KOL 分析</a>
   </div>
 </div>
   <a href="/dashboard">📊 市场全景</a>
@@ -3110,6 +3173,23 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 </div>
 
 <div class="panel">
+  <h2>风控参数</h2>
+  <div class="grid2">
+    <div>
+      <label>KOL Agent 最低信心分</label>
+      <input id="trade-kol-min-conf" type="number" min="50" max="95" step="5">
+    </div>
+    <div>
+      <label>日交易次数限制（每策略15次）</label>
+      <select id="trade-daily-limit-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
   <h2>Agent 参数</h2>
   <div class="grid2">
     <div>
@@ -3152,14 +3232,35 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 
 <div class="panel" style="margin-top:16px">
   <h2>操作</h2>
+  <div class="grid2">
+    <div>
+      <label>策略重置</label>
+      <select id="trade-reset-strategy">
+        <option value="agent">Agent-合约扫描</option>
+        <option value="heat_agent">Agent-热度榜单</option>
+        <option value="heat_agent_lessons">Agent-热度有教训</option>
+        <option value="agent_no_lessons">Agent-无教训</option>
+        <option value="kol_agent">Agent-KOL</option>
+        <option value="system">系统自动</option>
+        <option value="manual">手动</option>
+      </select>
+    </div>
+    <div>
+      <label>重置后初始金额（留空不修改）</label>
+      <input id="trade-reset-balance" type="number" min="1" placeholder="留空不修改">
+    </div>
+  </div>
   <div class="btn-row">
-    <button class="btn btn-danger" onclick="resetTradingAccount()">重置账户</button>
+    <button class="btn btn-danger" onclick="resetStrategyAccount()">重置该策略</button>
+    <button class="btn btn-danger" onclick="resetTradingAccount()">重置全部账户</button>
+  </div>
+  <div class="btn-row" style="margin-top:8px">
     <button class="btn btn-warn" onclick="restartSystem()">重启系统</button>
   </div>
   <div style="color:var(--muted);font-size:11px;margin-top:12px;text-align:center;line-height:1.5">
-    重置账户：清空持仓、决策、候选池，保留教训和日志<br>
-    重启系统：强制终止所有进程，等 3 分钟后自动重启<br>
-    切换数据源后需点击重启生效
+    策略重置：只清该策略的持仓/决策/候选池，保留教训和日志<br>
+    全部重置：清除所有策略数据<br>
+    重启系统：强制终止所有进程，等 3 分钟后自动重启
   </div>
 </div>
 
@@ -3193,6 +3294,8 @@ async function loadSettings() {
     document.getElementById('trade-kol-switch').value = s.kol_agent_enabled ?? true;
     document.getElementById('trade-nl-switch').value = s.nl_agent_enabled ?? true;
     document.getElementById('trade-heat-lessons-switch').value = s.heat_agent_lessons_enabled ?? true;
+    document.getElementById('trade-kol-min-conf').value = s.kol_agent_min_confidence ?? 70;
+    document.getElementById('trade-daily-limit-switch').value = s.trading_daily_limit_enabled ?? true;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
@@ -3220,18 +3323,45 @@ async function saveTradingSettings() {
     kol_agent_interval_minutes: Number(document.getElementById('trade-kol-interval').value),
     nl_agent_interval_minutes: Number(document.getElementById('trade-nl-interval').value),
     heat_agent_lessons_trigger_interval: Number(document.getElementById('trade-heat-lessons-interval').value),
+    ai_regime_interval_minutes: Number(document.getElementById('trade-ai-regime-interval').value),
     kol_llm_provider: document.getElementById('trade-kol-provider').value,
     agent_trade_enabled: document.getElementById('trade-agent-switch').value === 'true',
     heat_agent_enabled: document.getElementById('trade-heat-switch').value === 'true',
     kol_agent_enabled: document.getElementById('trade-kol-switch').value === 'true',
     nl_agent_enabled: document.getElementById('trade-nl-switch').value === 'true',
     heat_agent_lessons_enabled: document.getElementById('trade-heat-lessons-switch').value === 'true',
+    kol_agent_min_confidence: parseInt(document.getElementById('trade-kol-min-conf').value) || 70,
+    trading_daily_limit_enabled: document.getElementById('trade-daily-limit-switch').value === 'true',
   };
   try {
     const resp = await fetch('/api/trading/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     if (!resp.ok) { const err = await resp.text(); throw new Error(err); }
     showToast('设置已保存', 'ok');
   } catch(e) { showToast('保存失败：'+e.message, 'err'); }
+}
+async function resetStrategyAccount() {
+  const sel = document.getElementById('trade-reset-strategy');
+  const strategy = sel.value;
+  const name = sel.options[sel.selectedIndex].text;
+  if (!confirm('确定要重置「' + name + '」吗？\\n\\n将清空该策略的持仓、决策、候选池，保留教训和日志。\\n\\n此操作不可撤销！')) return;
+  const balInput = document.getElementById('trade-reset-balance');
+  const bal = balInput.value ? parseFloat(balInput.value) : null;
+  if (bal !== null && (isNaN(bal) || bal <= 0)) { showToast('金额必须为正数', 'err'); return; }
+  try {
+    const resp = await fetch('/api/trading/reset-strategy', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({strategy: strategy, confirm: true, new_initial_balance: bal}),
+    });
+    if (!resp.ok) { const err = await resp.text(); throw new Error(err); }
+    const data = await resp.json();
+    showToast(
+      '「' + name + '」已重置：清除 ' + data.positions_deleted + ' 条持仓 / ' +
+      data.locks_deleted + ' 条锁 / ' + data.decisions_deleted + ' 条决策 / ' +
+      data.candidates_deleted + ' 条候选',
+      'ok', 3000
+    );
+    loadSettings();
+  } catch(e) { showToast('重置失败：'+e.message, 'err'); }
 }
 async function resetTradingAccount() {
   if (!confirm('确定要重置账户吗？\\n\\n将清空所有持仓和历史记录，保留教训和操作日志。')) return;
@@ -3334,6 +3464,16 @@ def api_macro_events():
 @app.get("/api/ai-regime")
 def api_ai_regime():
     import dashboard
+    alpha = dashboard.get_alpha_breadth()
+    return dashboard.get_ai_regime(alpha)
+
+
+@app.post("/api/ai-regime/refresh")
+def api_ai_regime_refresh():
+    """强制刷新 AI 研判 — 清缓存立即触发后台 LLM"""
+    import dashboard
+    dashboard._ai_cache = {"ts": 0, "data": {}}
+    dashboard._ai_loading = False
     alpha = dashboard.get_alpha_breadth()
     return dashboard.get_ai_regime(alpha)
 
@@ -3738,10 +3878,11 @@ KOL_MONITOR_HTML = AGENT_HTML.replace(
 ).replace(
     "<h1>Agent-合约扫描</h1>", "<h1>Agent-KOL 监控</h1>"
 ).replace(
-    "合约扫描 · 自主决策开仓", "合约扫描 · 决策时间线 · LLM日志 · <a href=\"/kol\" style=\"color:var(--accent);text-decoration:none\">📊 查看K线分析 →</a>"
+    "合约扫描 · 自主决策开仓", "合约扫描 · 决策时间线 · LLM日志 · <a href='/kol' style='color:var(--accent);text-decoration:none'>📊 查看K线分析 →</a>"
 ).replace(
     "strategy_initial_agent", "strategy_initial_kol_agent"
 ).replace(
+    "loadLessons(true), ", "").replace(
     "  loadLessons(true);\n", ""
 ).replace(
     "p.strategy === 'agent'", "p.strategy === 'kol_agent'"
@@ -3866,7 +4007,7 @@ h1{font-size:18px;margin-bottom:2px}h2{font-size:14px;color:var(--accent);margin
 .main-grid{display:grid;grid-template-columns:1fr;gap:12px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
 .card-title{font-size:13px;color:var(--muted);margin-bottom:2px}
-.metrics-row{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:10px}
+.metrics-row{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px}
 .mini-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px;text-align:center}
 .mini-card .label{font-size:10px;color:var(--muted);margin-bottom:4px}
 .mini-card .value{font-size:22px;font-weight:700}
@@ -3898,6 +4039,7 @@ h1{font-size:18px;margin-bottom:2px}h2{font-size:14px;color:var(--accent);margin
 .legend{display:flex;gap:12px;font-size:10px;color:var(--muted)}
 .legend span{display:flex;align-items:center;gap:4px}
 .legend-dot{width:10px;height:10px;border-radius:2px;display:inline-block}
+button:disabled{opacity:.5;cursor:not-allowed}
 .refresh-info{font-size:11px;color:var(--muted)}
 .empty{text-align:center;color:var(--muted);padding:20px}
 @media(max-width:768px){.metrics-row{grid-template-columns:repeat(3,1fr)}.macro-4col{grid-template-columns:1fr 1fr}.events-grid{grid-template-columns:1fr}}
@@ -3909,16 +4051,15 @@ h1{font-size:18px;margin-bottom:2px}h2{font-size:14px;color:var(--accent);margin
   <a href="/strategies">📈 运行策略</a>
   <div class="nav-dropdown"><a href="#">🤖 Agent 面板 ▾</a>
     <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
+      <a href="/agent">Agent-合约搜索</a>
       <a href="/heat-agent">Agent-热度榜单</a>
       <a href="/agent-heat-lessons">Agent-热度有教训</a>
       <a href="/agent-nl">Agent-无教训</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
-      <a href="/kol">Agent-KOL 分析</a>
     </div>
   </div>
-  <a href="/settings">⚙ 系统设置</a>
   <a href="/dashboard" class="active">📊 市场全景</a>
+  <a href="/settings">⚙ 系统设置</a>
 </div>
 
 <div class="header-row">
@@ -3943,7 +4084,7 @@ h1{font-size:18px;margin-bottom:2px}h2{font-size:14px;color:var(--accent);margin
 
   <div class="card">
     <div class="header-row">
-      <div><h2 style="display:inline">V3 AI Regime</h2> <span id="regime-tag" style="font-size:12px;margin-left:8px"></span> <span id="model-tag" style="font-size:10px;color:var(--muted)"></span></div>
+      <div><h2 style="display:inline">V3 AI Regime</h2> <span id="regime-tag" style="font-size:12px;margin-left:8px"></span> <span id="model-tag" style="font-size:10px;color:var(--muted)"></span> <button onclick="refreshAI(event)" style="background:var(--accent);color:#000;border:none;border-radius:4px;padding:3px 10px;font-size:11px;cursor:pointer;margin-left:6px">⟳ 刷新</button></div>
       <span class="refresh-info" id="ai-updated">更新中...</span>
     </div>
     <div id="judgment" style="font-size:13px;line-height:1.6;margin:10px 0;padding:10px;background:var(--bg);border-radius:6px">加载中...</div>
@@ -3966,59 +4107,71 @@ h1{font-size:18px;margin-bottom:2px}h2{font-size:14px;color:var(--accent);margin
 <script>
 const R={"alt_season":"#3fb950","alt_pullback":"#d29922","chop":"#8b949e","risk_off":"#f85149","crash":"#6e7681"};
 const RN={"alt_season":"山寨行情","alt_pullback":"回调兑现","chop":"震荡死水","risk_off":"趋势空","crash":"崩盘"};
-const MLAB={"liquidity":"流动性状态","z_depth":"当前 z_depth","macro_1h":"1h 大局","macro_3h":"3h 大局","data_age":"数据年龄"};
+const MLAB={"liquidity":"流动性状态","z_depth":"当前 z_depth","macro_1h":"1h 大局","macro_3h":"3h 大局","data_age":"数据年龄","fear_greed":"恐惧贪婪"};
+async function refreshAI(e){
+  const btn=e.target;btn.disabled=true;btn.textContent='⟳ 刷新中...';
+  try{
+    const[rm,me,ai]=await Promise.all([fetch("/api/risk-metrics"),fetch("/api/macro-events"),fetch("/api/ai-regime/refresh",{method:'POST'})]);
+    const r=await rm.json(),m=await me.json(),a=await ai.json();
+    updateDashboard(r,m,a);
+  }catch(e){console.error(e)}
+  btn.disabled=false;btn.textContent='⟳ 刷新';
+}
+function updateDashboard(r,m,a){
+  const hasWarning=r.global_status==="warning"||m.current_risk==="high"||m.current_risk==="medium";
+  document.getElementById("status-badge").innerHTML=hasWarning?'<span class="status-badge status-warning">⚠ 有警告</span>':'<span class="status-badge status-normal">✓ 正常</span>';
+  const mt=r.metrics||{};let mh="";
+  for(const[k,v]of Object.entries(mt)){
+    const c=v.color||"var(--text)";
+    mh+=`<div class="mini-card"><div class="label">${MLAB[k]||k}</div><div class="value" style="color:${c}">${v.value??v.status}</div><div class="desc">${v.desc||""}</div></div>`;
+  }
+  document.getElementById("metrics").innerHTML=mh;
+  document.getElementById("macro-status").textContent=m.current_risk==="high"?"⚠ 高风险":m.current_risk==="medium"?"● 注意":"✓ 正常";
+  document.getElementById("macro-status").className="status-badge "+(m.current_risk==="high"?"status-warning":"status-normal");
+  if(m.next_event){
+    document.getElementById("macro-next").innerHTML=
+      `<div class="macro-col"><div class="m-label">当前宏观风险</div><div class="m-value" style="color:${m.current_risk==="high"?"var(--red)":"var(--green)"}">${m.current_risk==="high"?"高风险":m.current_risk==="medium"?"注意":"正常"}</div></div>`+
+      `<div class="macro-col"><div class="m-label">下个事件</div><div class="m-value">${m.next_event.name||""}</div><div style="font-size:10px;color:var(--muted)">${(m.next_event.time||"").substring(0,16)}</div></div>`+
+      `<div class="macro-col"><div class="m-label">倒计时</div><div class="m-value" style="color:var(--yellow)">${m.countdown_str||"即将"}</div><div style="font-size:10px;color:var(--muted)">预测:${m.next_event.forecast||"N/A"} 前值:${m.next_event.previous||"N/A"}</div></div>`+
+      `<div class="macro-col"><div class="m-label">面板动作</div><div class="m-value" style="color:var(--accent)">仅提示</div></div>`;
+  }else{
+    document.getElementById("macro-next").innerHTML=`<div class="macro-col" style="grid-column:1/-1;text-align:center;color:var(--muted)">暂无未来宏观事件</div>`;
+  }
+  const evts=m.recent_events||[];let eh="";
+  for(const e of evts){
+    const tag=e.tag==="核心"?"tag-core":"tag-observe";
+    eh+=`<div class="event-item"><div class="event-name">${e.name}${e.tag?`<span class="event-tag ${tag}">${e.tag}</span>`:""}</div><div class="event-meta">${(e.time||"").substring(0,16)} · ${e.region||""}</div></div>`;
+  }
+  document.getElementById("recent-events").innerHTML=eh||"<div class='empty'>暂无宏观事件</div>";
+  let anomalyHtml="";
+  const liq=r.metrics?.liquidity;
+  if(liq&&liq.color!=="green"){
+    anomalyHtml+=`<div class="anomaly-bar"><div class="a-title">⚠ 流动性警戒</div><div class="a-desc">${liq.status}: ${liq.desc}</div><div class="a-tag">rolling_liquidity</div></div>`;
+  }
+  if(r.global_status==="warning"&&m.current_risk==="high"){
+    anomalyHtml+=`<div class="anomaly-bar"><div class="a-title">⚠ 宏观风险 + 流动性双重警戒</div><div class="a-desc">当前宏观风险评级为高，同时流动性出现异常</div><div class="a-tag">macro_risk + liquidity</div></div>`;
+  }
+  document.getElementById("anomaly").innerHTML=anomalyHtml;
+  const tag=a.current_regime||"";
+  document.getElementById("regime-tag").innerHTML=`<span style="color:${R[tag]||'var(--muted)'}">●</span> ${RN[tag]||tag} <span style="color:var(--muted);font-size:11px">conf ${a.confidence||0}</span>`;
+  document.getElementById("model-tag").textContent=a.model||"deepseek";
+  document.getElementById("ai-updated").textContent=`每${a.refresh_interval_min||32}分钟 · ${a.updated_at||""}`;
+  document.getElementById("judgment").innerHTML=(a.judgment_text||"AI研判加载中...").replace(/\\n/g,"<br>");
+  let sl="";for(const s of(a.evidence_support||[]))sl+=`<li>${s}</li>`;
+  document.getElementById("evidence-support").innerHTML=`<ul>${sl}</ul>`;
+  document.getElementById("evidence-counter").innerHTML=`<p>${a.evidence_counter||"暂无反面证据"}</p>`;
+  let pl="";for(const s of(a.data_sources||[]))pl+=`<span class="pill">${s}</span>`;
+  document.getElementById("data-sources").innerHTML=pl;
+  const tl=a.timeline_24h||[];
+  let th="";for(const t of tl)th+=`<span class="timeline-block" style="background:${R[t]||"#30363d"}" title="${RN[t]||t}"></span>`;
+  for(let i=tl.length;i<24;i++)th+=`<span class="timeline-block" style="background:#1a1f2e" title="无数据"></span>`;
+  document.getElementById("timeline-bar").innerHTML=th;
+}
 async function loadAll(){
   try{
     const[rm,me,ai]=await Promise.all([fetch("/api/risk-metrics"),fetch("/api/macro-events"),fetch("/api/ai-regime")]);
     const r=await rm.json(),m=await me.json(),a=await ai.json();
-    const hasWarning=r.global_status==="warning"||m.current_risk==="high"||m.current_risk==="medium";
-    document.getElementById("status-badge").innerHTML=hasWarning?'<span class="status-badge status-warning">⚠ 有警告</span>':'<span class="status-badge status-normal">✓ 正常</span>';
-    const mt=r.metrics||{};let mh="";
-    for(const[k,v]of Object.entries(mt)){
-      const c=v.color||"var(--text)";
-      mh+=`<div class="mini-card"><div class="label">${MLAB[k]||k}</div><div class="value" style="color:${c}">${v.value??v.status}</div><div class="desc">${v.desc||""}</div></div>`;
-    }
-    document.getElementById("metrics").innerHTML=mh;
-    document.getElementById("macro-status").textContent=m.current_risk==="high"?"⚠ 高风险":m.current_risk==="medium"?"● 注意":"✓ 正常";
-    document.getElementById("macro-status").className="status-badge "+(m.current_risk==="high"?"status-warning":"status-normal");
-    if(m.next_event){
-      document.getElementById("macro-next").innerHTML=
-        `<div class="macro-col"><div class="m-label">当前宏观风险</div><div class="m-value" style="color:${m.current_risk==="high"?"var(--red)":"var(--green)"}">${m.current_risk==="high"?"高风险":m.current_risk==="medium"?"注意":"正常"}</div></div>`+
-        `<div class="macro-col"><div class="m-label">下个事件</div><div class="m-value">${m.next_event.name||""}</div><div style="font-size:10px;color:var(--muted)">${(m.next_event.time||"").substring(0,16)}</div></div>`+
-        `<div class="macro-col"><div class="m-label">倒计时</div><div class="m-value" style="color:var(--yellow)">${m.countdown_str||"即将"}</div><div style="font-size:10px;color:var(--muted)">预测:${m.next_event.forecast||"N/A"} 前值:${m.next_event.previous||"N/A"}</div></div>`+
-        `<div class="macro-col"><div class="m-label">面板动作</div><div class="m-value" style="color:var(--accent)">仅提示</div></div>`;
-    }else{
-      document.getElementById("macro-next").innerHTML=`<div class="macro-col" style="grid-column:1/-1;text-align:center;color:var(--muted)">暂无未来宏观事件</div>`;
-    }
-    const evts=m.recent_events||[];let eh="";
-    for(const e of evts){
-      const tag=e.tag==="核心"?"tag-core":"tag-observe";
-      eh+=`<div class="event-item"><div class="event-name">${e.name}${e.tag?`<span class="event-tag ${tag}">${e.tag}</span>`:""}</div><div class="event-meta">${(e.time||"").substring(0,16)} · ${e.region||""}</div></div>`;
-    }
-    document.getElementById("recent-events").innerHTML=eh||"<div class='empty'>暂无宏观事件</div>";
-    let anomalyHtml="";
-    const liq=r.metrics?.liquidity;
-    if(liq&&liq.color!=="green"){
-      anomalyHtml+=`<div class="anomaly-bar"><div class="a-title">⚠ 流动性警戒</div><div class="a-desc">${liq.status}: ${liq.desc}</div><div class="a-tag">rolling_liquidity</div></div>`;
-    }
-    if(r.global_status==="warning"&&m.current_risk==="high"){
-      anomalyHtml+=`<div class="anomaly-bar"><div class="a-title">⚠ 宏观风险 + 流动性双重警戒</div><div class="a-desc">当前宏观风险评级为高，同时流动性出现异常</div><div class="a-tag">macro_risk + liquidity</div></div>`;
-    }
-    document.getElementById("anomaly").innerHTML=anomalyHtml;
-    const tag=a.current_regime||"";
-    document.getElementById("regime-tag").innerHTML=`<span style="color:${R[tag]||'var(--muted)'}">●</span> ${RN[tag]||tag} <span style="color:var(--muted);font-size:11px">conf ${a.confidence||0}</span>`;
-    document.getElementById("model-tag").textContent=a.model||"deepseek";
-    document.getElementById("ai-updated").textContent=`每${a.refresh_interval_min||32}分钟 · ${a.updated_at||""}`;
-    document.getElementById("judgment").innerHTML=(a.judgment_text||"AI研判加载中...").replace(/\\n/g,"<br>");
-    let sl="";for(const s of(a.evidence_support||[]))sl+=`<li>${s}</li>`;
-    document.getElementById("evidence-support").innerHTML=`<ul>${sl}</ul>`;
-    document.getElementById("evidence-counter").innerHTML=`<p>${a.evidence_counter||"暂无反面证据"}</p>`;
-    let pl="";for(const s of(a.data_sources||[]))pl+=`<span class="pill">${s}</span>`;
-    document.getElementById("data-sources").innerHTML=pl;
-    const tl=a.timeline_24h||[];
-    let th="";for(const t of tl)th+=`<span class="timeline-block" style="background:${R[t]||"#30363d"}" title="${RN[t]||t}"></span>`;
-    for(let i=tl.length;i<24;i++)th+=`<span class="timeline-block" style="background:#1a1f2e" title="无数据"></span>`;
-    document.getElementById("timeline-bar").innerHTML=th;
+    updateDashboard(r,m,a);
   }catch(e){console.error(e);document.getElementById("judgment").innerHTML='<span style="color:var(--red)">数据加载失败，15s后重试...</span>';document.getElementById("status-badge").innerHTML='<span class="status-badge status-warning">⚠ 数据异常</span>'}
 }
 loadAll();setInterval(loadAll,15000);
