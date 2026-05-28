@@ -362,7 +362,7 @@ def _build_account_context(conn, strategy: str = None) -> risk.AccountContext:
     if strategy:
         summary = strategy_account_summary(conn, strategy)
         open_positions = [dict(r) for r in conn.execute(
-            "SELECT * FROM trade_positions WHERE status IN ('OPEN','PARTIAL') AND strategy=?",
+            "SELECT * FROM trade_positions WHERE status IN ('PENDING','OPEN','PARTIAL') AND strategy=?",
             (strategy,)
         )]
         # 单策略今日数据
@@ -419,8 +419,12 @@ def _build_account_context(conn, strategy: str = None) -> risk.AccountContext:
     )
 
 
+_last_reject_reason: dict = {}
+
+
 def _debug_reject(token: str, reason: str, candidate: dict = None):
-    """TRADING_DEBUG 为 True 时打印开仓拒绝原因到 stderr，便于诊断"""
+    """存原因 + TRADING_DEBUG 时打印到 stderr"""
+    _last_reject_reason[token.upper()] = reason
     if not getattr(config, "TRADING_DEBUG", False):
         return
     import sys
@@ -754,6 +758,10 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
                 "advice": "取消收藏触发：未成交挂单已取消",
                 "closed_at": "__CURRENT_TIMESTAMP__",
             })
+            storage.trade_signal_lock_release(conn, token, pos["strategy"])
+            pd_id = pos.get("pending_decision_id")
+            if pd_id:
+                conn.execute("UPDATE pending_decisions SET status = 'expired' WHERE id = ?", (pd_id,))
             canceled += 1
             continue
 
@@ -862,10 +870,71 @@ def _archive_stop_loss(conn, pos: dict, exit_price: float, realized: float,
     })
 
 
+def open_limit_position(
+    conn, token: str, side: str, limit_price: float,
+    margin_amount: float = 50.0, tier: str = "half",
+    strategy: str = "manual", pending_decision_id: int = None,
+) -> dict:
+    """
+    创建挂单 PENDING。止损在触发时补算。
+    pending_decision_id 可选，关联 pending_decisions 记录（KOL 时间线用）。
+    返回 {"ok": True/False, "reason": "...", "position_id": int}
+    """
+    import storage as _st
+    token = token.upper()
+    if side not in ("LONG", "SHORT"):
+        return {"ok": False, "reason": "方向无效"}
+    if side == "SHORT" and not getattr(config, "SHORT_SELLING_ENABLED", False):
+        return {"ok": False, "reason": "做空功能未启用"}
+    if _st.trade_has_active(conn, token, strategy):
+        return {"ok": False, "reason": f"{token} 已有持仓或挂单"}
+    if not limit_price or limit_price <= 0:
+        return {"ok": False, "reason": "限价无效"}
+
+    settings = _st.trading_settings_get(conn)
+    leverage = float(settings.get("leverage") or config.TRADING_LEVERAGE)
+    notional = margin_amount * leverage
+    quantity = notional / limit_price
+
+    if notional < config.TRADING_MIN_NOTIONAL:
+        return {"ok": False, "reason": f"名义价值${notional:.0f} < 最小 ${config.TRADING_MIN_NOTIONAL}"}
+
+    signal_key = _st.leaderboard_signal_key(conn)
+    if not _st.trade_signal_lock_acquire(conn, token, signal_key, strategy):
+        return {"ok": False, "reason": f"{token} signal_lock 已占用"}
+
+    symbol = f"{token}USDT"
+    position = {
+        "token": token, "symbol": symbol, "side": side,
+        "status": "PENDING", "mode": settings.get("mode") or "paper",
+        "margin_amount": margin_amount, "leverage": leverage,
+        "notional": notional, "quantity": round(quantity, 8),
+        "limit_price": limit_price, "entry_price": None,
+        "stop_loss_price": None, "tp1_price": None, "tp2_price": None,
+        "current_price": limit_price,
+        "pnl_pct": 0, "closed_qty": 0, "realized_pnl": 0, "unrealized_pnl": 0,
+        "highest_price": None, "lowest_price": None,
+        "trailing_stop_price": None, "signal_snapshot": None,
+        "open_reason": f"挂单 {side} @ ${limit_price:.6g} margin=${margin_amount} tier={tier}",
+        "strategy": strategy, "advice": f"挂单中：{'涨破' if side == 'SHORT' else '跌破'} ${limit_price:.6g} 成交",
+    }
+    ok = _st.trade_position_insert(conn, position)
+    if not ok:
+        _st.trade_signal_lock_release(conn, token, strategy)
+        return {"ok": False, "reason": "DB 写入失败"}
+    pos_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("UPDATE trade_positions SET order_type = 'limit' WHERE id = ?", (pos_id,))
+    if pending_decision_id is not None:
+        conn.execute("UPDATE trade_positions SET pending_decision_id = ? WHERE id = ?",
+                     (pending_decision_id, pos_id))
+    return {"ok": True, "reason": "", "position_id": pos_id}
+
+
 def update_paper_positions(conn):
     positions = storage.trade_open_positions(conn)
     settings = storage.trading_settings_get(conn)
     mode = settings.get("mode") or "paper"
+    limit_timeout = int(settings.get("limit_order_timeout_seconds", config.LIMIT_ORDER_TIMEOUT_SECONDS))
 
     # === 实盘：从 exchange 同步持仓状态 ===
     if mode == "live" and positions:
@@ -930,22 +999,60 @@ def update_paper_positions(conn):
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
             age = (datetime.now(timezone.utc) - created_at).total_seconds()
-            if price <= limit_price:
+            triggered = (price >= limit_price) if is_short else (price <= limit_price)
+            expired = age >= limit_timeout
+
+            if triggered:
+                # 补算 ATR 止损 + 止盈（挂单时没算，触发时补）
+                from market import get_klines_1h
+                klines = get_klines_1h(pos["token"], limit=30)
+                stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
+                if is_short:
+                    sl = limit_price * (1 - stop_pct / 100)
+                    risk_unit = sl - limit_price
+                    tp1 = limit_price - risk_unit * config.TRADING_TP1_R
+                    tp2 = limit_price - risk_unit * config.TRADING_TP2_R
+                    fields.update({
+                        "lowest_price": price,
+                        "highest_price": price,
+                    })
+                else:
+                    sl = limit_price * (1 + stop_pct / 100)
+                    risk_unit = limit_price - sl
+                    tp1 = limit_price + risk_unit * config.TRADING_TP1_R
+                    tp2 = limit_price + risk_unit * config.TRADING_TP2_R
+                    fields.update({
+                        "highest_price": price,
+                        "lowest_price": price,
+                    })
                 fields.update({
                     "status": "OPEN",
                     "entry_price": limit_price,
+                    "stop_loss_price": round(sl, 8),
+                    "tp1_price": round(tp1, 8),
+                    "tp2_price": round(tp2, 8),
                     "current_price": price,
-                    "highest_price": price,
-                    "advice": "持仓中：等待止盈或止损",
+                    "advice": f"挂单触发 @ ${limit_price:.6g}，止盈+{config.TRADING_TP1_R}R/+{config.TRADING_TP2_R}R 止损{stop_pct:+.2f}%",
                 })
-            elif age >= config.TRADING_LIMIT_ORDER_TIMEOUT_SECONDS:
+            elif expired:
                 fields.update({
                     "status": "CANCELED",
-                    "advice": "限价单超时未成交，已取消",
+                    "advice": "挂单超时未成交，已取消",
                     "closed_at": "__CURRENT_TIMESTAMP__",
                 })
+                storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
+            else:
+                fields["advice"] = f"挂单中：{'涨破' if is_short else '跌破'} ${limit_price:.6g} 成交，剩余 {int(limit_timeout - age)}s"
+
             storage.trade_position_update(conn, pos["id"], fields)
-            continue
+            pd_id = pos.get("pending_decision_id")
+            if pd_id:
+                if triggered:
+                    conn.execute("UPDATE pending_decisions SET status = 'consumed', consumed_at = datetime('now') WHERE id = ?", (pd_id,))
+                elif expired:
+                    conn.execute("UPDATE pending_decisions SET status = 'expired' WHERE id = ?", (pd_id,))
+            if triggered or expired:
+                continue
 
         entry = float(pos.get("entry_price") or pos.get("limit_price") or 0)
         if entry <= 0 or open_qty <= 0:

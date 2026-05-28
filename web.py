@@ -130,10 +130,20 @@ def _build_kol_data_blob(candidate: dict) -> dict:
         "basis": snap.get("basis_pct"),
         "okx_funding": snap.get("okx_funding_pct"),
         "funding_hist": snap.get("funding_history"),
-        "liq_long_usd": snap.get("liq_long_usd"),
-        "liq_short_usd": snap.get("liq_short_usd"),
-        "liq_long_cnt": snap.get("liq_long_count"),
-        "liq_short_cnt": snap.get("liq_short_count"),
+        # 乖离率 + 市值 + 聪明钱
+        "ma20_deviation": snap.get("ma20_deviation_pct"),
+        "market_cap_usd": snap.get("market_cap_usd"),
+        "market_cap_rank": snap.get("market_cap_rank"),
+        "sm_long_ratio": snap.get("sm_long_ratio"),
+        "sm_net_notional_usdt": snap.get("sm_net_notional_usdt"),
+        "sm_long_avg_entry": snap.get("sm_long_avg_entry"),
+        "sm_short_avg_entry": snap.get("sm_short_avg_entry"),
+        "sm_avg_long_win_rate": snap.get("sm_avg_long_win_rate"),
+        "sm_avg_short_win_rate": snap.get("sm_avg_short_win_rate"),
+        "sm_traders_with_position": snap.get("sm_traders_with_position"),
+        "oi_marketcap": snap.get("oi_marketcap_ratio"),
+        "klines_1h": snap.get("klines_1h"),
+        "klines_4h": snap.get("klines_4h"),
     })
     return blob
 
@@ -143,6 +153,14 @@ def _scan_candidates():
         items, skipped = _build_leaderboard_items(conn)
         return trade_logic.build_trade_candidates_from_leaderboard(
             conn, items, passed_only=True)
+
+
+def _scan_candidates_kol():
+    """KOL 专用 — 返回所有有行情数据的代币（不过滤 passed）"""
+    with storage.get_conn() as conn:
+        items, skipped = _build_leaderboard_items(conn)
+        return trade_logic.build_trade_candidates_from_leaderboard(
+            conn, items, passed_only=False)
 
 
 def _run_kol_agent():
@@ -211,7 +229,8 @@ def _collect_loop():
     kol_interval_seconds = _read_kol_interval() * 60
     nl_interval_seconds = _read_nl_interval() * 60
     now_start = time.time()
-    # 偏移量防撞车: KOL(8,offset=0) 主(16,offset=1) NL(16,offset=3) 永不重叠
+    # 偏移量防撞车: KOL(8,offset=0) 主(16,offset=1) NL(16,offset=3) AI(32,offset=5) 永不重叠
+    _ai_regime_last_refresh = now_start - (32*60 - 5*60)  # 首次 5 分钟后
     _last_flush       = now_start - (16*60 - 1*60)   # 首次 1 分钟后
     _kol_last_flush   = now_start                      # 首次 8 分钟后
     _nl_last_flush    = now_start - (16*60 - 3*60)   # 首次 3 分钟后
@@ -243,22 +262,27 @@ def _collect_loop():
                     "pass_count": c.get("pass_count", 0),
                     "signal_key": c.get("signal_key", ""),
                 }
-                # KOL Agent：独立累积（开关关闭时跳过，passed 的才收，用 _build_kol_data_blob 展平含全景字段）
-                if ts_settings.get("kol_agent_enabled", True) and c.get("passed"):
-                    _kol_collected[c["token"]] = {
+                # 无教训版 Agent：独立累积（开关关闭时跳过，passed 的才收）
+                if ts_settings.get("nl_agent_enabled", True) and c.get("passed"):
+                    _nl_collected[c["token"]] = {
                         "token": c["token"],
-                        "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
+                        "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
                         "tier": c.get("tier", ""),
                         "passed": 1,
                         "hard_blocks": json.dumps(c.get("hard_block", [])),
                         "pass_count": c.get("pass_count", 0),
                         "signal_key": c.get("signal_key", ""),
                     }
-                # 无教训版 Agent：独立累积（开关关闭时跳过，passed 的才收）
-                if ts_settings.get("nl_agent_enabled", True) and c.get("passed"):
-                    _nl_collected[c["token"]] = {
+
+            # === KOL Agent：独立数据源，异常度筛选 ===
+            if ts_settings.get("kol_agent_enabled", True):
+                kol_candidates = _cached("kol_candidates_scan", cache_ttl, _scan_candidates_kol)
+                for c in kol_candidates:
+                    if not kol_agent.kol_is_interesting(c):
+                        continue
+                    _kol_collected[c["token"]] = {
                         "token": c["token"],
-                        "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
+                        "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
                         "tier": c.get("tier", ""),
                         "passed": 1,
                         "hard_blocks": json.dumps(c.get("hard_block", [])),
@@ -297,6 +321,18 @@ def _collect_loop():
                 if new_nl_interval != nl_interval_seconds:
                     print(f"[nl-collect] NL间隔变更: {nl_interval_seconds//60} → {new_nl_interval//60} 分钟", flush=True)
                     nl_interval_seconds = new_nl_interval
+                # AI Regime 定时刷新（后台调用，不阻塞 collector）
+                try:
+                    ai_interval = int(ts_settings.get("ai_regime_interval_minutes", 32)) * 60
+                except Exception:
+                    ai_interval = getattr(config, "AI_REGIME_INTERVAL_MINUTES", 32) * 60
+                if now - _ai_regime_last_refresh >= ai_interval:
+                    _ai_regime_last_refresh = now
+                    try:
+                        import dashboard
+                        dashboard.refresh_ai_regime(dashboard.get_alpha_breadth())
+                    except Exception:
+                        pass
                 remaining = max(0, interval_seconds - (now - _last_flush))
                 kol_remaining = max(0, kol_interval_seconds - (now - _kol_last_flush))
                 nl_remaining = max(0, nl_interval_seconds - (now - _nl_last_flush))
@@ -334,13 +370,13 @@ def _collect_loop():
             # === KOL Agent 独立定时触发 ===
             if (ts_settings.get("kol_agent_enabled", True) and _kol_collected
                     and not _kol_running and now - _kol_last_flush >= kol_interval_seconds):
+                batch = list(_kol_collected.values())
+                with storage.get_conn() as conn:
+                    storage.kol_candidates_insert_batch(conn, _kol_round + 1, batch)
+                    storage.kol_candidates_purge_old(conn, keep_last_rounds=30)
                 _kol_last_flush = now
                 _kol_running = True
                 _kol_round += 1
-                batch = list(_kol_collected.values())
-                with storage.get_conn() as conn:
-                    storage.kol_candidates_insert_batch(conn, _kol_round, batch)
-                    storage.kol_candidates_purge_old(conn, keep_last_rounds=30)
                 _kol_collected.clear()
                 ts_str = datetime.now().strftime("%H:%M:%S")
                 print(f"[kol-collect] {ts_str} 入库 {len(batch)} 个KOL候选"
@@ -350,13 +386,13 @@ def _collect_loop():
             # === 无教训版 Agent 独立定时触发 ===
             if (ts_settings.get("nl_agent_enabled", True) and _nl_collected
                     and not _nl_running and now - _nl_last_flush >= nl_interval_seconds):
+                batch = list(_nl_collected.values())
+                with storage.get_conn() as conn:
+                    storage.nl_candidates_insert_batch(conn, _nl_round + 1, batch)
+                    storage.nl_candidates_purge_old(conn, keep_last_rounds=30)
                 _nl_last_flush = now
                 _nl_running = True
                 _nl_round += 1
-                batch = list(_nl_collected.values())
-                with storage.get_conn() as conn:
-                    storage.nl_candidates_insert_batch(conn, _nl_round, batch)
-                    storage.nl_candidates_purge_old(conn, keep_last_rounds=30)
                 _nl_collected.clear()
                 ts_str = datetime.now().strftime("%H:%M:%S")
                 print(f"[nl-collect] {ts_str} 入库 {len(batch)} 个NL候选"
@@ -405,6 +441,9 @@ class TradingSettingsBody(BaseModel):
     heat_agent_lessons_enabled: bool | None = None
     trading_daily_limit_enabled: bool | None = None
     kol_agent_min_confidence: int | None = None
+    kol_token_cooldown_minutes: int | None = None
+    limit_order_timeout_seconds: int | None = None
+    system_auto_trade_enabled: bool | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -788,7 +827,7 @@ def api_trading():
     def compute():
         with storage.get_conn() as conn:
             account = trade_logic.account_summary(conn)
-            positions = storage.trade_positions_all(conn, limit=10000)
+            positions = storage.trade_positions_with_kol_enrichment(conn)
             candidates = _cached("candidates_scan", getattr(config, "AGENT_COLLECT_CACHE_TTL", 5), _scan_candidates)
         return {
             "account": account,
@@ -807,7 +846,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -859,6 +898,49 @@ def api_trading_reset_strategy(body: TradingResetStrategyBody):
         result = storage.trade_reset_strategy(conn, strategy, body.new_initial_balance)
     _cache_invalidate()
     return {"ok": True, **result}
+
+
+@app.post("/api/trading/limit-order")
+def api_limit_order(body: dict):
+    """创建挂单"""
+    required = {"token", "side", "limit_price"}
+    if not all(k in body for k in required):
+        raise HTTPException(400, "缺少必填字段: token/side/limit_price")
+    with storage.get_conn() as conn:
+        result = trade_logic.open_limit_position(
+            conn,
+            token=body["token"],
+            side=body["side"],
+            limit_price=float(body["limit_price"]),
+            margin_amount=float(body.get("margin_amount", 50)),
+            tier=body.get("tier", "half"),
+            strategy=body.get("strategy", "manual"),
+        )
+    _cache_invalidate()
+    return result
+
+
+@app.post("/api/trading/limit-order/{order_id}/cancel")
+def api_limit_order_cancel(order_id: int):
+    """取消挂单"""
+    with storage.get_conn() as conn:
+        pos = conn.execute(
+            "SELECT * FROM trade_positions WHERE id=? AND status='PENDING'",
+            (order_id,)
+        ).fetchone()
+        if not pos:
+            raise HTTPException(404, "挂单不存在或已成交")
+        storage.trade_position_update(conn, order_id, {
+            "status": "CANCELED",
+            "advice": "手动取消",
+            "closed_at": "__CURRENT_TIMESTAMP__",
+        })
+        storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
+        if pos["pending_decision_id"]:
+            conn.execute("UPDATE pending_decisions SET status = 'expired' WHERE id = ?",
+                         (pos["pending_decision_id"],))
+    _cache_invalidate()
+    return {"ok": True}
 
 
 @app.post("/api/system/restart")
@@ -1065,11 +1147,12 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
             (limit, offset)
         ).fetchall()
 
-        # 哪些 token 已有 journal open 记录（用于避免时间线重复显示 consumed）
-        j_open_tokens = {r["token"] for r in conn.execute(
-            f"SELECT DISTINCT j.token FROM journal j "
+        # 哪些 pending_decision_id 已有 journal open 记录（精确去重，避免 token 同名误杀）
+        j_pd_ids = {r["pending_decision_id"] for r in conn.execute(
+            f"SELECT DISTINCT j.pending_decision_id FROM journal j "
             f"JOIN trade_positions tp ON j.order_id = tp.id "
             f"WHERE tp.strategy = '{strategy}' AND j.action = 'open'"
+            f" AND j.pending_decision_id IS NOT NULL"
         ).fetchall()}
 
     timeline = []
@@ -1079,8 +1162,8 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
         timeline.append(r)
     for r in decision_rows:
         r = dict(r)
-        # consumed 且已有 journal open → 跳过；无 journal open 的旧数据 → 保留
-        if r.get("status") == "consumed" and r["token"] in j_open_tokens:
+        # consumed 且已有 journal open（同 pending_decision_id）→ 跳过，避免重复显示
+        if r.get("status") == "consumed" and r["id"] in j_pd_ids:
             continue
         r["source"] = "decision"
         timeline.append(r)
@@ -1742,6 +1825,20 @@ function renderDeepAnalysis(items) {
       if (v >= 1e3) return '$' + (v / 1e3).toFixed(1) + 'K';
       return '$' + v.toFixed(2);
     };
+    const fmtMc = (v) => {
+      if (!v) return '-';
+      if (v >= 1e12) return '$' + (v/1e12).toFixed(2) + 'T';
+      if (v >= 1e9) return '$' + (v/1e9).toFixed(2) + 'B';
+      if (v >= 1e6) return '$' + (v/1e6).toFixed(1) + 'M';
+      if (v >= 1e3) return '$' + (v/1e3).toFixed(1) + 'K';
+      return '$' + v.toFixed(0);
+    };
+    const fmtSmTooltip = (s) => {
+      return '多头均价: ' + (s.sm_long_avg_entry ? fmtPrice(s.sm_long_avg_entry) : '-') +
+        ' | 空头均价: ' + (s.sm_short_avg_entry ? fmtPrice(s.sm_short_avg_entry) : '-') +
+        ' | 多头胜率: ' + (s.sm_avg_long_win_rate != null ? s.sm_avg_long_win_rate.toFixed(1)+'%' : '-') +
+        ' | 空头胜率: ' + (s.sm_avg_short_win_rate != null ? s.sm_avg_short_win_rate.toFixed(1)+'%' : '-');
+    };
     const tagsHtml = (a.tags || []).map(t => `<span class="tag-chip">${t}</span>`).join('');
     const notesHtml = (a.notes && a.notes.length)
       ? `<ul>${a.notes.map(n => `<li>${n}</li>`).join('')}</ul>`
@@ -1756,7 +1853,7 @@ function renderDeepAnalysis(items) {
           <span class="score-big">综合 ${a.score !== undefined ? a.score : '-'}</span>
           <span class="muted" style="font-size:12px;">社交热度 ${item.score.toFixed(1)} · ${item.unique_posts} 条帖子</span>
           <span style="margin-left:auto;" class="muted" style="font-size:11px;">
-            更新于 ${m.updated_at || '-'}
+            ${(()=>{if(!m.updated_at)return'更新于 -';const d=new Date(m.updated_at+'Z');d.setHours(d.getHours()+8);return'更新于 '+d.toISOString().replace('T',' ').substring(5,16);})()}
           </span>
         </div>
         <div class="deep-metrics">
@@ -1784,8 +1881,12 @@ function renderDeepAnalysis(items) {
           <div class="metric"><div class="label">品类/链</div><div class="value" style="font-size:11px">${s.sector||'-'} / ${s.chain||'-'}</div></div>
           <div class="metric"><div class="label">Basis 基差</div><div class="value">${fmtPct2(s.basis_pct)}</div></div>
           <div class="metric"><div class="label">OKX 费率</div><div class="value">${fmtFR2(s.okx_funding_pct)}</div></div>
-          <div class="metric"><div class="label">爆仓(多/空)</div><div class="value" style="font-size:11px">${(s.liq_long_usd||s.liq_short_usd) ? fmtUsd((s.liq_long_usd||0)+(s.liq_short_usd||0)) : '-'}<br><span style="color:var(--green)">${s.liq_long_count ? s.liq_long_count+'笔' : ''}</span> / <span style="color:var(--red)">${s.liq_short_count ? s.liq_short_count+'笔' : ''}</span></div></div>
+
           <div class="metric"><div class="label">OKX 费率趋势</div><div class="value" style="font-size:11px">${(()=>{const h=s.funding_history;if(!h||!h.length)return'-';return h.slice(-4).map(x=>(x.r>0?'+':'')+x.r.toFixed(4)+'%').join(' → ')})()}</div></div>
+          <div class="metric"><div class="label">市值</div><div class="value">${fmtMc(s.market_cap_usd)}${s.market_cap_rank ? ' <span class="muted">#'+s.market_cap_rank+'</span>' : ''}</div></div>
+          <div class="metric"><div class="label">OI/市值 (杠杆率)</div><div class="value">${s.oi_marketcap_ratio != null ? s.oi_marketcap_ratio.toFixed(2)+'%' : '-'}${s.oi_marketcap_ratio > 5 ? ' <span style="color:var(--red);font-size:11px">高杠杆</span>' : s.oi_marketcap_ratio > 2 ? ' <span style="color:var(--yellow);font-size:11px">注意</span>' : ''}</div></div>
+          <div class="metric"><div class="label">MA20 乖离 (5h)</div><div class="value">${fmtPct2(s.ma20_deviation_pct)}</div></div>
+          <div class="metric" title="${fmtSmTooltip(s)}" style="cursor:help"><div class="label">聪明钱 ▾</div><div class="value">多头${fmtPct2(s.sm_long_ratio)} | 净头寸${fmtUsd(s.sm_net_notional_usdt)} | ${s.sm_traders_with_position||0}人</div></div>
         </div>
         ${a.oi_divergence ? `
           <div class="divergence-banner ${a.oi_divergence.type}">
@@ -1999,7 +2100,8 @@ async function refreshAll(opts = {}) {
 
 // 把 loadLeaderboard 拆成两步：fetch 由 refreshAll 做，渲染单独提出来
 function renderLeaderboard(data) {
-  document.getElementById('updated').textContent = '最后刷新: ' + data.updated_at;
+  let ut='';if(data.updated_at){const d=new Date(data.updated_at+"Z");d.setHours(d.getHours()+8);ut=d.toISOString().replace("T"," ").substring(5,16);}
+  document.getElementById('updated').textContent = '最后刷新: ' + ut;
   const tbody = document.getElementById('leaderboard');
   const noteEl = document.getElementById('leaderboard-note');
   if (!data.items.length) {
@@ -2497,11 +2599,22 @@ tr:hover { background: #1f2536; }
     </div>
   </div>
 
-  <div class="panel" style="overflow:auto;max-height:380px">
+  <div class="panel" style="overflow:auto" id="pending-panel" >
+    <h2>挂单</h2>
+    <table>
+      <thead><tr>
+        <th>币种</th><th>方向</th><th>限价</th><th>现价</th><th>入场结构</th><th>最新结构</th><th>仓位</th><th>剩余</th><th>开仓时间</th><th>操作</th>
+      </tr></thead>
+      <tbody id="pending-body"></tbody>
+    </table>
+    <div class="empty" id="pending-empty" >无挂单</div>
+  </div>
+
+  <div class="panel" style="grid-column:1/-1;overflow:auto;max-height:380px">
     <h2>当前持仓</h2>
     <table>
       <thead><tr>
-        <th>币种</th><th>方向</th><th>锁利</th><th>入场</th><th>现价</th><th>PnL%</th><th>止损</th><th>TP1</th><th>TP2</th><th>持仓</th>
+        <th>币种</th><th>方向</th><th>锁利</th><th>入场</th><th>现价</th><th>入场结构</th><th>最新结构</th><th>仓位</th><th>PnL</th><th>止损</th><th>TP1</th><th>TP2</th><th>持仓</th><th>类型</th><th>开仓时间</th>
       </tr></thead>
       <tbody id="positions-body"></tbody>
     </table>
@@ -2621,20 +2734,93 @@ async function loadPositions() {
       if (p.created_at) {
         try { const d = new Date(p.created_at.replace(' ','T') + 'Z'); const h = Math.floor((Date.now()-d)/3600000); const m = Math.floor((Date.now()-d)/60000)%60; hold = (h ? h+'h' : '') + m + 'm'; } catch(e) {}
       }
+      const entryConf = p.entry_confidence != null ? Number(p.entry_confidence) : null;
+      const entryTrend = p.entry_trend ? '<span class="badge badge-action">'+esc(p.entry_trend)+(entryConf!=null?' / '+entryConf:'')+'</span>' : '—';
+      const latestConf = p.latest_confidence != null ? Number(p.latest_confidence) : null;
+      const latestTrend = p.latest_trend ? '<span class="badge badge-action">'+esc(p.latest_trend)+(latestConf!=null?' / '+latestConf:'')+'</span>' : '—';
+      const posSize = '$' + Number(p.margin_amount || 0).toFixed(0) + ' ×' + Number(p.leverage || 0);
+      const pnlDollar = p.unrealized_pnl != null ? Number(p.unrealized_pnl) : null;
+      let pnlDisplay = '<span class="' + pnlClass(pnl) + '">' + fmtPct(pnl) + '</span>';
+      if (pnlDollar !== null) {
+        pnlDisplay += ' <span class="muted" style="font-size:10px">(' + (pnlDollar>=0?'+':'') + '$' + pnlDollar.toFixed(2) + ')</span>';
+      }
+      let openTime = '—';
+      if (p.created_at) { try { const d = new Date(p.created_at.replace(' ','T')+'Z'); openTime = d.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/\//g,'-'); } catch(e) {} }
       return '<tr>' +
         '<td style="font-weight:bold;color:var(--accent)">' + esc(p.token) + '</td>' +
         '<td>' + esc(p.side) + '</td>' +
         '<td style="font-size:11px;color:var(--green)">' + (lockedPct > 0 ? '🔒'+lockedPct.toFixed(0)+'%' : '—') + '</td>' +
         '<td>' + fmtPrice(p.entry_price) + '</td>' +
         '<td>' + fmtPrice(p.current_price) + '</td>' +
-        '<td class="' + pnlClass(pnl) + '">' + fmtPct(pnl) + '</td>' +
+        '<td style="font-size:11px">' + entryTrend + '</td>' +
+        '<td style="font-size:11px">' + latestTrend + '</td>' +
+        '<td style="font-size:11px;white-space:nowrap">' + posSize + '</td>' +
+        '<td style="font-size:11px">' + pnlDisplay + '</td>' +
         '<td>' + fmtPrice(p.stop_loss_price) + '</td>' +
         '<td>' + fmtPrice(p.tp1_price) + '</td>' +
         '<td>' + fmtPrice(p.tp2_price) + '</td>' +
         '<td style="font-size:11px;white-space:nowrap">' + esc(hold) + '</td>' +
+        '<td style="font-size:11px">' + (p.order_type === 'limit' ? '挂单' : '市价') + '</td>' +
+        '<td style="font-size:11px;white-space:nowrap">' + openTime + '</td>' +
         '</tr>';
     }).join('');
   } catch(e) { console.error('positions', e); }
+}
+
+async function loadPending() {
+  try {
+    const r = await fetch('/api/trading' + location.search);
+    const d = await r.json();
+    const pending = (d.positions || []).filter(p => p.status === 'PENDING' && p.strategy === 'agent');
+    const tbody = document.getElementById('pending-body');
+    const empty = document.getElementById('pending-empty');
+    const panel = document.getElementById('pending-panel');
+    const maxAge = Number((d.account && d.account.settings && d.account.settings.limit_order_timeout_seconds)) || 600;
+    if (!pending.length) {
+      tbody.innerHTML = '';
+      empty.style.display = '';
+      return;
+    }
+    empty.style.display = 'none';
+    tbody.innerHTML = pending.map(p => {
+      const limitPrice = Number(p.limit_price || 0);
+      const currentPrice = Number(p.current_price || 0);
+      const gapPct = limitPrice > 0 ? ((currentPrice - limitPrice) / limitPrice * 100).toFixed(1) : '-';
+      let remain = '—';
+      if (p.created_at) {
+        try { const dd = new Date(p.created_at.replace(' ','T') + 'Z'); const elapsed = (Date.now()-dd)/1000; const left = Math.max(0, maxAge - elapsed); const m = Math.floor(left/60); const s = Math.floor(left%60); remain = m + 'm' + s + 's'; } catch(e) {}
+      }
+      const entryConf = p.entry_confidence != null ? Number(p.entry_confidence) : null;
+      const entryTrend = p.entry_trend ? '<span class="badge badge-action">'+esc(p.entry_trend)+(entryConf!=null?' / '+entryConf:'')+'</span>' : '—';
+      const latestConf = p.latest_confidence != null ? Number(p.latest_confidence) : null;
+      const latestTrend = p.latest_trend ? '<span class="badge badge-action">'+esc(p.latest_trend)+(latestConf!=null?' / '+latestConf:'')+'</span>' : '—';
+      const posSize = '$' + Number(p.margin_amount || 0).toFixed(0) + ' ×' + Number(p.leverage || 0);
+      let openTime = '—';
+      if (p.created_at) { try { const d = new Date(p.created_at.replace(' ','T')+'Z'); openTime = d.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/\//g,'-'); } catch(e) {} }
+      return '<tr>' +
+        '<td style="font-weight:bold;color:var(--accent)">' + esc(p.token) + '</td>' +
+        '<td>' + esc(p.side) + '</td>' +
+        '<td>' + fmtPrice(limitPrice) + '</td>' +
+        '<td>' + fmtPrice(currentPrice) + ' <span class="muted" style="font-size:10px">(' + (gapPct >= 0 ? '+' : '') + gapPct + '%)</span></td>' +
+        '<td style="font-size:11px">' + entryTrend + '</td>' +
+        '<td style="font-size:11px">' + latestTrend + '</td>' +
+        '<td style="font-size:11px;white-space:nowrap">' + posSize + '</td>' +
+        '<td style="font-size:11px">' + esc(remain) + '</td>' +
+        '<td style="font-size:11px;white-space:nowrap">' + openTime + '</td>' +
+        '<td><button onclick="cancelPending(' + p.id + ')" style="font-size:11px;padding:2px 6px">取消</button></td>' +
+        '</tr>';
+    }).join('');
+  } catch(e) { console.error('pending', e); }
+}
+
+async function cancelPending(id) {
+  if (!confirm('确定取消该挂单？')) return;
+  try {
+    const r = await fetch('/api/trading/limit-order/' + id + '/cancel', {method:'POST'});
+    if (!r.ok) { const e = await r.text(); alert('取消失败: ' + e); return; }
+    loadPending();
+    loadPositions();
+  } catch(e) { alert('取消失败: ' + e.message); }
 }
 
 // 教训库
@@ -2904,7 +3090,7 @@ async function loadJournal(reset = false) {
 }
 
 async function refreshAll() {
-  await Promise.all([loadOverview(), loadPositions(), loadLessons(true), loadTimeline(true), loadJournal(true)]);
+  await Promise.all([loadOverview(), loadPositions(), loadPending(), loadLessons(true), loadTimeline(true), loadJournal(true)]);
 }
 
 updateClock();
@@ -2912,6 +3098,7 @@ setInterval(updateClock, 1000);
 refreshAll();
 setInterval(loadOverview, 15000);
 setInterval(loadPositions, 5000);
+setInterval(loadPending, 30000);
 </script>
 </body>
 </html>
@@ -3180,8 +3367,19 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       <input id="trade-kol-min-conf" type="number" min="50" max="95" step="5">
     </div>
     <div>
+      <label>KOL Token 冷却时间（分钟）</label>
+      <input id="trade-kol-cooldown" type="number" min="1" max="1440" step="5">
+    </div>
+    <div>
       <label>日交易次数限制（每策略15次）</label>
       <select id="trade-daily-limit-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
+      <label>系统策略自动开仓</label>
+      <select id="trade-system-auto-switch">
         <option value="true">启用</option>
         <option value="false">关闭</option>
       </select>
@@ -3222,6 +3420,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <div>
       <label>AI 研判间隔（分钟）</label>
       <input id="trade-ai-regime-interval" type="number" min="10" max="240" step="5">
+    </div>
+    <div>
+      <label>挂单超时（秒）</label>
+      <input id="trade-limit-timeout" type="number" min="60" max="7200" step="60">
     </div>
   </div>
 </div>
@@ -3288,6 +3490,7 @@ async function loadSettings() {
     document.getElementById('trade-nl-interval').value = s.nl_agent_interval_minutes ?? 30;
     document.getElementById('trade-heat-lessons-interval').value = s.heat_agent_lessons_trigger_interval ?? 3;
     document.getElementById('trade-ai-regime-interval').value = s.ai_regime_interval_minutes ?? 30;
+    document.getElementById('trade-limit-timeout').value = s.limit_order_timeout_seconds ?? 600;
     document.getElementById('trade-kol-provider').value = s.kol_llm_provider || 'deepseek';
     document.getElementById('trade-agent-switch').value = s.agent_trade_enabled ?? true;
     document.getElementById('trade-heat-switch').value = s.heat_agent_enabled ?? true;
@@ -3295,7 +3498,9 @@ async function loadSettings() {
     document.getElementById('trade-nl-switch').value = s.nl_agent_enabled ?? true;
     document.getElementById('trade-heat-lessons-switch').value = s.heat_agent_lessons_enabled ?? true;
     document.getElementById('trade-kol-min-conf').value = s.kol_agent_min_confidence ?? 70;
+    document.getElementById('trade-kol-cooldown').value = s.kol_token_cooldown_minutes ?? 30;
     document.getElementById('trade-daily-limit-switch').value = s.trading_daily_limit_enabled ?? true;
+    document.getElementById('trade-system-auto-switch').value = s.system_auto_trade_enabled ?? true;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
@@ -3324,6 +3529,7 @@ async function saveTradingSettings() {
     nl_agent_interval_minutes: Number(document.getElementById('trade-nl-interval').value),
     heat_agent_lessons_trigger_interval: Number(document.getElementById('trade-heat-lessons-interval').value),
     ai_regime_interval_minutes: Number(document.getElementById('trade-ai-regime-interval').value),
+    limit_order_timeout_seconds: Number(document.getElementById('trade-limit-timeout').value),
     kol_llm_provider: document.getElementById('trade-kol-provider').value,
     agent_trade_enabled: document.getElementById('trade-agent-switch').value === 'true',
     heat_agent_enabled: document.getElementById('trade-heat-switch').value === 'true',
@@ -3331,7 +3537,9 @@ async function saveTradingSettings() {
     nl_agent_enabled: document.getElementById('trade-nl-switch').value === 'true',
     heat_agent_lessons_enabled: document.getElementById('trade-heat-lessons-switch').value === 'true',
     kol_agent_min_confidence: parseInt(document.getElementById('trade-kol-min-conf').value) || 70,
+    kol_token_cooldown_minutes: parseInt(document.getElementById('trade-kol-cooldown').value) || 30,
     trading_daily_limit_enabled: document.getElementById('trade-daily-limit-switch').value === 'true',
+    system_auto_trade_enabled: document.getElementById('trade-system-auto-switch').value === 'true',
   };
   try {
     const resp = await fetch('/api/trading/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -3410,7 +3618,9 @@ def api_strategy_stats():
                    SUM(CASE WHEN status='CLOSED' AND realized_pnl<=0 THEN 1 ELSE 0 END) as losses,
                    ROUND(SUM(CASE WHEN status='CLOSED' THEN realized_pnl ELSE 0 END),2) as total_pnl,
                    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),2) as avg_pnl,
-                   SUM(CASE WHEN status IN('OPEN','PARTIAL') THEN 1 ELSE 0 END) as open_count
+                   SUM(CASE WHEN status IN('OPEN','PARTIAL') THEN 1 ELSE 0 END) as open_count,
+                   COUNT(CASE WHEN status='CLOSED' AND closed_at >= datetime('now', '-7 days') THEN 1 END) as total_7d,
+                   SUM(CASE WHEN status='CLOSED' AND closed_at >= datetime('now', '-7 days') AND realized_pnl>0 THEN 1 ELSE 0 END) as wins_7d
             FROM trade_positions WHERE strategy IS NOT NULL
             GROUP BY strategy ORDER BY strategy
         """)]
@@ -3432,10 +3642,28 @@ def api_strategy_stats():
         positions = [dict(r) for r in conn.execute(
             "SELECT strategy, token, side, status, entry_price, current_price, "
             "pnl_pct, realized_pnl, unrealized_pnl, stop_loss_price, tp1_price, tp2_price, "
-            "margin_amount, closed_qty, quantity, created_at, closed_at "
+            "margin_amount, leverage, closed_qty, quantity, order_type, created_at, closed_at "
             "FROM trade_positions WHERE strategy IS NOT NULL "
             "ORDER BY id DESC LIMIT 500"
         )]
+        # 为 KOL 策略持仓补 trend + confidence
+        for p in positions:
+            if p.get("strategy") != "kol_agent":
+                continue
+            row = conn.execute(
+                "SELECT trend, confidence FROM kol_analyses WHERE token=? AND created_at <= ? ORDER BY id DESC LIMIT 1",
+                (p["token"], p["created_at"]),
+            ).fetchone()
+            if row:
+                p["entry_trend"] = row["trend"]
+                p["entry_confidence"] = row["confidence"]
+            row = conn.execute(
+                "SELECT trend, confidence FROM kol_analyses WHERE token=? ORDER BY id DESC LIMIT 1",
+                (p["token"],),
+            ).fetchone()
+            if row:
+                p["latest_trend"] = row["trend"]
+                p["latest_confidence"] = row["confidence"]
         for s in strategies:
             s["loss_tags"] = loss_tags.get(s["strategy"], {})
             s["account"] = trade_logic.strategy_account_summary(conn, s["strategy"])
@@ -3464,8 +3692,7 @@ def api_macro_events():
 @app.get("/api/ai-regime")
 def api_ai_regime():
     import dashboard
-    alpha = dashboard.get_alpha_breadth()
-    return dashboard.get_ai_regime(alpha)
+    return dashboard.get_ai_regime()
 
 
 @app.post("/api/ai-regime/refresh")
@@ -3475,7 +3702,8 @@ def api_ai_regime_refresh():
     dashboard._ai_cache = {"ts": 0, "data": {}}
     dashboard._ai_loading = False
     alpha = dashboard.get_alpha_breadth()
-    return dashboard.get_ai_regime(alpha)
+    dashboard.refresh_ai_regime(alpha)
+    return dashboard.get_ai_regime()
 
 
 @app.get("/api/kol/llm-logs")
@@ -3485,9 +3713,9 @@ def api_kol_llm_logs(limit: int = 30):
 
 
 @app.get("/api/kol/analyses")
-def api_kol_analyses():
+def api_kol_analyses(symbol: str = ""):
     with storage.get_conn() as conn:
-        rows = storage.kol_analyses_latest(conn)
+        rows = storage.kol_analyses_latest(conn, symbol=symbol)
     tokens = list(dict.fromkeys(r["token"] for r in rows))
     by_token = {}
     for r in rows:
@@ -3503,13 +3731,13 @@ KOL_AGENT_HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agent-KOL 分析 - BSM Agent</title>
+<title>AI 判断流详细版 - BSM Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
   --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
-  --yellow: #d29922;
+  --yellow: #d29922; --purple: #a371f7; --orange: #d97706;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: var(--bg); color: var(--text); font-family: 'Inter','JetBrains Mono',-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif; padding: 20px; max-width: 1200px; margin: 0 auto; font-size: 13px; }
@@ -3534,31 +3762,66 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 .nav-dropdown:hover .nav-dropdown-content { display: block; }
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .header-time { color: var(--muted); font-size: 12px; }
-.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
-.card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.card-time { color: var(--muted); font-size: 11px; }
-.card-badges { display: flex; gap: 6px; margin-left: auto; }
-.badge { padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-.badge-short { background: #3a1a1a; color: var(--red); }
+
+/* Zone 1: Metadata row */
+.zone1 { margin-bottom: 8px; }
+.zone1-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.card-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
 .badge-long { background: #1a3a1a; color: var(--green); }
+.badge-short { background: #3a1a1a; color: var(--red); }
 .badge-none { background: #1a1a2a; color: var(--muted); }
+.badge-enter { background: #1a3a1a; color: var(--green); }
+.badge-wait { background: #3a3a1a; color: var(--yellow); }
+.badge-action { background: #2a1a3a; color: var(--purple); }
 .badge-high { background: #1a3a1a; color: var(--green); }
 .badge-medium { background: #3a3a1a; color: var(--yellow); }
 .badge-low { background: #3a1a1a; color: var(--red); }
+.context-tag-inline { font-size: 11px; color: #a371f7; margin-left: 4px; }
+.zone1-summary { font-size: 12px; color: var(--text); line-height: 1.6; margin-top: 2px; }
+
+/* Zone 2: Price grid */
 .price-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-bottom: 10px; }
-.price-box { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; text-align: center; }
+.price-box { background: #0f0f23; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; text-align: center; }
 .price-box .plabel { font-size: 10px; color: var(--muted); margin-bottom: 2px; }
 .price-box .pvalue { font-size: 12px; font-weight: 600; color: var(--text); }
-.analysis-text { font-size: 12px; color: var(--text); line-height: 1.5; margin: 4px 0; }
-.analysis-timing { font-size: 12px; color: var(--yellow); line-height: 1.5; margin: 4px 0; }
-.analysis-risk { font-size: 11px; color: var(--green); margin: 2px 0; }
-.token-tab { padding: 6px 16px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+
+/* Zone 3: Reasoning rows */
+.zone3 { margin: 8px 0; padding: 8px 10px; background: #0d1117; border-radius: 6px; }
+.reasoning-row { display: flex; gap: 6px; padding: 3px 0; font-size: 12px; line-height: 1.5; align-items: flex-start; }
+.reasoning-row .rlabel { color: var(--accent); font-weight: 600; min-width: 36px; flex-shrink: 0; }
+.reasoning-row .rtext { color: var(--text); }
+
+/* Zone 4: Evidence tags */
+.zone4 { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
+.evidence-tag { font-size: 10px; padding: 2px 7px; border-radius: 3px; border: 1px solid; }
+.et-neutral { color: #94a3b8; background: #1a1a2a; border-color: #2a2a3a; }
+.et-bull { color: var(--green); background: #0d1a0d; border-color: #1a3a1a; }
+.et-bear { color: var(--red); background: #1a0d0d; border-color: #3a1a1a; }
+
+/* Token tabs */
+.token-tab { padding: 6px 16px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s; font-family: inherit; background: var(--panel); color: var(--text); }
 .token-tab:hover { border-color: var(--accent); }
-.empty { text-align: center; color: var(--muted); padding: 40px; }
+.token-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Timeline header */
+.timeline-header { padding: 6px 0 10px; font-size: 13px; color: var(--text); border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.timeline-header .th-token { font-weight: 600; color: var(--accent); }
+.timeline-header .th-count { background: var(--accent); color: #fff; padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; }
+
+/* Period selector */
+.period-selector { display: flex; gap: 4px; padding: 8px; border-bottom: 1px solid var(--border); }
+.period-btn { padding: 3px 12px; border: 1px solid var(--border); border-radius: 4px; font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit; background: transparent; color: var(--muted); transition: all 0.15s; }
+.period-btn:hover { border-color: var(--accent); color: var(--text); }
+.period-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Layout */
 #main-layout { display: flex; gap: 16px; height: 600px; }
-#chart-panel { width: 380px; min-width: 320px; flex-shrink: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+#chart-panel { width: 380px; min-width: 320px; flex-shrink: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+#chart-iframe-wrap { flex: 1; }
 #cards-panel { flex: 1; overflow-y: auto; padding-right: 4px; }
+.empty { text-align: center; color: var(--muted); padding: 40px; }
 @media (max-width: 900px) { #main-layout { flex-direction: column; height: auto; } #chart-panel { width: 100%; height: 300px; } #cards-panel { max-height: 600px; overflow-y: auto; } }
 </style>
 </head>
@@ -3582,10 +3845,7 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 </div>
 
 <div class="header">
-  <div>
-    <h1>Agent-KOL 分析</h1>
-    <span style="color:var(--muted);font-size:12px">基于KOL交易体系蒸馏的盘面结构分析</span>
-  </div>
+  <div></div>
   <span class="header-time" id="clock"></span>
 </div>
 
@@ -3593,110 +3853,192 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 
 <div id="main-layout">
   <div id="chart-panel">
-    <iframe id="tv-chart" src="about:blank" style="width:100%;height:100%;border:none;border-radius:8px" allowfullscreen></iframe>
+    <div class="period-selector" id="period-selector">
+      <button class="period-btn active" data-interval="15">15m</button>
+      <button class="period-btn" data-interval="60">1H</button>
+      <button class="period-btn" data-interval="240">4H</button>
+    </div>
+    <div id="chart-iframe-wrap">
+      <iframe id="tv-chart" src="about:blank" style="width:100%;height:100%;border:none" allowfullscreen></iframe>
+    </div>
   </div>
-  <div id="cards-panel"><div class="empty">加载中...</div></div>
+  <div id="cards-panel">
+    <div id="timeline-header" class="timeline-header" style="display:none"></div>
+    <div id="cards-list"><div class="empty">加载中...</div></div>
+  </div>
 </div>
 
 <script>
 const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':Number(v).toFixed(6);
 const esc = s => s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : '';
+
 let _byToken = {};
 let _activeToken = '';
+let _currentInterval = '15';
+let _autoRefreshTimer = null;
 
-function renderCard(a, showToken) {
-  const dirBadge = a.direction === 'long' ? '<span class="badge badge-long">LONG</span>'
+function evTagClass(text) {
+  var s = String(text);
+  if (/\\b-\\d/.test(s)) return 'et-bear';
+  if (/跌|空|卖|砸|阻|缩|dump|short|bear/i.test(s)) return 'et-bear';
+  if (/涨|多|买|拉|放|支|弹|增|pump|long|bull|break/i.test(s)) return 'et-bull';
+  return 'et-neutral';
+}
+
+function setChart(token, interval) {
+  var sym = 'BINANCE%3A' + token + 'USDT.P';
+  var iv = interval || _currentInterval;
+  document.getElementById('tv-chart').src = 'https://s.tradingview.com/widgetembed/?symbol=' + sym + '&interval=' + iv + '&theme=dark&style=1&width=100%25&height=100%25&hide_side_toolbar=1&withdateranges=1&save_image=0&studies=';
+}
+
+function timeStr(ts) {
+  if (!ts) return '';
+  try { var d = new Date(ts.replace(' ','T')+'Z'); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\\//g,'-'); } catch(e) { return ts.substr(5,11); }
+}
+
+function renderCard(a) {
+  // --- Zone 1: time + badges + context_tag + summary ---
+  var dirBadge = a.direction === 'long' ? '<span class="badge badge-long">LONG</span>'
     : a.direction === 'short' ? '<span class="badge badge-short">SHORT</span>'
     : '<span class="badge badge-none">NONE</span>';
-  const confScore = Number(a.confidence) || 0;
-  const confClass = confScore >= 80 ? 'badge-high' : confScore >= 50 ? 'badge-medium' : 'badge-low';
-  const confBadge = '<span class="badge ' + confClass + '">' + confScore + '</span>';
-  const timeStr = (function(ts) {
-    if (!ts) return '';
-    try { const d = new Date(ts.replace(' ','T')+'Z'); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); } catch { return ts.substr(5,11); }
-  })(a.created_at);
+  var confScore = Number(a.confidence) || 0;
+  var statusBadge = a.status === 'ENTER'
+    ? '<span class="badge badge-enter">ENTER</span>'
+    : '<span class="badge badge-wait">' + esc(a.status||'WAIT') + '</span>';
+  var trendConfBadge = '<span class="badge badge-action">' + esc(a.trend || '') + ' / ' + confScore + '</span>';
+  var ctxTag = a.context_tag ? ' <span class="context-tag-inline">'+esc(a.context_tag)+'</span>' : '';
 
-  let priceHtml = '';
-  const pl = a.price_levels || {};
-  const priceKeys = [
+  var summary = a.summary || '';
+
+  var zone1 = '<div class="zone1">'
+    + '<div class="zone1-row"><span class="card-time">'+timeStr(a.created_at)+'</span>'
+    + dirBadge + trendConfBadge + statusBadge + ctxTag + '</div>'
+    + (summary ? '<div class="zone1-summary">'+esc(summary)+'</div>' : '')
+    + '</div>';
+
+  // --- Zone 2: Price grid ---
+  var pl = a.price_levels || {};
+  var priceKeys = [
     ['现价','current'],['支撑','support'],['阻力','resistance'],
     ['入场','entry'],['止损','stop_loss'],['止盈','take_profit']
   ];
-  for (const [label, key] of priceKeys) {
-    const v = pl[key];
-    priceHtml += '<div class="price-box"><div class="plabel">'+label+'</div><div class="pvalue">'+(v!=null?fmtPrice(v):'—')+'</div></div>';
+  var priceHtml = '';
+  for (var i = 0; i < priceKeys.length; i++) {
+    var v = pl[priceKeys[i][1]];
+    priceHtml += '<div class="price-box"><div class="plabel">'+priceKeys[i][0]+'</div><div class="pvalue">'+(v!=null?fmtPrice(v):'—')+'</div></div>';
+  }
+  var zone2 = '<div class="price-grid">'+priceHtml+'</div>';
+
+  // --- Zone 3: Reasoning rows (key:value) ---
+  var rs = a.reasoning || {};
+  var reasoningHtml = '';
+  if (rs.wz || rs.sj || rs.fk) {
+    reasoningHtml = '<div class="zone3">';
+    if (rs.wz) reasoningHtml += '<div class="reasoning-row"><span class="rlabel">位置</span><span class="rtext">'+esc(rs.wz)+'</span></div>';
+    if (rs.sj) reasoningHtml += '<div class="reasoning-row"><span class="rlabel">时机</span><span class="rtext">'+esc(rs.sj)+'</span></div>';
+    if (rs.fk) reasoningHtml += '<div class="reasoning-row"><span class="rlabel">风控</span><span class="rtext">'+esc(rs.fk)+'</span></div>';
+    reasoningHtml += '</div>';
   }
 
-  let riskHtml = '';
-  const rc = a.risk_control || {};
-  if (rc.stop_loss_rule) riskHtml += '<div class="analysis-risk">止损：'+esc(rc.stop_loss_rule)+'</div>';
-  if (rc.tp1) riskHtml += '<div class="analysis-risk">TP1：'+esc(rc.tp1)+'</div>';
-  if (rc.tp2) riskHtml += '<div class="analysis-risk">TP2：'+esc(rc.tp2)+'</div>';
+  // --- Zone 4: Evidence tags (color-coded) ---
+  var evTags = a.evidence_tags || [];
+  var tagsHtml = '';
+  if (evTags.length) {
+    tagsHtml = '<div class="zone4">';
+    for (var j = 0; j < evTags.length; j++) {
+      tagsHtml += '<span class="evidence-tag '+evTagClass(evTags[j])+'">'+esc(evTags[j])+'</span>';
+    }
+    tagsHtml += '</div>';
+  }
 
-  return '<div class="card">'
-    + '<div class="card-header"><span class="card-time">'+timeStr+'</span><div class="card-badges">'+dirBadge+confBadge+'</div></div>'
-    + '<div class="price-grid">'+priceHtml+'</div>'
-    + (a.position_analysis ? '<div class="analysis-text">'+esc(a.position_analysis)+'</div>' : '')
-    + (a.timing ? '<div class="analysis-timing">时机：'+esc(a.timing)+'</div>' : '')
-    + riskHtml
-    + (a.reason ? '<div class="analysis-text" style="color:var(--muted);font-size:11px;margin-top:8px">'+esc(a.reason)+'</div>' : '')
-    + '</div>';
+  return '<div class="card">' + zone1 + zone2 + reasoningHtml + tagsHtml + '</div>';
 }
 
 function renderTabs(tokens) {
-  let html = '<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">';
-  for (const t of tokens) {
-    const active = t === _activeToken ? ' style="background:var(--accent);color:#fff"' : ' style="background:var(--panel);color:var(--text)"';
-    html += '<button class="token-tab" data-token="'+esc(t)+'"'+active+'>'+esc(t)+'</button>';
+  var html = '<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">';
+  for (var i = 0; i < tokens.length; i++) {
+    var t = tokens[i];
+    var cls = t === _activeToken ? ' token-tab active' : 'token-tab';
+    html += '<button class="'+cls+'" data-token="'+esc(t)+'">'+esc(t)+'</button>';
   }
   html += '</div>';
   document.getElementById('token-tabs').innerHTML = html;
-  for (const btn of document.querySelectorAll('.token-tab')) {
-    btn.addEventListener('click', function() { selectToken(this.dataset.token); });
+  var btns = document.querySelectorAll('.token-tab');
+  for (var j = 0; j < btns.length; j++) {
+    btns[j].addEventListener('click', function() { selectToken(this.dataset.token); });
   }
 }
 
-function setChart(token) {
-  document.getElementById('tv-chart').src = 'https://s.tradingview.com/widgetembed/?symbol=BINANCE%3A'+token+'USDT.P&interval=15&theme=dark&style=1&width=100%25&height=100%25&hide_side_toolbar=1&withdateranges=1&save_image=0&studies=';
+function renderTimelineHeader(token, count) {
+  var hdr = document.getElementById('timeline-header');
+  hdr.style.display = '';
+  hdr.innerHTML = '<span class="th-token">'+esc(token)+'</span> 判断时间线 · 最近12小时<span class="th-count">'+count+'条</span>';
 }
 
-function selectToken(token) {
-  _activeToken = token;
-  renderTabs(Object.keys(_byToken));
-  setChart(token);
-  var list = _byToken[token] || [];
-  document.getElementById('cards-panel').innerHTML = list.map(function(a) { return renderCard(a, false); }).join('');
+async function loadTimeline(token) {
+  try {
+    var r = await fetch('/api/kol/analyses?symbol=' + encodeURIComponent(token));
+    var d = await r.json();
+    var list = (d.by_token && d.by_token[token]) ? d.by_token[token] : [];
+    document.getElementById('cards-list').innerHTML = list.length
+      ? list.map(function(a) { return renderCard(a); }).join('')
+      : '<div class="empty">暂无该币种分析数据</div>';
+    renderTimelineHeader(token, list.length);
+  } catch(e) {
+    document.getElementById('cards-list').innerHTML = '<div class="empty" style="color:var(--red)">加载失败: '+esc(e.message)+'</div>';
+  }
 }
 
-async function load() {
+async function loadTokens() {
   try {
     var r = await fetch('/api/kol/analyses');
     var d = await r.json();
     var tokens = d.tokens || [];
     _byToken = d.by_token || {};
     if (!tokens.length) {
-      document.getElementById('cards-panel').innerHTML = '<div class="empty">暂无KOL分析数据<br><span style="font-size:11px;color:var(--muted)">等待 collector 触发分析后刷新</span></div>';
+      document.getElementById('cards-list').innerHTML = '<div class="empty">暂无KOL分析数据<br><span style="font-size:11px;color:var(--muted)">等待 collector 触发分析后刷新</span></div>';
+      document.getElementById('timeline-header').style.display = 'none';
       return;
     }
     _activeToken = tokens[0];
     renderTabs(tokens);
     selectToken(_activeToken);
   } catch(e) {
-    document.getElementById('cards-panel').innerHTML = '<div class="empty" style="color:var(--red)">加载失败: '+esc(e.message)+'</div>';
+    document.getElementById('cards-list').innerHTML = '<div class="empty" style="color:var(--red)">加载失败: '+esc(e.message)+'</div>';
   }
 }
+
+function selectToken(token) {
+  _activeToken = token;
+  renderTabs(Object.keys(_byToken));
+  setChart(token);
+  loadTimeline(token);
+  // restart auto-refresh for current token
+  if (_autoRefreshTimer) clearInterval(_autoRefreshTimer);
+  _autoRefreshTimer = setInterval(function() { loadTimeline(_activeToken); }, 60000);
+}
+
+// Period selector
+document.getElementById('period-selector').addEventListener('click', function(e) {
+  var btn = e.target.closest('.period-btn');
+  if (!btn) return;
+  _currentInterval = btn.dataset.interval;
+  var btns = document.querySelectorAll('.period-btn');
+  for (var i = 0; i < btns.length; i++) { btns[i].classList.remove('active'); }
+  btn.classList.add('active');
+  if (_activeToken) setChart(_activeToken);
+});
 
 function updateClock() {
   try { document.getElementById('clock').textContent = new Date().toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai'}); } catch(e) {}
 }
 setInterval(updateClock, 1000);
 updateClock();
-load();
+loadTokens();
 </script>
 </body>
 </html>
 """
-
 
 STRATEGIES_HTML = """
 <!DOCTYPE html>
@@ -3819,7 +4161,7 @@ async function load() {
           <div class="metric"><div class="label">胜/负</div><div class="value">${s.wins}/${s.losses}</div></div>
           <div class="metric"><div class="label">总盈亏</div><div class="value ${pnlCls}">${fmtUsd(s.total_pnl)}</div></div>
           <div class="metric"><div class="label">平均盈亏</div><div class="value ${pnlCls}">${fmtPct(s.avg_pnl)}</div></div>
-          <div class="metric"><div class="label">当前持仓</div><div class="value">${s.open_count||0}</div></div>
+          <div class="metric"><div class="label">最近7天胜率</div><div class="value">${s.total_7d>0 ? (s.wins_7d/s.total_7d*100).toFixed(1)+'%' : '—'}</div><div style="font-size:10px;color:var(--muted);margin-top:1px">${s.wins_7d||0}胜/${s.total_7d||0}笔</div></div>
         </div>`;
       // 止损失败标签
       const lossTags = s.loss_tags || {};
@@ -3840,24 +4182,32 @@ async function load() {
       if (openList.length) {
         html += `<div class="toggle-section">
           <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📌 当前持仓 (${openList.length}) ▾</div>
-          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th>锁利</th><th class="right">入场</th><th class="right">现价</th><th class="right">PnL%</th><th class="right">PnL$</th><th class="right">止损</th><th class="right">TP1</th><th class="right">TP2</th><th>持仓</th></tr></thead><tbody>`;
+          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th>锁利</th><th class="right">入场</th><th class="right">现价</th><th>入场结构</th><th>最新结构</th><th class="right">仓位</th><th class="right">PnL%</th><th class="right">PnL$</th><th class="right">止损</th><th class="right">TP1</th><th class="right">TP2</th><th>持仓</th><th>类型</th><th>开仓时间</th></tr></thead><tbody>`;
         for (const p of openList) {
           const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
           const cq = Number(p.closed_qty||0), tq = Number(p.quantity||0);
           const lockedPct = tq > 0 ? (cq/tq*100) : 0;
           let hold = '—';
           if (p.created_at) { try { const d = new Date(p.created_at.replace(' ','T')+'Z'); const h = Math.floor((Date.now()-d)/3600000); const m = Math.floor((Date.now()-d)/60000)%60; hold = (h?h+'h':'')+m+'m'; } catch(e) {} }
-          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td style="color:var(--green);font-size:11px">${lockedPct>0?'🔒'+lockedPct.toFixed(0)+'%':'—'}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.unrealized_pnl)}</td><td class="right">${fmtPrice(p.stop_loss_price)}</td><td class="right">${fmtPrice(p.tp1_price)}</td><td class="right">${fmtPrice(p.tp2_price)}</td><td style="font-size:11px;white-space:nowrap">${hold}</td></tr>`;
+          const entryConf = p.entry_confidence != null ? Number(p.entry_confidence) : null;
+          const entryTrend = p.entry_trend ? '<span style="display:inline-block;background:#2a1a3a;color:#a371f7;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600">'+p.entry_trend+(entryConf!=null?' / '+entryConf:'')+'</span>' : '—';
+          const latestConf = p.latest_confidence != null ? Number(p.latest_confidence) : null;
+          const latestTrend = p.latest_trend ? '<span style="display:inline-block;background:#2a1a3a;color:#a371f7;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600">'+p.latest_trend+(latestConf!=null?' / '+latestConf:'')+'</span>' : '—';
+          const posSize = '$' + Number(p.margin_amount || 0).toFixed(0) + ' ×' + Number(p.leverage || 0);
+          let openTime = '—';
+          if (p.created_at) { try { const d = new Date(p.created_at.replace(' ','T')+'Z'); openTime = d.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/\//g,'-'); } catch(e) {} }
+          const orderTypeLabel = p.order_type === 'limit' ? '挂单' : '市价';
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td style="color:var(--green);font-size:11px">${lockedPct>0?'🔒'+lockedPct.toFixed(0)+'%':'—'}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td style="font-size:11px">${entryTrend}</td><td style="font-size:11px">${latestTrend}</td><td style="font-size:11px;white-space:nowrap">${posSize}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.unrealized_pnl)}</td><td class="right">${fmtPrice(p.stop_loss_price)}</td><td class="right">${fmtPrice(p.tp1_price)}</td><td class="right">${fmtPrice(p.tp2_price)}</td><td style="font-size:11px;white-space:nowrap">${hold}</td><td style="font-size:11px">${orderTypeLabel}</td><td style="font-size:11px;white-space:nowrap">${openTime}</td></tr>`;
         }
         html += `</tbody></table></div></div>`;
       }
       if (closedList.length) {
         html += `<div class="toggle-section">
           <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📋 最近平仓 (${closedList.length}) ▾</div>
-          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th class="right">入场</th><th class="right">平仓</th><th class="right">PnL%</th><th class="right">盈亏</th><th>平仓时间</th></tr></thead><tbody>`;
+          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th class="right">入场</th><th class="right">平仓</th><th class="right">PnL%</th><th class="right">盈亏</th><th>类型</th><th>平仓时间</th></tr></thead><tbody>`;
         for (const p of closedList) {
           const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
-          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.realized_pnl)}</td><td style="font-size:11px;white-space:nowrap">${fmtTime(p.closed_at)}</td></tr>`;
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.realized_pnl)}</td><td style="font-size:11px">${p.order_type === 'limit' ? '挂单' : '市价'}</td><td style="font-size:11px;white-space:nowrap">${fmtTime(p.closed_at)}</td></tr>`;
         }
         html += `</tbody></table></div></div>`;
       }
@@ -3928,7 +4278,7 @@ async function loadLLMLogs(){
     if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
     let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th></tr>";
     for(const l of logs){
-      const t=l.created_at?l.created_at.replace("T"," ").substring(5,16):"";
+      let t="";if(l.created_at){const d=new Date(l.created_at+"Z");d.setHours(d.getHours()+8);t=d.toISOString().replace("T"," ").substring(5,16);}
       const ok=l.success?"<span class=green>OK("+l.analyses_count+"条)</span>":"<span class=red>FAIL</span>";
       h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td></tr>";
     }
@@ -4155,7 +4505,7 @@ function updateDashboard(r,m,a){
   const tag=a.current_regime||"";
   document.getElementById("regime-tag").innerHTML=`<span style="color:${R[tag]||'var(--muted)'}">●</span> ${RN[tag]||tag} <span style="color:var(--muted);font-size:11px">conf ${a.confidence||0}</span>`;
   document.getElementById("model-tag").textContent=a.model||"deepseek";
-  document.getElementById("ai-updated").textContent=`每${a.refresh_interval_min||32}分钟 · ${a.updated_at||""}`;
+  document.getElementById("ai-updated").textContent=`每${a.refresh_interval_min||32}分钟 · ${a.cache_age_display||""}` + (a.cache_age_display!=="等待首次刷新" ? ` (${a.updated_at||""})` : "");
   document.getElementById("judgment").innerHTML=(a.judgment_text||"AI研判加载中...").replace(/\\n/g,"<br>");
   let sl="";for(const s of(a.evidence_support||[]))sl+=`<li>${s}</li>`;
   document.getElementById("evidence-support").innerHTML=`<ul>${sl}</ul>`;

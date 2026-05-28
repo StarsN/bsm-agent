@@ -362,7 +362,7 @@ def one_scan():
     with storage.get_conn() as conn:
         pending = conn.execute(
             "SELECT * FROM pending_decisions "
-            "WHERE status = 'pending' "
+            "WHERE status = 'pending' AND source != 'kol_agent' "
             "ORDER BY created_at ASC "
             "LIMIT 5"
         ).fetchall()
@@ -402,7 +402,7 @@ def one_scan():
 
     # 4. 策略 B：系统自动开仓（读榜单 passed 币直接开，signal_lock 防重复）
     system_opened = 0
-    if getattr(config, "SYSTEM_AUTO_TRADE_ENABLED", True):
+    if settings.get("system_auto_trade_enabled", True):
         with storage.get_conn() as conn:
             candidates = trade_logic.build_trade_candidates(
                 conn, limit=config.COMPOSITE_HEAT_TOP_N, passed_only=True)

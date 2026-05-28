@@ -309,12 +309,19 @@ CREATE TABLE IF NOT EXISTS kol_analyses (
     trend           TEXT,
     timeline        TEXT,
     price_levels    TEXT,
+    summary         TEXT,
+    reasoning       TEXT,
     position_analysis TEXT,
     timing          TEXT,
     risk_control    TEXT,
     direction       TEXT,
     confidence      TEXT,
     reason          TEXT,
+    llm_log_id      INTEGER,
+    action          TEXT,
+    status          TEXT,
+    context_tag     TEXT,
+    evidence_tags   TEXT,
     raw_response    TEXT,
     system_prompt   TEXT,
     user_prompt     TEXT,
@@ -455,6 +462,11 @@ def _migrate(conn):
         conn.execute("ALTER TABLE trade_positions ADD COLUMN strategy TEXT DEFAULT 'agent'")
     if "lowest_price" not in tp_cols:
         conn.execute("ALTER TABLE trade_positions ADD COLUMN lowest_price REAL")
+    if "pending_decision_id" not in tp_cols:
+        conn.execute("ALTER TABLE trade_positions ADD COLUMN pending_decision_id INTEGER")
+    if "order_type" not in tp_cols:
+        conn.execute("ALTER TABLE trade_positions ADD COLUMN order_type TEXT DEFAULT 'market'")
+        conn.execute("UPDATE trade_positions SET order_type = 'limit' WHERE status = 'PENDING'")
     # 更新唯一索引为 (token, side, strategy) 实现策略级数据隔离
     conn.execute("DROP INDEX IF EXISTS idx_trade_one_active_token")
     conn.execute("""
@@ -499,6 +511,18 @@ def _migrate(conn):
         conn.execute("ALTER TABLE kol_analyses ADD COLUMN user_prompt TEXT")
     if "llm_log_id" not in ka_cols:
         conn.execute("ALTER TABLE kol_analyses ADD COLUMN llm_log_id INTEGER")
+    if "action" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN action TEXT")
+    if "status" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN status TEXT")
+    if "context_tag" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN context_tag TEXT")
+    if "evidence_tags" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN evidence_tags TEXT")
+    if "summary" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN summary TEXT")
+    if "reasoning" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN reasoning TEXT")
     # kol_llm_logs 存 prompt（从 kol_analyses 迁出，减少冗余）
     kll_cols = [r[1] for r in conn.execute("PRAGMA table_info(kol_llm_logs)").fetchall()]
     if "system_prompt" not in kll_cols:
@@ -909,12 +933,14 @@ def trading_settings_defaults() -> dict:
         "ai_regime_interval_minutes": getattr(config, "AI_REGIME_INTERVAL_MINUTES", 30),
         "kol_llm_provider": getattr(config, "KOL_LLM_PROVIDER", "deepseek"),
         "kol_agent_min_confidence": getattr(config, "KOL_AGENT_MIN_CONFIDENCE", 70),
+        "kol_token_cooldown_minutes": getattr(config, "KOL_TOKEN_COOLDOWN_MINUTES", 30),
         "agent_trade_enabled": getattr(config, "AGENT_TRADE_ENABLED", True),
         "heat_agent_enabled": getattr(config, "HEAT_AGENT_ENABLED", True),
         "kol_agent_enabled": getattr(config, "KOL_AGENT_ENABLED", True),
         "nl_agent_enabled": getattr(config, "NL_AGENT_ENABLED", True),
         "heat_agent_lessons_enabled": getattr(config, "HEAT_AGENT_LESSONS_ENABLED", True),
         "trading_daily_limit_enabled": getattr(config, "TRADING_DAILY_LIMIT_ENABLED", True),
+        "limit_order_timeout_seconds": getattr(config, "LIMIT_ORDER_TIMEOUT_SECONDS", 600),
     }
 
 
@@ -925,7 +951,7 @@ def trading_settings_get(conn) -> dict:
         raw = row["value"]
         if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
-        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence"}:
+        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds"}:
             try:
                 settings[row["key"]] = float(raw)
             except (TypeError, ValueError):
@@ -934,11 +960,12 @@ def trading_settings_get(conn) -> dict:
             settings[row["key"]] = raw
     settings["leverage"] = int(settings.get("leverage") or config.TRADING_LEVERAGE)
     settings["kol_agent_min_confidence"] = int(settings.get("kol_agent_min_confidence") or 70)
+    settings["kol_token_cooldown_minutes"] = int(settings.get("kol_token_cooldown_minutes") or 30)
     return settings
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "limit_order_timeout_seconds"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -968,6 +995,30 @@ def trade_positions_all(conn, limit: int = 50) -> list[dict]:
         LIMIT ?
     """, (limit,))
     return [dict(r) for r in cur.fetchall()]
+
+
+def trade_positions_with_kol_enrichment(conn) -> list[dict]:
+    """对所有持仓，对 kol_agent 策略补 entry_trend/confidence / latest_trend/confidence"""
+    positions = trade_positions_all(conn, limit=10000)
+    for p in positions:
+        if p.get("strategy") != "kol_agent":
+            continue
+        token = p["token"]
+        row = conn.execute(
+            "SELECT trend, confidence FROM kol_analyses WHERE token=? AND created_at <= ? ORDER BY id DESC LIMIT 1",
+            (token, p["created_at"]),
+        ).fetchone()
+        if row:
+            p["entry_trend"] = row["trend"]
+            p["entry_confidence"] = row["confidence"]
+        row = conn.execute(
+            "SELECT trend, confidence FROM kol_analyses WHERE token=? ORDER BY id DESC LIMIT 1",
+            (token,),
+        ).fetchone()
+        if row:
+            p["latest_trend"] = row["trend"]
+            p["latest_confidence"] = row["confidence"]
+    return positions
 
 
 def trade_has_active(conn, token: str, strategy: str = None) -> bool:
@@ -1465,40 +1516,84 @@ def kol_analysis_insert(conn, analysis: dict):
     import json as _json
     conn.execute(
         """INSERT INTO kol_analyses
-            (token, trend, timeline, price_levels, position_analysis,
-             timing, risk_control, direction, confidence, reason, llm_log_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (token, trend, timeline, price_levels, summary, reasoning,
+             position_analysis, timing, risk_control, direction, confidence,
+             reason, llm_log_id, action, status, context_tag, evidence_tags)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            analysis["token"], analysis.get("trend"),
+            analysis.get("token", ""), analysis.get("trend"),
             _json.dumps(analysis.get("timeline"), ensure_ascii=False),
             _json.dumps(analysis.get("price_levels"), ensure_ascii=False),
+            analysis.get("summary"),
+            _json.dumps(analysis.get("reasoning"), ensure_ascii=False),
             analysis.get("position_analysis"),
             analysis.get("timing"),
             _json.dumps(analysis.get("risk_control"), ensure_ascii=False),
             analysis.get("direction"), analysis.get("confidence"),
             analysis.get("reason"),
             analysis.get("llm_log_id"),
+            None,
+            analysis.get("status"),
+            analysis.get("context_tag"),
+            _json.dumps(analysis.get("evidence_tags"), ensure_ascii=False),
         ),
     )
 
 
-def kol_analyses_latest(conn):
+def kol_analyses_latest(conn, symbol: str = ""):
     import json as _json
-    rows = conn.execute(
-        "SELECT id, token, trend, price_levels, position_analysis, timing, "
-        "risk_control, direction, confidence, reason, created_at "
+    q = (
+        "SELECT id, token, trend, timeline, price_levels, "
+        "summary, reasoning, position_analysis, timing, risk_control, direction, confidence, reason, "
+        "action, status, context_tag, evidence_tags, "
+        "created_at "
         "FROM kol_analyses "
         "WHERE created_at >= datetime('now', '-12 hours') "
-        "ORDER BY id DESC"
-    ).fetchall()
+    )
+    params: tuple = ()
+    if symbol:
+        q += " AND token = ? "
+        params = (symbol.upper(),)
+    q += " ORDER BY id DESC"
+    if symbol:
+        q += " LIMIT 8"
+    rows = conn.execute(q, params).fetchall()
     results = []
     for r in rows:
         d = dict(r)
-        for field in ("timeline", "price_levels", "risk_control"):
+        for field in ("timeline", "price_levels", "risk_control", "evidence_tags", "reasoning"):
             try:
                 d[field] = _json.loads(d[field]) if d[field] else None
             except (Exception):
                 pass
+
+        # --- 字段映射: 旧列 → 新字段 (fallback 兼容迁移前数据) ---
+        # summary: 新字段优先, 空则取 position_analysis / reason
+        if not d.get("summary"):
+            d["summary"] = d.get("position_analysis") or d.get("reason") or ""
+
+        # reasoning: 新字段优先, 空则用旧 timing + risk_control 拼凑
+        rs = d.get("reasoning")
+        if not isinstance(rs, dict):
+            rs = {}
+        if not (rs.get("wz") or rs.get("sj") or rs.get("fk")):
+            if d.get("timing"):
+                rs["sj"] = d["timing"]
+            rc = d.get("risk_control")
+            if isinstance(rc, dict):
+                parts = [v for v in rc.values() if v]
+                if parts:
+                    rs["fk"] = "；".join(parts)
+        d["reasoning"] = rs if (rs.get("wz") or rs.get("sj") or rs.get("fk")) else None
+
+        # action: 新字段优先, 空则用 direction / confidence 拼接 "LONG / 75"
+        if not d.get("action"):
+            dir_upper = (d.get("direction") or "").upper()
+            conf = d.get("confidence", "")
+            if dir_upper:
+                d["action"] = f"{dir_upper} / {conf}"
+        # --- 映射结束 ---
+
         results.append(d)
     return results
 
