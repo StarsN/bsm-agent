@@ -1051,6 +1051,25 @@ def update_paper_positions(conn):
                     conn.execute("UPDATE pending_decisions SET status = 'consumed', consumed_at = datetime('now') WHERE id = ?", (pd_id,))
                 elif expired:
                     conn.execute("UPDATE pending_decisions SET status = 'expired' WHERE id = ?", (pd_id,))
+            if triggered:
+                _reason = pos.get("open_reason", "") or ""
+                _m = __import__("re").search(r"tier=(\w+)", _reason)
+                _tier = _m.group(1) if _m else "half"
+                _snap = __import__("json").dumps({
+                    "price": limit_price, "stop_loss": round(sl, 8),
+                    "tp1": round(tp1, 8), "tp2": round(tp2, 8),
+                    "margin": pos.get("margin_amount", 0),
+                    "notional": pos.get("notional", 0),
+                    "leverage": pos.get("leverage", 0),
+                }, ensure_ascii=False)
+                storage.journal_add_open(
+                    conn, position_id=pos["id"], token=pos["token"], price=limit_price,
+                    tier=_tier, stop_loss=round(sl, 8),
+                    tp1_price=round(tp1, 8), tp2_price=round(tp2, 8),
+                    reason=f"挂单触发 {pos.get('side', 'LONG')} @ ${limit_price:.6g}",
+                    dimension_data=_snap,
+                    pending_decision_id=pd_id,
+                )
             if triggered or expired:
                 continue
 

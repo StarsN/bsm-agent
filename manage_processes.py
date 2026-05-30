@@ -62,11 +62,28 @@ def _pid_running(pid: int | None) -> bool:
         return False
 
 
+def _cleanup_old_logs(days: int = 30):
+    """删除 N 天前的旧日志文件"""
+    log_root = BASE_DIR / "logs"
+    if not log_root.is_dir():
+        return
+    cutoff = time.time() - days * 86400
+    for proc_dir in log_root.iterdir():
+        if proc_dir.is_dir():
+            for f in proc_dir.iterdir():
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+
+
 def _start_one(name: str, script: str) -> dict:
     path = BASE_DIR / script
-    log_dir = BASE_DIR / "logs"
-    log_dir.mkdir(exist_ok=True)
-    log_file = open(str(log_dir / f"{name}.log"), "a")
+    date_str = time.strftime("%Y%m%d")
+    log_dir = BASE_DIR / "logs" / name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = open(str(log_dir / f"{date_str}.log"), "a")
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_CONSOLE
@@ -81,12 +98,13 @@ def _start_one(name: str, script: str) -> dict:
     return {
         "pid": proc.pid,
         "script": script,
-        "log": str(log_dir / f"{name}.log"),
+        "log": str(log_dir / f"{date_str}.log"),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
 def start(open_browser: bool = True):
+    _cleanup_old_logs()
     state = _load_state()
     changed = False
 

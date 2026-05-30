@@ -362,7 +362,7 @@ def one_scan():
     with storage.get_conn() as conn:
         pending = conn.execute(
             "SELECT * FROM pending_decisions "
-            "WHERE status = 'pending' AND source != 'kol_agent' "
+            "WHERE status = 'pending' AND source NOT IN ('kol_agent', 'kol_snapshot') "
             "ORDER BY created_at ASC "
             "LIMIT 5"
         ).fetchall()

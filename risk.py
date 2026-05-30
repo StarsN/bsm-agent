@@ -298,8 +298,8 @@ def evaluate_entry_quality(
     taker_trend = pct(snap.get("taker_trend_pct"))
 
     # ---- 硬否决：价格追高 ----
-    if "过热" in verdict:
-        hard_block.append(f"analyzer verdict 是过热预警")
+    if "健康" not in verdict:
+        hard_block.append(f"analyzer verdict: {verdict}")
     if ch4h is not None and ch4h > config.TRADING_MAX_CHANGE_4H_PCT:
         hard_block.append(f"4h 涨幅 {ch4h:+.1f}% 超过追高上限 {config.TRADING_MAX_CHANGE_4H_PCT}%")
     if ch24h is not None and ch24h > config.TRADING_MAX_CHANGE_24H_PCT:

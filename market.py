@@ -401,6 +401,9 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
         "depth_ask_1pct_usd": None,
         "depth_imbalance_pct": None,
         "klines_15m_count": 0,
+        "ma20_deviation_pct": None,     # MA20 乖离率（15m K线 × 20 = 5小时均线）
+        "klines_1h": None,              # 1H K线近6根 [O,H,L,C,Vol,QuoteVol]
+        "klines_4h": None,              # 4H K线近6根
     }
 
     # 1) 标记价 + 资金费率
@@ -486,8 +489,30 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
             # 4h 前（16 根）
             if len(closes) >= 17:
                 snap["change_4h_pct"] = (now_price - closes[-17]) / closes[-17] * 100
+            if len(closes) >= 20:
+                ma20 = sum(closes[-20:]) / 20
+                if ma20 > 0:
+                    snap["ma20_deviation_pct"] = (now_price - ma20) / ma20 * 100
         except (TypeError, ValueError, ZeroDivisionError):
             pass
+
+    # 聚合 K 线：从 15m 蜡烛合成 1H/4H [O,H,L,C,Vol,QuoteVol]
+    def _agg_candle(group):
+        try:
+            return [
+                float(group[0][1]), float(max(float(c[2]) for c in group)),
+                float(min(float(c[3]) for c in group)), float(group[-1][4]),
+                sum(float(c[5]) for c in group), sum(float(c[7]) for c in group),
+            ]
+        except Exception:
+            return None
+
+    if klines and len(klines) >= 24:
+        n = len(klines)
+        snap["klines_1h"] = list(filter(None, (_agg_candle(klines[i:i+4]) for i in range(n-24, n, 4))))
+    if klines and len(klines) >= 96:
+        n = len(klines)
+        snap["klines_4h"] = list(filter(None, (_agg_candle(klines[i:i+16]) for i in range(n-96, n, 16))))
 
     if heavy:
         # 4b) 48h 价格变化 —— 用 1h 粒度，取 49 个点
@@ -565,3 +590,19 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
     )
 
     return snap
+
+
+def get_daily_klines(token: str, limit: int = 7) -> list[list[float]] | None:
+    """拉日线 [O,H,L,C,Vol,QuoteVol] × limit，供 KOL 策略用"""
+    klines = _http_get(
+        f"{FAPI_BASE}/fapi/v1/klines",
+        {"symbol": _perp_symbol(token), "interval": "1d", "limit": limit},
+        timeout=5,
+    )
+    if klines and len(klines) >= limit:
+        try:
+            return [[float(k[1]), float(k[2]), float(k[3]), float(k[4]),
+                     float(k[5]), float(k[7])] for k in klines]
+        except Exception:
+            pass
+    return None

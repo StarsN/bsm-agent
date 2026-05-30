@@ -72,7 +72,15 @@ _flush_lock = threading.Lock()
 _kol_collected = {}
 _kol_last_flush = 0.0
 _kol_round = 0
-_kol_running = False          # 防重叠：上一轮未完成时不触发
+_kol_running = False          #
+
+# KOL 认知快照 Agent 独立累积池
+_kol_snapshot_collected = {}
+_kol_snapshot_last_flush = 0.0
+_kol_snapshot_round = 0
+_kol_snapshot_running = False
+
+# 防重叠：上一轮未完成时不触发
 
 # 无教训版 Agent 独立累积器
 _nl_collected = {}
@@ -176,6 +184,19 @@ def _run_kol_agent():
         _kol_running = False
 
 
+def _run_kol_snapshot_agent():
+    """后台执行 KOL 认知快照 Agent"""
+    global _kol_snapshot_running
+    try:
+        with storage.get_conn() as conn:
+            kol_agent.analyze_candidates_snapshot(conn)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        _kol_snapshot_running = False
+
+
 def _run_nl_agent():
     """后台触发无教训版 Agent（hermes cron）"""
     global _nl_running
@@ -194,7 +215,7 @@ def _run_nl_agent():
 
 
 def _collect_loop():
-    global _collected, _last_flush, _kol_collected, _kol_last_flush, _kol_round, _kol_running, _nl_collected, _nl_last_flush, _nl_round, _nl_running
+    global _collected, _last_flush, _kol_collected, _kol_last_flush, _kol_round, _kol_running, _nl_collected, _nl_last_flush, _nl_round, _nl_running, _kol_snapshot_collected, _kol_snapshot_last_flush, _kol_snapshot_round, _kol_snapshot_running
     poll_seconds = getattr(config, "AGENT_COLLECT_POLL_SECONDS", 5)
     cache_ttl = getattr(config, "AGENT_COLLECT_CACHE_TTL", 5)
 
@@ -227,12 +248,14 @@ def _collect_loop():
 
     interval_seconds = _read_interval() * 60
     kol_interval_seconds = _read_kol_interval() * 60
+    kol_snapshot_interval_seconds = kol_interval_seconds
     nl_interval_seconds = _read_nl_interval() * 60
     now_start = time.time()
     # 偏移量防撞车: KOL(8,offset=0) 主(16,offset=1) NL(16,offset=3) AI(32,offset=5) 永不重叠
     _ai_regime_last_refresh = now_start - (32*60 - 5*60)  # 首次 5 分钟后
     _last_flush       = now_start - (16*60 - 1*60)   # 首次 1 分钟后
-    _kol_last_flush   = now_start                      # 首次 8 分钟后
+    _kol_last_flush            = now_start               # 首次 8 分钟后
+    _kol_snapshot_last_flush   = now_start - (8*60 - 4*60)  # offset=4
     _nl_last_flush    = now_start - (16*60 - 3*60)   # 首次 3 分钟后
     _last_heartbeat = 0
     ts_settings = {}  # 心跳刷新，供 flush 点读取开关
@@ -275,7 +298,7 @@ def _collect_loop():
                     }
 
             # === KOL Agent：独立数据源，异常度筛选 ===
-            if ts_settings.get("kol_agent_enabled", True):
+            if ts_settings.get("kol_agent_enabled", True) or ts_settings.get("kol_snapshot_enabled", True):
                 kol_candidates = _cached("kol_candidates_scan", cache_ttl, _scan_candidates_kol)
                 for c in kol_candidates:
                     if not kol_agent.kol_is_interesting(c):
@@ -289,6 +312,19 @@ def _collect_loop():
                         "pass_count": c.get("pass_count", 0),
                         "signal_key": c.get("signal_key", ""),
                     }
+                if ts_settings.get("kol_snapshot_enabled", True):
+                    for c in kol_candidates:
+                        if not kol_agent.kol_is_interesting(c):
+                            continue
+                        _kol_snapshot_collected[c["token"]] = {
+                            "token": c["token"],
+                            "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
+                            "tier": c.get("tier", ""),
+                            "passed": 1,
+                            "hard_blocks": json.dumps(c.get("hard_block", [])),
+                            "pass_count": c.get("pass_count", 0),
+                            "signal_key": c.get("signal_key", ""),
+                        }
 
             now = time.time()
             if now - _last_heartbeat >= 60:
@@ -383,6 +419,22 @@ def _collect_loop():
                       f"（第{_kol_round}轮），触发 DeepSeek", flush=True)
                 threading.Thread(target=_run_kol_agent, daemon=True).start()
 
+            # === KOL 认知快照 Agent 独立定时触发 ===
+            if (ts_settings.get("kol_snapshot_enabled", True) and _kol_snapshot_collected
+                    and not _kol_snapshot_running and now - _kol_snapshot_last_flush >= kol_snapshot_interval_seconds):
+                batch = list(_kol_snapshot_collected.values())
+                with storage.get_conn() as conn:
+                    storage.kol_candidates_insert_batch(conn, _kol_snapshot_round + 1, batch)
+                    storage.kol_candidates_purge_old(conn, keep_last_rounds=30)
+                _kol_snapshot_last_flush = now
+                _kol_snapshot_running = True
+                _kol_snapshot_round += 1
+                _kol_snapshot_collected.clear()
+                ts_str = datetime.now().strftime("%H:%M:%S")
+                print(f"[kol-snapshot-collect] {ts_str} 入库 {len(batch)} 个候选"
+                      f"（第{_kol_snapshot_round}轮），触发 DeepSeek", flush=True)
+                threading.Thread(target=_run_kol_snapshot_agent, daemon=True).start()
+
             # === 无教训版 Agent 独立定时触发 ===
             if (ts_settings.get("nl_agent_enabled", True) and _nl_collected
                     and not _nl_running and now - _nl_last_flush >= nl_interval_seconds):
@@ -444,6 +496,11 @@ class TradingSettingsBody(BaseModel):
     kol_token_cooldown_minutes: int | None = None
     limit_order_timeout_seconds: int | None = None
     system_auto_trade_enabled: bool | None = None
+    kol_snapshot_enabled: bool | None = None
+    kol_snapshot_interval_minutes: int | None = None
+    strategy_initial_kol_snapshot: float | None = None
+    kol_snapshot_min_confidence: int | None = None
+    kol_snapshot_llm_provider: str | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -846,7 +903,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -891,7 +948,7 @@ def api_trading_reset_strategy(body: TradingResetStrategyBody):
         raise HTTPException(400, "需要 confirm=true 以确认重置")
     strategy = body.strategy.strip().lower()
     valid = {"agent", "heat_agent", "heat_agent_lessons", "agent_no_lessons",
-             "kol_agent", "system", "manual"}
+             "kol_agent", "kol_snapshot", "system", "manual"}
     if strategy not in valid:
         raise HTTPException(400, f"无效策略: {body.strategy}")
     with storage.get_conn() as conn:
@@ -1014,7 +1071,8 @@ def api_agent_overview(strategy: str = "agent"):
             # 待处理决策（按 source 过滤策略）
             src_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history",
                        "agent_no_lessons": "nl_candidates", "heat_agent_lessons": "token_heat_history_lessons",
-                       "kol_agent": "kol_agent"}
+                       "kol_agent": "kol_agent",
+                       "kol_snapshot": "kol_snapshot"}
             src = src_map.get(strategy, "agent_candidates")
             pending = conn.execute(
                 "SELECT COUNT(*) FROM pending_decisions WHERE status='pending' AND source=?",
@@ -1115,7 +1173,8 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
     # strategy → pending_decisions source 映射
     source_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history",
                   "agent_no_lessons": "nl_candidates", "heat_agent_lessons": "token_heat_history_lessons",
-                  "kol_agent": "kol_agent"}
+                  "kol_agent": "kol_agent",
+                       "kol_snapshot": "kol_snapshot"}
     src = source_map.get(strategy, "agent_candidates")
     with storage.get_conn() as conn:
         journal_total = conn.execute(
@@ -1563,6 +1622,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
+              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
           </div>
 </div>
   <a href="/dashboard">📊 市场全景</a>
@@ -2260,6 +2320,7 @@ async function saveTradingSettings() {
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
     agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
     kol_agent_interval_minutes: Number(document.getElementById('trade-kol-interval').value),
+    kol_snapshot_interval_minutes: Number(document.getElementById('trade-kol-snapshot-interval').value),
     agent_data_source: document.getElementById('trade-data-source').value,
   };
   try {
@@ -2563,6 +2624,7 @@ tr:hover { background: #1f2536; }
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
+              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
               </div>
   </div>
   <a href="/dashboard">📊 市场全景</a>
@@ -3246,6 +3308,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
     <a href="/agent-kol">Agent-KOL 监控</a>
+              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
   </div>
 </div>
   <a href="/dashboard">📊 市场全景</a>
@@ -3308,6 +3371,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       <input id="trade-strategy-kol" type="number" min="1" step="1">
     </div>
     <div>
+      <label>KOL认知快照 初始 USDT</label>
+      <input id="trade-strategy-kol-snapshot" type="number" min="1" step="1">
+    </div>
+    <div>
       <label>无教训版初始 USDT</label>
       <input id="trade-strategy-nl" type="number" min="1" step="1">
     </div>
@@ -3336,6 +3403,13 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       </select>
     </div>
     <div>
+      <label>Agent-KOL认知快照</label>
+      <select id="trade-kol-snapshot-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
       <label>Agent-KOL</label>
       <select id="trade-kol-switch">
         <option value="true">启用</option>
@@ -3352,6 +3426,13 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <div>
       <label>Agent-热度有教训</label>
       <select id="trade-heat-lessons-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
+      <label>系统策略自动开仓</label>
+      <select id="trade-system-auto-switch">
         <option value="true">启用</option>
         <option value="false">关闭</option>
       </select>
@@ -3377,13 +3458,6 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <option value="false">关闭</option>
       </select>
     </div>
-    <div>
-      <label>系统策略自动开仓</label>
-      <select id="trade-system-auto-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
   </div>
 </div>
 
@@ -3403,8 +3477,19 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       <input id="trade-kol-interval" type="number" min="10" max="480" step="5">
     </div>
     <div>
+      <label>Agent-KOL认知快照 触发间隔（分钟）</label>
+      <input id="trade-kol-snapshot-interval" type="number" min="10" max="480" step="5">
+    </div>
+    <div>
       <label>KOL Agent LLM 提供商</label>
       <select id="trade-kol-provider">
+        <option value="deepseek">DeepSeek</option>
+        <option value="nvidia">NVIDIA</option>
+      </select>
+    </div>
+    <div>
+      <label>KOL认知快照 LLM 提供商</label>
+      <select id="trade-kol-snapshot-provider">
         <option value="deepseek">DeepSeek</option>
         <option value="nvidia">NVIDIA</option>
       </select>
@@ -3443,6 +3528,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <option value="heat_agent_lessons">Agent-热度有教训</option>
         <option value="agent_no_lessons">Agent-无教训</option>
         <option value="kol_agent">Agent-KOL</option>
+        <option value="kol_snapshot">Agent-KOL认知快照</option>
         <option value="system">系统自动</option>
         <option value="manual">手动</option>
       </select>
@@ -3492,9 +3578,13 @@ async function loadSettings() {
     document.getElementById('trade-ai-regime-interval').value = s.ai_regime_interval_minutes ?? 30;
     document.getElementById('trade-limit-timeout').value = s.limit_order_timeout_seconds ?? 600;
     document.getElementById('trade-kol-provider').value = s.kol_llm_provider || 'deepseek';
+    document.getElementById('trade-kol-snapshot-provider').value = s.kol_snapshot_llm_provider || 'nvidia';
     document.getElementById('trade-agent-switch').value = s.agent_trade_enabled ?? true;
     document.getElementById('trade-heat-switch').value = s.heat_agent_enabled ?? true;
     document.getElementById('trade-kol-switch').value = s.kol_agent_enabled ?? true;
+    document.getElementById('trade-kol-snapshot-switch').value = s.kol_snapshot_enabled ?? true;
+    document.getElementById('trade-kol-snapshot-interval').value = s.kol_snapshot_interval_minutes ?? 8;
+    document.getElementById('trade-strategy-kol-snapshot').value = s.strategy_initial_kol_snapshot ?? 1000;
     document.getElementById('trade-nl-switch').value = s.nl_agent_enabled ?? true;
     document.getElementById('trade-heat-lessons-switch').value = s.heat_agent_lessons_enabled ?? true;
     document.getElementById('trade-kol-min-conf').value = s.kol_agent_min_confidence ?? 70;
@@ -3521,19 +3611,23 @@ async function saveTradingSettings() {
     strategy_initial_system: Number(document.getElementById('trade-strategy-system').value),
     strategy_initial_manual: Number(document.getElementById('trade-strategy-manual').value),
     strategy_initial_kol_agent: Number(document.getElementById('trade-strategy-kol').value),
+    strategy_initial_kol_snapshot: Number(document.getElementById('trade-strategy-kol-snapshot').value),
     strategy_initial_agent_no_lessons: Number(document.getElementById('trade-strategy-nl').value),
     strategy_initial_heat_agent_lessons: Number(document.getElementById('trade-strategy-heat-lessons').value),
     agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
     agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
     kol_agent_interval_minutes: Number(document.getElementById('trade-kol-interval').value),
+    kol_snapshot_interval_minutes: Number(document.getElementById('trade-kol-snapshot-interval').value),
     nl_agent_interval_minutes: Number(document.getElementById('trade-nl-interval').value),
     heat_agent_lessons_trigger_interval: Number(document.getElementById('trade-heat-lessons-interval').value),
     ai_regime_interval_minutes: Number(document.getElementById('trade-ai-regime-interval').value),
     limit_order_timeout_seconds: Number(document.getElementById('trade-limit-timeout').value),
     kol_llm_provider: document.getElementById('trade-kol-provider').value,
+    kol_snapshot_llm_provider: document.getElementById('trade-kol-snapshot-provider').value,
     agent_trade_enabled: document.getElementById('trade-agent-switch').value === 'true',
     heat_agent_enabled: document.getElementById('trade-heat-switch').value === 'true',
     kol_agent_enabled: document.getElementById('trade-kol-switch').value === 'true',
+    kol_snapshot_enabled: document.getElementById('trade-kol-snapshot-switch').value === 'true',
     nl_agent_enabled: document.getElementById('trade-nl-switch').value === 'true',
     heat_agent_lessons_enabled: document.getElementById('trade-heat-lessons-switch').value === 'true',
     kol_agent_min_confidence: parseInt(document.getElementById('trade-kol-min-conf').value) || 70,
@@ -3648,7 +3742,7 @@ def api_strategy_stats():
         )]
         # 为 KOL 策略持仓补 trend + confidence
         for p in positions:
-            if p.get("strategy") != "kol_agent":
+            if p.get("strategy") not in ("kol_agent", "kol_snapshot"):
                 continue
             row = conn.execute(
                 "SELECT trend, confidence FROM kol_analyses WHERE token=? AND created_at <= ? ORDER BY id DESC LIMIT 1",
@@ -3707,15 +3801,15 @@ def api_ai_regime_refresh():
 
 
 @app.get("/api/kol/llm-logs")
-def api_kol_llm_logs(limit: int = 30):
+def api_kol_llm_logs(limit: int = 30, strategy: str = ""):
     with storage.get_conn() as conn:
-        return storage.kol_llm_logs_recent(conn, limit)
+        return storage.kol_llm_logs_recent(conn, limit, strategy=strategy)
 
 
 @app.get("/api/kol/analyses")
-def api_kol_analyses(symbol: str = ""):
+def api_kol_analyses(symbol: str = "", strategy: str = ""):
     with storage.get_conn() as conn:
-        rows = storage.kol_analyses_latest(conn, symbol=symbol)
+        rows = storage.kol_analyses_latest(conn, symbol=symbol, strategy=strategy)
     tokens = list(dict.fromkeys(r["token"] for r in rows))
     by_token = {}
     for r in rows:
@@ -3838,6 +3932,7 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
+              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
           </div>
   </div>
   <a href="/dashboard">📊 市场全景</a>
@@ -3977,7 +4072,7 @@ function renderTimelineHeader(token, count) {
 
 async function loadTimeline(token) {
   try {
-    var r = await fetch('/api/kol/analyses?symbol=' + encodeURIComponent(token));
+    var r = await fetch('/api/kol/analyses?strategy=' + (_strategy || '') + '&symbol=' + encodeURIComponent(token));
     var d = await r.json();
     var list = (d.by_token && d.by_token[token]) ? d.by_token[token] : [];
     document.getElementById('cards-list').innerHTML = list.length
@@ -3989,9 +4084,11 @@ async function loadTimeline(token) {
   }
 }
 
+var _strategy = new URLSearchParams(window.location.search).get("strategy") || "";
+
 async function loadTokens() {
   try {
-    var r = await fetch('/api/kol/analyses');
+    var r = await fetch('/api/kol/analyses?strategy=' + (_strategy || ''));
     var d = await r.json();
     var tokens = d.tokens || [];
     _byToken = d.by_token || {};
@@ -4102,6 +4199,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
+              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
               </div>
   </div>
   <a href="/dashboard">📊 市场全景</a>
@@ -4132,6 +4230,7 @@ async function load() {
       heat_agent: '<span class="strategy-badge" style="background:#3a1f5f;color:#c4a0ff">📡 热度Agent</span>',
       system: '<span class="strategy-badge badge-system">⚙ 系统策略</span>',
       manual: '<span class="strategy-badge badge-manual">👆 手动策略</span>',
+      kol_snapshot: '<span class="strategy-badge" style="background:#2a1a3a;color:#c4a0ff">KOL快照</span>',
       kol_agent: '<span class="strategy-badge" style="background:#1a2a4a;color:#58a6ff">🧠 KOL策略</span>',
       heat_agent_lessons: '<span class="strategy-badge" style="background:#3a2a1a;color:#f0a040">🔥 热度有教训</span>',
       agent_no_lessons: '<span class="strategy-badge" style="background:#2a2a1a;color:#d29922">📋 无教训对照</span>',
@@ -4223,12 +4322,81 @@ load();
 """
 
 
+KOL_SNAPSHOT_MONITOR_HTML = AGENT_HTML.replace(
+    "<title>Agent-合约扫描</title>", "<title>Agent-KOL 认知快照</title>"
+).replace(
+    "<h1>Agent-合约扫描</h1>", "<h1>Agent-KOL 认知快照</h1>"
+).replace(
+    "合约扫描 · 自主决策开仓", "KOL认知快照 · 决策时间线 · LLM日志 · <a href='/kol?strategy=kol_snapshot' style='color:var(--accent);text-decoration:none'>📊 查看K线分析 →</a>"
+).replace(
+    "strategy_initial_agent", "strategy_initial_kol_snapshot"
+).replace(
+    "loadLessons(true), ", "").replace(
+    "  loadLessons(true);\n", ""
+).replace(
+    "p.strategy === 'agent'", "p.strategy === 'kol_snapshot'"
+).replace(
+    "const AGENT_STRATEGY = 'agent'", "const AGENT_STRATEGY = 'kol_snapshot'"
+).replace(
+    "'/api/agent/overview'", "'/api/agent/overview?strategy='+AGENT_STRATEGY"
+).replace(
+    "'/api/agent/journal?limit='", "'/api/agent/journal?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/timeline?limit='", "'/api/agent/timeline?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/lessons?limit='", "'/api/agent/lessons?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    '<a href="/agent" class="active">', '<a href="/agent">'
+).replace(
+    '<a href="/agent-kol-snapshot">', '<a href="/agent-kol-snapshot" class="active">'
+).replace(
+    '''<!-- 底部：教训库 + 决策时间线 -->
+<div class="grid-bottom">
+  <div class="panel">
+    <h2>教训库</h2>
+    <div class="stats-bar" id="lesson-stats"></div>
+    <div id="lessons-list"></div>
+  </div>
+
+  <div class="panel">
+    <h2>决策时间线</h2>''',
+    '''<!-- 底部：LLM日志 + 决策时间线 -->
+<div class="grid-bottom">
+  <div class="panel">
+    <h2>LLM 调用日志</h2>
+    <div id="llm-logs"></div>
+  </div>
+  <div class="panel">
+    <h2>决策时间线</h2>'''
+).replace(
+    '</body>', '''<script>
+var _strategy = "kol_snapshot";
+async function loadLLMLogs(){
+  try{
+    const r=await fetch("/api/kol/llm-logs?limit=30&strategy=" + _strategy);
+    const logs=await r.json();
+    if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
+    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th></tr>";
+    for(const l of logs){
+      let t="";if(l.created_at){const d=new Date(l.created_at+"Z");d.setHours(d.getHours()+8);t=d.toISOString().replace("T"," ").substring(5,16);}
+      const ok=l.success?"<span class=green>OK("+l.analyses_count+"条)</span>":"<span class=red>FAIL</span>";
+      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td></tr>";
+    }
+    document.getElementById("llm-logs").innerHTML=h+"</table>";
+  }catch(e){}
+}
+loadLLMLogs();
+setInterval(loadLLMLogs,60000);
+</script>
+</body>'''
+)
+
 KOL_MONITOR_HTML = AGENT_HTML.replace(
     "<title>Agent-合约扫描</title>", "<title>Agent-KOL 监控</title>"
 ).replace(
     "<h1>Agent-合约扫描</h1>", "<h1>Agent-KOL 监控</h1>"
 ).replace(
-    "合约扫描 · 自主决策开仓", "合约扫描 · 决策时间线 · LLM日志 · <a href='/kol' style='color:var(--accent);text-decoration:none'>📊 查看K线分析 →</a>"
+    "合约扫描 · 自主决策开仓", "合约扫描 · 决策时间线 · LLM日志 · <a href='/kol?strategy=kol_agent' style='color:var(--accent);text-decoration:none'>📊 查看K线分析 →</a>"
 ).replace(
     "strategy_initial_agent", "strategy_initial_kol_agent"
 ).replace(
@@ -4271,9 +4439,10 @@ KOL_MONITOR_HTML = AGENT_HTML.replace(
     <h2>决策时间线</h2>'''
 ).replace(
     '</body>', '''<script>
+var _strategy = "kol_agent";
 async function loadLLMLogs(){
   try{
-    const r=await fetch("/api/kol/llm-logs?limit=30");
+    const r=await fetch("/api/kol/llm-logs?limit=30&strategy=" + _strategy);
     const logs=await r.json();
     if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
     let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th></tr>";
@@ -4306,6 +4475,14 @@ def agent_nl_page():
         content=NL_AGENT_HTML,
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
+
+@app.get("/agent-kol-snapshot", response_class=HTMLResponse)
+def agent_kol_snapshot_page():
+    return HTMLResponse(
+        content=KOL_SNAPSHOT_MONITOR_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
 
 @app.get("/agent-kol", response_class=HTMLResponse)
 def agent_kol_page():
@@ -4406,6 +4583,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       <a href="/agent-heat-lessons">Agent-热度有教训</a>
       <a href="/agent-nl">Agent-无教训</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
+              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
     </div>
   </div>
   <a href="/dashboard" class="active">📊 市场全景</a>

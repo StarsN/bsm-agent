@@ -22,7 +22,6 @@ from scraper import SquareScraper
 from analyzer import extract_tokens_from_text, compute_short_scores
 from filters import is_likely_human, post_passes_quality
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
-import liquidation
 from signals import analyze as analyze_signals
 
 
@@ -56,10 +55,6 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
     """
     if not tokens_to_check:
         return 0
-    # 确保爆仓流已启动
-    liquidation.start()
-    # 取本轮爆仓聚合数据
-    liq_data = liquidation.get_and_reset()
     try:
         futures_set = get_futures_symbols()
     except Exception as e:
@@ -104,12 +99,9 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
                 if k not in snap or snap.get(k) is None:
                     snap[k] = v
 
-        # 合并爆仓数据
-        lq = liq_data.get(up, {})
-        if lq:
-            for k, v in lq.items():
-                if k not in snap:
-                    snap[k] = v
+        # 计算 OI/市值（杠杆率），存为百分比值
+        if snap.get("market_cap_usd") and snap.get("oi_usd") and snap["market_cap_usd"] > 0:
+            snap["oi_marketcap_ratio"] = snap["oi_usd"] / snap["market_cap_usd"] * 100
 
         social_score = social_map.get(token, 0.0)
         try:

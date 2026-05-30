@@ -365,6 +365,68 @@ def get_multi_token_okx_metrics(tokens: list[str], heavy: bool = False) -> dict:
             except Exception:
                 pass
 
+    # === 市值（一次拉 TOP 100，按 token 匹配；未命中的逐个补拉）===
+    mc_data = _okx(["market", "filter", "--instType", "SPOT",
+                    "--sortBy", "marketCapUsd", "--sortOrder", "desc",
+                    "--limit", "100", "--quoteCcy", "USDT"])
+    if mc_data and isinstance(mc_data, list):
+        for row in mc_data[0].get("rows", []):
+            t = row.get("baseCcy", "").upper()
+            if t in result:
+                result[t]["market_cap_usd"] = float(row.get("marketCapUsd", 0))
+                result[t]["market_cap_rank"] = int(row.get("rank", 0))
+
+    # 补拉：TOP 100 未覆盖的 token，逐个查市值
+    missing_mc = [t for t in result if "market_cap_usd" not in result[t]]
+    if missing_mc:
+        def _fetch_mc(token: str):
+            data = _okx(["market", "filter", "--instType", "SPOT",
+                         "--baseCcy", token, "--limit", "1"])
+            try:
+                rows = data[0].get("rows", []) if data and isinstance(data, list) else []
+                if rows and rows[0].get("baseCcy", "").upper() == token:
+                    return token, {
+                        "market_cap_usd": float(rows[0].get("marketCapUsd", 0)),
+                        "market_cap_rank": int(rows[0].get("rank", 0)),
+                    }
+            except Exception:
+                pass
+            return token, {}
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(_fetch_mc, t): t for t in missing_mc}
+            for f in as_completed(futures):
+                try:
+                    token, data = f.result()
+                    if data:
+                        result[token].update(data)
+                except Exception:
+                    pass
+
+    # === 聪明钱共识信号（按候选币列表直接查，100% 覆盖）===
+    if result:
+        sm_data = _okx(["smartmoney", "signal-overview-by-filter",
+                        "--instCcyList", ",".join(result.keys()),
+                        "--sortBy", "pnl", "--period", "7"], live=True)
+        if sm_data and isinstance(sm_data, dict):
+            sm_items = sm_data.get("data", [])
+            if isinstance(sm_items, list):
+                for item in sm_items:
+                    t = item.get("ccy", "").upper()
+                    if t in result:
+                        lsr = item.get("longShortRatio", {})
+                        nt = item.get("notional", {})
+                        wr = item.get("winRate", {})
+                        result[t].update({
+                            "sm_long_ratio": float(lsr.get("longRatio", 0)) * 100,
+                            "sm_net_notional_usdt": float(nt.get("netNotionalUsdt", 0)),
+                            "sm_long_avg_entry": float(nt.get("smartMoneyLongAvgEntry", 0)),
+                            "sm_short_avg_entry": float(nt.get("smartMoneyShortAvgEntry", 0)),
+                            "sm_avg_long_win_rate": float(wr.get("avgLongWinRate", 0)) * 100,
+                            "sm_avg_short_win_rate": float(wr.get("avgShortWinRate", 0)) * 100,
+                            "sm_traders_with_position": int(item.get("tradersWithPosition", 0)),
+                        })
+
     return result
 
 
@@ -534,48 +596,8 @@ def _parse_llm_response(raw: str | None, alpha_data: dict) -> dict:
     }
 
 
-def get_ai_regime(alpha_data: dict) -> dict:
-    """AI 市场研判 — 后台异步 LLM，页面永远不阻塞"""
-    import threading
-    global _ai_cache, _ai_loading
-
-    now = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%H:%M:%S")
-
-    # alpha 数据不可用时直接返回 fallback
-    if "error" in alpha_data or "total" not in alpha_data:
-        return {
-            "current_regime": "chop", "confidence": 0, "model": "N/A",
-            "updated_at": now, "judgment_text": "Alpha 池数据不可用，无法生成研判",
-            "evidence_support": [], "evidence_counter": "", "data_sources": [],
-            "timeline_24h": _load_timeline(),
-        }
-
-    # 从 DB 读间隔配置
-    import config as _cfg
-    try:
-        import storage as _st
-        with _st.get_conn() as conn:
-            ts = _st.trading_settings_get(conn)
-        cache_ttl = int(ts.get("ai_regime_interval_minutes", 30)) * 60
-    except Exception:
-        cache_ttl = getattr(_cfg, "AI_REGIME_INTERVAL_MINUTES", 30) * 60
-
-    # 更新 timeline（本地操作不花钱）
-    regime_key = alpha_data.get("altseason", "chop")
-    _update_timeline(now, regime_key, 50)
-
-    # 缓存命中 → 秒返
-    if time.time() - _ai_cache["ts"] < cache_ttl and _ai_cache["data"]:
-        d = dict(_ai_cache["data"])
-        d["updated_at"] = now
-        return d
-
-    # 缓存 miss + 正在加载 → 返回占位，不重复启动
-    if _ai_loading:
-        parsed = _parse_llm_response(None, alpha_data)
-        return _build_result(parsed, now, cache_ttl, loading=True)
-
-    # 缓存 miss + 空闲 → 启动后台线程，秒返占位
+def _build_ai_regime_prompt(alpha_data: dict):
+    """构建 AI Regime LLM 的 system/user prompt"""
     system = """你是加密货币量化分析师。根据提供的 Alpha 池数据，用中文输出市场研判。
 
 返回 JSON：
@@ -599,6 +621,45 @@ def get_ai_regime(alpha_data: dict) -> dict:
 
 请给出市场研判。"""
 
+    return system, user
+
+
+def _ai_cache_ttl():
+    """从 DB/config 读取 AI Regime 缓存 TTL（秒）"""
+    import config as _cfg
+    try:
+        import storage as _st
+        with _st.get_conn() as conn:
+            ts = _st.trading_settings_get(conn)
+        return int(ts.get("ai_regime_interval_minutes", 32)) * 60
+    except Exception:
+        return getattr(_cfg, "AI_REGIME_INTERVAL_MINUTES", 32) * 60
+
+
+def _ai_cache_age() -> tuple:
+    """返回 (age_seconds, age_display)"""
+    age_seconds = int(time.time() - _ai_cache["ts"])
+    if age_seconds < 60:
+        return age_seconds, "几秒前"
+    elif age_seconds < 3600:
+        return age_seconds, f"{age_seconds // 60}分钟前"
+    else:
+        return age_seconds, f"{age_seconds // 3600}小时前"
+
+
+def refresh_ai_regime(alpha_data: dict):
+    """collector 专用：无条件启动后台 LLM 刷新缓存"""
+    if "error" in alpha_data or "total" not in alpha_data:
+        return
+
+    import threading
+    global _ai_loading
+    if _ai_loading:
+        return
+
+    system, user = _build_ai_regime_prompt(alpha_data)
+    cache_ttl = _ai_cache_ttl()
+
     _ai_loading = True
 
     def _bg_fetch():
@@ -621,8 +682,34 @@ def get_ai_regime(alpha_data: dict) -> dict:
 
     threading.Thread(target=_bg_fetch, daemon=True, name="ai-regime-llm").start()
 
-    parsed = _parse_llm_response(None, alpha_data)
-    return _build_result(parsed, now, cache_ttl, loading=True)
+
+def get_ai_regime() -> dict:
+    """纯读缓存 — 页面 API 专用，永远不阻塞也不触发 LLM"""
+    global _ai_cache
+
+    import config as _cfg
+    now = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%H:%M:%S")
+    cache_ttl = _ai_cache_ttl()
+    age_seconds, age_display = _ai_cache_age()
+
+    if _ai_cache["data"]:
+        d = dict(_ai_cache["data"])
+        d["updated_at"] = now
+        d["cache_age_seconds"] = age_seconds
+        d["cache_age_display"] = age_display
+        return d
+
+    return {
+        "current_regime": "chop", "confidence": 0,
+        "model": getattr(_cfg, "AI_REGIME_MODEL", "deepseek-v4-pro"),
+        "updated_at": now,
+        "refresh_interval_min": cache_ttl // 60,
+        "judgment_text": "AI 研判生成中，请稍后刷新...",
+        "evidence_support": [], "evidence_counter": "", "data_sources": [],
+        "timeline_24h": _load_timeline(),
+        "cache_age_seconds": -1,
+        "cache_age_display": "等待首次刷新",
+    }
 
 
 def _build_result(parsed: dict, now: str, cache_ttl: int, loading: bool = False) -> dict:

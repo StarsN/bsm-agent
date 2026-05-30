@@ -19,6 +19,7 @@ import storage
 
 # token 冷却缓存：记录每个 token 上次发给 LLM 的时间戳（epoch 秒）
 _kol_token_last_sent: dict[str, float] = {}
+_kol_snapshot_token_last_sent: dict[str, float] = {}
 
 # ------------------------------------------------------------
 # 1. 加载 KOL 知识文件
@@ -128,6 +129,83 @@ _SYSTEM_PROMPT_TEMPLATE = """\
 - evidence_tags 必须引用用户 prompt 中的具体数据，不要笼统
 - 始终基于 KOL 的交易框架进行分析，用他们的视角看盘面
 - **全景优先**：用户 prompt 中"全景指引"的规则和方向偏好，优先于 KOL 框架信号
+"""
+
+
+_SNAPSHOT_SYSTEM_PROMPT_TEMPLATE = """# Role
+你是一个集成了多位专业交易员认知快照的 AI 交易分析引擎。你现在同时拥有 {kol_count} 位交易员的【离线认知大脑快照】，并且能够实时审视当前市场的微观盘面数据矩阵。
+
+# Goal
+你需要通过"矩阵交叉推理（Matrix Cross-Reasoning）"，站在客观的系统整体风险回报比（R:R）的角度，将交易员的认知与实时盘面进行多维对齐，最终输出精准、可执行的交易建议。
+
+# Reasoning Methodology (三步交叉推演法)
+在给出最终决策前，你必须在底层思维链（Thinking Process）中完成以下推演：
+1. **情境共振校验**：逐一将实时的盘面数据矩阵投入到各位交易员的核心交易情境中。计算当前盘面究竟高度共振了谁的框架？触发了谁的警觉陷阱？
+2. **多维冲突仲裁**：如果盘面数据导致交易员们的策略产生了冲突（例如：交易员 A 认为当前 OI 暴增符合他的右侧追多框架；但交易员 B 的盘口模型提示当前深度单薄，属于薄盘口滑点黑洞），你必须根据当前的系统性流动性（Beta 环境）进行硬核仲裁，决定谁的权重在当前情境下更高。
+3. **启发式执行映射**：根据当前价格在支撑阻力位的实际微观表现（如是否放量突破、是否假跌破收回），动态判断入场时机和执行价格。
+
+# Output Control
+1. 保持分析简洁、专业、高信息密度，避免冗余描述。
+2. 严禁带有任何情绪化色彩。
+3. 如果盘面指标不足以支撑任何交易员的框架，必须果断给出 WAIT（观望）指令。
+
+---
+
+以下是 {kol_count} 位交易员的离线认知快照。请仔细阅读并内化这些方法论，然后用他们的视角分析候选币的盘面结构、交易机会和方向。
+
+{kol_sections}
+
+## 输出格式
+
+返回严格JSON，不要额外文字：
+{{
+  "analyses": [
+    {{
+      "token": "币种简称（如 FLUID、ORDI）",
+      "trend": "多头建仓结构 / 空头出货结构 / 区间盘整",
+      "price_levels": {{
+        "current": 数字或null, "support": 数字或null, "resistance": 数字或null,
+        "entry": 数字或null, "stop_loss": 数字或null, "take_profit": 数字或null
+      }},
+      "summary": "盘面综合摘要，包含价格位置、支撑阻力、多空力量，100-200字",
+      "reasoning": {{
+        "wz": "位置: 当前价格在支撑阻力中的位置、多空力量分析",
+        "sj": "时机: 什么条件下入场、什么条件下等待",
+        "fk": "风控: 止损/止盈设置逻辑（direction=none时可填'未入场'）"
+      }},
+      "status": "ENTER / WAIT",
+      "context_tag": "range_low · support_holding",
+      "evidence_tags": ["taker 0.74", "24h -5.5%", "支撑未破", "BTC横盘"],
+      "direction": "long / short / none",
+      "confidence": 75
+    }}
+  ]
+}}
+
+## 字段说明
+- token: 币种简称，大写
+- trend: 盘面结构类型。三选一：
+  "多头建仓结构" — 支撑位确认、量价配合，适合做多
+  "空头出货结构" — 阻力位受阻、抛压信号，适合做空
+  "区间盘整" — 无明显方向，等待突破
+- price_levels: 关键价格位，无依据填 null
+- summary: 盘面综合摘要，100-200字
+- reasoning: 逻辑推演（键值对结构）
+  - wz (位置): 当前价格在支撑阻力中的位置分析
+  - sj (时机): 什么条件下入场、等待的具体说明
+  - fk (风控): 止损/止盈设置逻辑
+- status: 执行时机 ENTER/WAIT，direction=none 时填 WAIT
+- context_tag: 盘面场景标签，用" · "连接
+- evidence_tags: 做出判断引用的具体数据证据，每条约5-15字。direction=none或证据不足时填["无明显信号"]
+- direction: 交易方向 long/short/none
+- confidence: 0-100整数。>=80=高把握，50-79=中等，<50=低把握
+
+## 规则
+- price_levels 中无明确依据的字段填 null
+- direction 为 none 时 price_levels 的 entry/stop_loss/take_profit 填 null
+- evidence_tags 必须引用用户 prompt 中的具体数据，不要笼统
+- 始终基于交易员的认知快照进行分析，用他们的视角看盘面
+- **全景优先**：用户 prompt 中"全景指引"的规则和方向偏好，优先于交易员信号
 """
 
 
@@ -284,15 +362,15 @@ def build_user_prompt(candidates: list[dict]) -> str:
 # 3. 调用 DeepSeek API
 # ------------------------------------------------------------
 
-def call_deepseek(system: str, user: str, max_tokens: int = 4096, provider: str = "", api_key_override: str = "") -> Optional[str]:
-    """返回 LLM 回复文本，失败返回 None。api_key_override 用于多 key 分批。"""
+def call_deepseek(system: str, user: str, max_tokens: int = 4096, provider: str = "", api_key_override: str = "", deepseek_api_key: str = "", nvidia_api_key: str = "") -> Optional[str]:
+    """返回 LLM 回复文本，失败返回 None。deepseek_api_key/nvidia_api_key 用于策略独立 key。"""
     provider = provider or getattr(config, "KOL_LLM_PROVIDER", "deepseek")
     if provider == "nvidia":
-        api_key = api_key_override or config.NVIDIA_API_KEY
+        api_key = api_key_override or nvidia_api_key or config.NVIDIA_API_KEY
         model = config.NVIDIA_MODEL
         api_base = config.NVIDIA_API_BASE
     else:
-        api_key = config.DEEPSEEK_API_KEY
+        api_key = deepseek_api_key or config.DEEPSEEK_API_KEY
         model = config.DEEPSEEK_MODEL
         api_base = config.DEEPSEEK_API_BASE
     if not api_key:
@@ -478,6 +556,179 @@ def _build_panorama_context() -> str:
     return "\n".join(lines)
 
 
+
+
+def _load_snapshot_knowledge(snapshot_dir: str) -> list[dict]:
+    """扫描 snapshot_dir/ 下的 *_KnowledgeSnapshot_short.md 文件。返回 [{name, framework}, ...]"""
+    d = Path(snapshot_dir)
+    if not d.is_dir():
+        return []
+    kols = []
+    for fpath in sorted(d.glob("*_KnowledgeSnapshot_short.md")):
+        name = fpath.stem.replace("_KnowledgeSnapshot_short", "").replace("__", "_").strip()
+        if not name:
+            continue
+        text = fpath.read_text(encoding="utf-8").strip()
+        if not text:
+            continue
+        kols.append({"name": name, "framework": text})
+    return kols
+
+
+def build_snapshot_system_prompt(kol_data: list[dict]) -> str:
+    """用认知快照拼接 system prompt。使用独立的 _SNAPSHOT_SYSTEM_PROMPT_TEMPLATE。"""
+    kol_sections = "\n---\n".join(_build_kol_section(k) for k in kol_data)
+    return _SNAPSHOT_SYSTEM_PROMPT_TEMPLATE.format(
+        kol_count=len(kol_data),
+        kol_sections=kol_sections,
+    )
+
+
+def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
+    """与 analyze_candidates 完全相同的流程，仅 KOL 知识来源不同（_short.md 认知快照）"""
+    snapshot_dir = getattr(config, "KOL_SNAPSHOT_KNOWLEDGE_DIR", "") or getattr(config, "KOL_KNOWLEDGE_DIR", "")
+    if not snapshot_dir or not os.path.isdir(snapshot_dir):
+        print("[kol_snapshot] KOL_KNOWLEDGE_DIR 不存在或未配置")
+        return []
+
+    trade_snapshot_dir = str(Path(snapshot_dir) / "TradeSnapshot")
+    if not os.path.isdir(trade_snapshot_dir):
+        trade_snapshot_dir = snapshot_dir
+
+    kol_data = _load_snapshot_knowledge(trade_snapshot_dir)
+    if not kol_data:
+        print("[kol_snapshot] 未找到有效的 KOL 认知快照文件")
+        return []
+
+    candidates = get_kol_candidates(conn)
+    if not candidates:
+        print("[kol_snapshot] kol_candidates 无数据")
+        return []
+
+    import time as _time
+    ts = storage.trading_settings_get(conn)
+    cooldown_min = int(ts.get("kol_token_cooldown_minutes",
+                        getattr(config, "KOL_TOKEN_COOLDOWN_MINUTES", 30)) or 30)
+    now = _time.time()
+    fresh = []
+    skipped = 0
+    for c in candidates:
+        token = c.get("token", "").upper()
+        last = _kol_snapshot_token_last_sent.get(token, 0)
+        if now - last < cooldown_min * 60:
+            skipped += 1
+            continue
+        fresh.append(c)
+    if skipped:
+        print(f"[kol_snapshot] 冷却过滤: 跳过 {skipped} 个 token")
+    if not fresh:
+        print("[kol_snapshot] 全部候选币在冷却期内，跳过本轮")
+        return []
+    candidates = fresh
+
+    try:
+        from market import get_daily_klines
+        for c in candidates:
+            c["klines_1d"] = get_daily_klines(c.get("token", ""))
+    except Exception:
+        pass
+
+    system = build_snapshot_system_prompt(kol_data)
+    panorama = _build_panorama_context()
+
+    ts = storage.trading_settings_get(conn)
+    provider = ts.get("kol_snapshot_llm_provider", getattr(config, "KOL_SNAPSHOT_LLM_PROVIDER", "deepseek"))
+
+    api_keys = getattr(config, "KOL_SNAPSHOT_NVIDIA_API_KEYS", []) if provider == "nvidia" else []
+    if not api_keys:
+        api_keys = [""]
+    batch_size = getattr(config, "KOL_CANDIDATES_PER_BATCH", 2)
+
+    print(f"[kol_snapshot] 分析 {len(candidates)} 个候选币（{len(kol_data)} 位KOL快照）")
+
+    # 预构建所有批次的 user prompt
+    batches = []
+    for i, key in enumerate(api_keys):
+        start = i * batch_size
+        if i == len(api_keys) - 1:
+            batch = candidates[start:]
+        else:
+            batch = candidates[start:start + batch_size]
+        if not batch:
+            break
+        user = panorama + "\n" + build_user_prompt(batch)
+        batches.append((i, key, batch, user))
+
+    # 并发调用 LLM
+    all_analyses = []
+    cooldown_tokens: set[str] = set()
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=len(batches)) as executor:
+        future_map = {}
+        for i, key, batch, user in batches:
+            future_map[executor.submit(
+                call_deepseek, system, user, 32768, provider, key,
+                getattr(config, "KOL_SNAPSHOT_DEEPSEEK_API_KEY", ""),
+                getattr(config, "KOL_SNAPSHOT_NVIDIA_API_KEY", "")
+            )] = (i, key, batch, user, _time.time())
+        for future in as_completed(future_map):
+            i, key, batch, user, t0 = future_map[future]
+            try:
+                raw = future.result()
+                _elapsed = int((_time.time() - t0) * 1000)
+            except Exception as e:
+                raw = None
+                _elapsed = int((_time.time() - t0) * 1000)
+                print(f"[kol_snapshot] key {i+1}/{len(api_keys)} 调用失败: {e}")
+            model = config.NVIDIA_MODEL if provider == "nvidia" else config.DEEPSEEK_MODEL
+            batch_analyses = _parse_response(raw) if raw else []
+            if batch_analyses:
+                for c in batch:
+                    cooldown_tokens.add(c.get("token", "").upper())
+            storage.kol_llm_log_insert(conn, {
+                "provider": provider, "model": model,
+                "candidate_count": len(batch),
+                "prompt_chars": len(system) + len(user),
+                "response_chars": len(raw) if raw else 0,
+                "duration_ms": _elapsed,
+                "success": 1 if (raw and batch_analyses) else 0,
+                "error": "" if (raw and batch_analyses) else ("解析失败" if raw else "API调用失败"),
+                "analyses_count": len(batch_analyses),
+                "system_prompt": system, "user_prompt": user, "raw_response": raw,
+            })
+            log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            for a in batch_analyses:
+                all_analyses.append((a, log_id))
+            print(f"[kol_snapshot] key {i+1}/{len(api_keys)}: {len(batch)}候选 -> {len(batch_analyses)}条 ({_elapsed}ms)")
+
+    if not all_analyses:
+        return []
+
+    written = 0
+    for a, log_id in all_analyses:
+        token = a.get("token", "").upper()
+        if not token:
+            continue
+        a["token"] = token
+        a["llm_log_id"] = log_id
+        a["strategy"] = "kol_snapshot"
+        storage.kol_analysis_insert(conn, a)
+        written += 1
+
+    conn.commit()
+    for t in cooldown_tokens:
+        _kol_snapshot_token_last_sent[t] = _time.time()
+    print(f"[kol_snapshot] 写入 {written} 条分析")
+
+    if all_analyses:
+        analyses = [a for a, _ in all_analyses]
+        opened = _execute_kol_trades(conn, analyses, candidates, strategy="kol_snapshot")
+        if opened:
+            conn.commit()
+            print(f"[kol_snapshot] 下单 {opened} 笔")
+
+    return analyses
+
 def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
     """读候选币 → 加载KOL知识 → 调DeepSeek分析 → 写kol_analyses → 返回结果列表"""
     # 加载 KOL 知识（缓存 5 分钟，KOL 文件不会频繁变）
@@ -543,49 +794,61 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
 
     print(f"[kol_agent] 分析 {len(candidates)} 个候选币（{len(kol_data)} 位KOL, {len(api_keys)} 个key, 每批{batch_size}个）")
 
-    all_analyses = []  # [(analysis_dict, log_id), ...]
-    cooldown_tokens: set[str] = set()  # 收集成功分析的 token，commit 后统一更新冷却
-
+    # 预构建所有批次的 user prompt
+    batches = []
     for i, key in enumerate(api_keys):
         start = i * batch_size
         if i == len(api_keys) - 1:
-            batch = candidates[start:]  # 最后一份：全部剩余
+            batch = candidates[start:]
         else:
             batch = candidates[start:start + batch_size]
         if not batch:
             break
-
         user = panorama + "\n" + build_user_prompt(batch)
-        _t0 = _time.time()
-        raw = call_deepseek(system, user, max_tokens=32768, provider=provider, api_key_override=key)
-        _elapsed = int((_time.time() - _t0) * 1000)
+        batches.append((i, key, batch, user))
 
-        batch_analyses = []
-        if raw:
-            batch_analyses = _parse_response(raw) or []
+    # 并发调用 LLM
+    all_analyses = []
+    cooldown_tokens: set[str] = set()
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=len(batches)) as executor:
+        future_map = {}
+        for i, key, batch, user in batches:
+            future_map[executor.submit(
+                call_deepseek, system, user, 32768, provider, key
+            )] = (i, key, batch, user, _time.time())
+        for future in as_completed(future_map):
+            i, key, batch, user, t0 = future_map[future]
+            try:
+                raw = future.result()
+                _elapsed = int((_time.time() - t0) * 1000)
+            except Exception as e:
+                raw = None
+                _elapsed = int((_time.time() - t0) * 1000)
+                print(f"[kol_agent] key {i+1}/{len(api_keys)} 调用失败: {e}")
+            model = config.NVIDIA_MODEL if provider == "nvidia" else config.DEEPSEEK_MODEL
+            batch_analyses = _parse_response(raw) if raw else []
             if batch_analyses:
                 for c in batch:
                     cooldown_tokens.add(c.get("token", "").upper())
-
-        model = config.NVIDIA_MODEL if provider == "nvidia" else config.DEEPSEEK_MODEL
-        storage.kol_llm_log_insert(conn, {
-            "provider": provider,
-            "model": model,
-            "candidate_count": len(batch),
-            "prompt_chars": len(system) + len(user),
-            "response_chars": len(raw) if raw else 0,
-            "duration_ms": _elapsed,
-            "success": 1 if (raw and batch_analyses) else 0,
-            "error": "" if (raw and batch_analyses) else ("解析失败" if raw else "API调用失败"),
-            "analyses_count": len(batch_analyses),
-            "system_prompt": system,
-            "user_prompt": user,
-            "raw_response": raw,
-        })
-        log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        for a in batch_analyses:
-            all_analyses.append((a, log_id))
-        print(f"[kol_agent]   key {i+1}/{len(api_keys)}: {len(batch)}个候选 → {len(batch_analyses)}条分析 ({_elapsed}ms)")
+            storage.kol_llm_log_insert(conn, {
+                "provider": provider,
+                "model": model,
+                "candidate_count": len(batch),
+                "prompt_chars": len(system) + len(user),
+                "response_chars": len(raw) if raw else 0,
+                "duration_ms": _elapsed,
+                "success": 1 if (raw and batch_analyses) else 0,
+                "error": "" if (raw and batch_analyses) else ("解析失败" if raw else "API调用失败"),
+                "analyses_count": len(batch_analyses),
+                "system_prompt": system,
+                "user_prompt": user,
+                "raw_response": raw,
+            })
+            log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            for a in batch_analyses:
+                all_analyses.append((a, log_id))
+            print(f"[kol_agent]   key {i+1}/{len(api_keys)}: {len(batch)}个候选 → {len(batch_analyses)}条分析 ({_elapsed}ms)")
 
     if not all_analyses:
         return []
@@ -617,8 +880,8 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
     return analyses
 
 
-def _execute_kol_trades(conn, analyses, candidates):
-    """对 KOL 分析结果中满足条件的，接入系统下单（策略隔离: kol_agent）
+def _execute_kol_trades(conn, analyses, candidates, strategy="kol_agent"):
+    """对 KOL 分析结果中满足条件的，接入系统下单（策略隔离）
 
     status=ENTER → 市价单；status=WAIT → 挂单（需 entry）；
     direction=long/short + confidence≥min_conf。
@@ -626,8 +889,9 @@ def _execute_kol_trades(conn, analyses, candidates):
     from trade_logic import open_limit_position, open_paper_position, _last_reject_reason
     candidate_map = {c["token"]: c for c in candidates}
     settings = storage.trading_settings_get(conn)
-    min_conf = int(settings.get("kol_agent_min_confidence", 70) or 70)
-    margin = float(settings.get("kol_agent_margin") or getattr(config, "KOL_AGENT_MARGIN", 50))
+    prefix = "kol_snapshot" if strategy == "kol_snapshot" else "kol_agent"
+    min_conf = int(settings.get(f"{prefix}_min_confidence", 70) or 70)
+    margin = float(settings.get(f"{prefix}_margin") or getattr(config, "KOL_AGENT_MARGIN", 50))
     opened = 0
     for a in analyses:
         direction = a.get("direction", "")
@@ -665,14 +929,14 @@ def _execute_kol_trades(conn, analyses, candidates):
             conn.execute(
                 "INSERT INTO pending_decisions "
                 "(action, token, tier, entry_price, reason, status, source, social_score, mentions) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', 'kol_agent', ?, ?)",
-                (action, token, tier, entry_price_f, reason,
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (action, token, tier, entry_price_f, reason, strategy,
                  original.get("social_score", 0), original.get("mentions", 0)),
             )
             pd_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             result = open_limit_position(
                 conn, token, side, entry_price_f,
-                margin_amount=margin, tier=tier, strategy="kol_agent",
+                margin_amount=margin, tier=tier, strategy=strategy,
                 pending_decision_id=pd_id,
             )
             ok = result.get("ok", False)
@@ -691,8 +955,8 @@ def _execute_kol_trades(conn, analyses, candidates):
             conn.execute(
                 "INSERT INTO pending_decisions "
                 "(action, token, tier, reason, status, source, social_score, mentions) "
-                "VALUES (?, ?, ?, ?, 'pending', 'kol_agent', ?, ?)",
-                (action, token, tier, reason,
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (action, token, tier, reason, strategy,
                  original.get("social_score", 0), original.get("mentions", 0)),
             )
             pd_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -707,14 +971,14 @@ def _execute_kol_trades(conn, analyses, candidates):
                 "analysis_score": confidence,
                 "pass_count": confidence,
             }
-            ok = open_paper_position(conn, candidate, settings, strategy="kol_agent", side=side)
+            ok = open_paper_position(conn, candidate, settings, strategy=strategy, side=side)
             if ok:
                 conn.execute(
                     "UPDATE pending_decisions SET status = 'consumed', consumed_at = datetime('now') WHERE id = ?",
                     (pd_id,),
                 )
                 pos_id = conn.execute(
-                    "SELECT id FROM trade_positions WHERE token=? AND strategy='kol_agent' ORDER BY id DESC LIMIT 1",
+                    f"SELECT id FROM trade_positions WHERE token=? AND strategy='{strategy}' ORDER BY id DESC LIMIT 1",
                     (token,),
                 ).fetchone()[0]
                 conn.execute(

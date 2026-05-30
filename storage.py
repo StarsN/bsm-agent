@@ -464,6 +464,10 @@ def _migrate(conn):
         conn.execute("ALTER TABLE trade_positions ADD COLUMN lowest_price REAL")
     if "pending_decision_id" not in tp_cols:
         conn.execute("ALTER TABLE trade_positions ADD COLUMN pending_decision_id INTEGER")
+    # kol_analyses strategy 列（kol_snapshot 策略隔离）
+    ka_cols = {r["name"] for r in conn.execute("PRAGMA table_info(kol_analyses)").fetchall()}
+    if "strategy" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN strategy TEXT DEFAULT 'kol_agent'")
     if "order_type" not in tp_cols:
         conn.execute("ALTER TABLE trade_positions ADD COLUMN order_type TEXT DEFAULT 'market'")
         conn.execute("UPDATE trade_positions SET order_type = 'limit' WHERE status = 'PENDING'")
@@ -546,19 +550,28 @@ def init_db():
 
 
 def upsert_author(conn, author: dict):
-    conn.execute("""
-        INSERT INTO authors (user_id, username, followers, following,
-                             account_created, post_count_24h, is_human, last_seen)
-        VALUES (:user_id, :username, :followers, :following,
-                :account_created, :post_count_24h, :is_human, :last_seen)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            followers=excluded.followers,
-            following=excluded.following,
-            post_count_24h=excluded.post_count_24h,
-            is_human=excluded.is_human,
-            last_seen=excluded.last_seen
-    """, author)
+    import time as _t
+    for attempt in range(5):
+        try:
+            conn.execute("""
+                INSERT INTO authors (user_id, username, followers, following,
+                                     account_created, post_count_24h, is_human, last_seen)
+                VALUES (:user_id, :username, :followers, :following,
+                        :account_created, :post_count_24h, :is_human, :last_seen)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    followers=excluded.followers,
+                    following=excluded.following,
+                    post_count_24h=excluded.post_count_24h,
+                    is_human=excluded.is_human,
+                    last_seen=excluded.last_seen
+            """, author)
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 4:
+                _t.sleep(1 + attempt * 0.5)
+            else:
+                raise
 
 
 def upsert_post(conn, post: dict):
@@ -613,14 +626,23 @@ def watchlist_remove(conn, token: str):
 # === 合约快照缓存 ===
 
 def snapshot_upsert(conn, token: str, snapshot_json: str, analysis_json: str):
-    conn.execute("""
-        INSERT INTO market_snapshots (token, snapshot, analysis, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(token) DO UPDATE SET
-            snapshot=excluded.snapshot,
-            analysis=excluded.analysis,
-            updated_at=excluded.updated_at
-    """, (token.upper(), snapshot_json, analysis_json))
+    import time as _t
+    for attempt in range(5):
+        try:
+            conn.execute("""
+                INSERT INTO market_snapshots (token, snapshot, analysis, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(token) DO UPDATE SET
+                    snapshot=excluded.snapshot,
+                    analysis=excluded.analysis,
+                    updated_at=excluded.updated_at
+            """, (token.upper(), snapshot_json, analysis_json))
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 4:
+                _t.sleep(1 + attempt * 0.5)
+            else:
+                raise
 
 
 def snapshot_get(conn, token: str) -> dict | None:
@@ -639,14 +661,23 @@ def snapshot_get_all(conn) -> list[dict]:
 
 
 def realtime_upsert(conn, token: str, symbol: str, snapshot_json: str):
-    conn.execute("""
-        INSERT INTO market_realtime_cache (token, symbol, snapshot, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(token) DO UPDATE SET
-            symbol=excluded.symbol,
-            snapshot=excluded.snapshot,
-            updated_at=excluded.updated_at
-    """, (token.upper(), symbol.upper(), snapshot_json))
+    import time as _t
+    for attempt in range(5):
+        try:
+            conn.execute("""
+                INSERT INTO market_realtime_cache (token, symbol, snapshot, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(token) DO UPDATE SET
+                    symbol=excluded.symbol,
+                    snapshot=excluded.snapshot,
+                    updated_at=excluded.updated_at
+            """, (token.upper(), symbol.upper(), snapshot_json))
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 4:
+                _t.sleep(1 + attempt * 0.5)
+            else:
+                raise
 
 
 def realtime_get(conn, token: str) -> dict | None:
@@ -745,16 +776,25 @@ def leaderboard_signal_key(conn) -> str:
 
 def agent_candidates_insert_batch(conn, round_number: int, items: list[dict]):
     """批量写入一轮的候选币评估结果。每条 items 含 token/data/tier/passed/hard_blocks/pass_count/signal_key。"""
+    import time as _t
     for item in items:
-        conn.execute("""
-            INSERT INTO agent_candidates
-                (round_number, token, data, tier, passed, hard_blocks, pass_count, signal_key)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (
-            round_number, item["token"], item["data"], item.get("tier"),
-            item.get("passed", 0), item.get("hard_blocks", "[]"),
-            item.get("pass_count", 0), item.get("signal_key"),
-        ))
+        for attempt in range(5):
+            try:
+                conn.execute("""
+                    INSERT INTO agent_candidates
+                        (round_number, token, data, tier, passed, hard_blocks, pass_count, signal_key)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (
+                    round_number, item["token"], item["data"], item.get("tier"),
+                    item.get("passed", 0), item.get("hard_blocks", "[]"),
+                    item.get("pass_count", 0), item.get("signal_key"),
+                ))
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < 4:
+                    _t.sleep(1 + attempt * 0.5)
+                else:
+                    raise
 
 
 def agent_candidates_get_latest(conn, rounds: int = 2) -> list[dict]:
@@ -937,10 +977,16 @@ def trading_settings_defaults() -> dict:
         "agent_trade_enabled": getattr(config, "AGENT_TRADE_ENABLED", True),
         "heat_agent_enabled": getattr(config, "HEAT_AGENT_ENABLED", True),
         "kol_agent_enabled": getattr(config, "KOL_AGENT_ENABLED", True),
+        "kol_snapshot_enabled": getattr(config, "KOL_SNAPSHOT_ENABLED", True),
+        "strategy_initial_kol_snapshot": getattr(config, "STRATEGY_INITIAL_KOL_SNAPSHOT", 1000),
+        "kol_snapshot_interval_minutes": getattr(config, "KOL_SNAPSHOT_INTERVAL_MINUTES", 8),
+        "kol_snapshot_min_confidence": getattr(config, "KOL_SNAPSHOT_MIN_CONFIDENCE", 70),
+        "kol_snapshot_llm_provider": getattr(config, "KOL_SNAPSHOT_LLM_PROVIDER", "nvidia"),
         "nl_agent_enabled": getattr(config, "NL_AGENT_ENABLED", True),
         "heat_agent_lessons_enabled": getattr(config, "HEAT_AGENT_LESSONS_ENABLED", True),
         "trading_daily_limit_enabled": getattr(config, "TRADING_DAILY_LIMIT_ENABLED", True),
         "limit_order_timeout_seconds": getattr(config, "LIMIT_ORDER_TIMEOUT_SECONDS", 600),
+        "system_auto_trade_enabled": getattr(config, "SYSTEM_AUTO_TRADE_ENABLED", True),
     }
 
 
@@ -949,9 +995,9 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
-        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds"}:
+        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence"}:
             try:
                 settings[row["key"]] = float(raw)
             except (TypeError, ValueError):
@@ -960,12 +1006,13 @@ def trading_settings_get(conn) -> dict:
             settings[row["key"]] = raw
     settings["leverage"] = int(settings.get("leverage") or config.TRADING_LEVERAGE)
     settings["kol_agent_min_confidence"] = int(settings.get("kol_agent_min_confidence") or 70)
+    settings["kol_snapshot_min_confidence"] = int(settings.get("kol_snapshot_min_confidence") or 70)
     settings["kol_token_cooldown_minutes"] = int(settings.get("kol_token_cooldown_minutes") or 30)
     return settings
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "limit_order_timeout_seconds"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -1001,7 +1048,7 @@ def trade_positions_with_kol_enrichment(conn) -> list[dict]:
     """对所有持仓，对 kol_agent 策略补 entry_trend/confidence / latest_trend/confidence"""
     positions = trade_positions_all(conn, limit=10000)
     for p in positions:
-        if p.get("strategy") != "kol_agent":
+        if p.get("strategy") not in ("kol_agent", "kol_snapshot"):
             continue
         token = p["token"]
         row = conn.execute(
@@ -1258,6 +1305,7 @@ def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None 
         "heat_agent_lessons": "token_heat_history_lessons",
         "agent_no_lessons": "nl_candidates",
         "kol_agent": "kol_agent",
+        "kol_snapshot": "kol_snapshot",
     }
 
     # 更新策略初始金额
@@ -1295,6 +1343,10 @@ def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None 
     elif strategy == "kol_agent":
         cand_del = conn.execute("DELETE FROM kol_candidates").rowcount or 0
         conn.execute("DELETE FROM kol_analyses")
+        conn.execute("DELETE FROM kol_llm_logs")
+    elif strategy == "kol_snapshot":
+        cand_del = conn.execute("DELETE FROM kol_candidates").rowcount or 0
+        conn.execute("DELETE FROM kol_analyses WHERE strategy = 'kol_snapshot'")
         conn.execute("DELETE FROM kol_llm_logs")
 
     settings = trading_settings_get(conn)
@@ -1518,8 +1570,8 @@ def kol_analysis_insert(conn, analysis: dict):
         """INSERT INTO kol_analyses
             (token, trend, timeline, price_levels, summary, reasoning,
              position_analysis, timing, risk_control, direction, confidence,
-             reason, llm_log_id, action, status, context_tag, evidence_tags)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             reason, llm_log_id, action, status, context_tag, evidence_tags, strategy)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             analysis.get("token", ""), analysis.get("trend"),
             _json.dumps(analysis.get("timeline"), ensure_ascii=False),
@@ -1536,28 +1588,32 @@ def kol_analysis_insert(conn, analysis: dict):
             analysis.get("status"),
             analysis.get("context_tag"),
             _json.dumps(analysis.get("evidence_tags"), ensure_ascii=False),
+            analysis.get("strategy", "kol_agent"),
         ),
     )
 
 
-def kol_analyses_latest(conn, symbol: str = ""):
+def kol_analyses_latest(conn, symbol: str = "", strategy: str = ""):
     import json as _json
     q = (
         "SELECT id, token, trend, timeline, price_levels, "
         "summary, reasoning, position_analysis, timing, risk_control, direction, confidence, reason, "
         "action, status, context_tag, evidence_tags, "
-        "created_at "
+        "strategy, created_at "
         "FROM kol_analyses "
         "WHERE created_at >= datetime('now', '-12 hours') "
     )
-    params: tuple = ()
+    params: list = []
+    if strategy:
+        q += " AND strategy = ? "
+        params.append(strategy)
     if symbol:
         q += " AND token = ? "
-        params = (symbol.upper(),)
+        params.append(symbol.upper())
     q += " ORDER BY id DESC"
     if symbol:
         q += " LIMIT 8"
-    rows = conn.execute(q, params).fetchall()
+    rows = conn.execute(q, tuple(params) if params else ()).fetchall()
     results = []
     for r in rows:
         d = dict(r)
@@ -1599,25 +1655,43 @@ def kol_analyses_latest(conn, symbol: str = ""):
 
 
 def kol_llm_log_insert(conn, log: dict):
-    conn.execute(
-        """INSERT INTO kol_llm_logs
-            (provider, model, candidate_count, prompt_chars, response_chars,
-             duration_ms, success, error, analyses_count,
-             system_prompt, user_prompt, raw_response)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (log.get("provider"), log.get("model"), log.get("candidate_count"),
-         log.get("prompt_chars"), log.get("response_chars"), log.get("duration_ms"),
-         log.get("success", 0), log.get("error"), log.get("analyses_count", 0),
-         log.get("system_prompt"), log.get("user_prompt"), log.get("raw_response")),
-    )
+    import time as _t
+    for attempt in range(5):
+        try:
+            conn.execute(
+                """INSERT INTO kol_llm_logs
+                    (provider, model, candidate_count, prompt_chars, response_chars,
+                     duration_ms, success, error, analyses_count,
+                     system_prompt, user_prompt, raw_response)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (log.get("provider"), log.get("model"), log.get("candidate_count"),
+                 log.get("prompt_chars"), log.get("response_chars"), log.get("duration_ms"),
+                 log.get("success", 0), log.get("error"), log.get("analyses_count", 0),
+                 log.get("system_prompt"), log.get("user_prompt"), log.get("raw_response")),
+            )
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 4:
+                _t.sleep(1 + attempt * 0.5)
+            else:
+                raise
 
 
-def kol_llm_logs_recent(conn, limit: int = 30):
-    rows = conn.execute(
-        "SELECT id, provider, model, candidate_count, prompt_chars, response_chars, "
-        "duration_ms, success, error, analyses_count, created_at "
-        "FROM kol_llm_logs ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
+def kol_llm_logs_recent(conn, limit: int = 30, strategy: str = ""):
+    if strategy:
+        rows = conn.execute(
+            "SELECT DISTINCT l.id, l.provider, l.model, l.candidate_count, l.prompt_chars, l.response_chars, "
+            "l.duration_ms, l.success, l.error, l.analyses_count, l.created_at "
+            "FROM kol_llm_logs l "
+            "JOIN kol_analyses a ON a.llm_log_id = l.id AND a.strategy = ? "
+            "ORDER BY l.id DESC LIMIT ?", (strategy, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, provider, model, candidate_count, prompt_chars, response_chars, "
+            "duration_ms, success, error, analyses_count, created_at "
+            "FROM kol_llm_logs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
     return [dict(r) for r in rows]
 
 

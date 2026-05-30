@@ -235,8 +235,19 @@ class SquareScraper:
             page.on("response", self._handle_response)
 
             try:
-                await page.goto(SQUARE_URL, wait_until="domcontentloaded",
-                                timeout=getattr(config, "PAGE_GOTO_TIMEOUT", 90000))
+                goto_timeout = getattr(config, "PAGE_GOTO_TIMEOUT", 90000)
+                for goto_attempt in range(3):
+                    try:
+                        await page.goto(SQUARE_URL, wait_until="domcontentloaded",
+                                        timeout=goto_timeout)
+                        break
+                    except Exception as e:
+                        if "Target crashed" in str(e):
+                            raise
+                        if goto_attempt < 2:
+                            await page.wait_for_timeout(3000)
+                        else:
+                            raise
                 await page.wait_for_timeout(random.randint(2500, 4500))
 
                 burst_start = time.time()
