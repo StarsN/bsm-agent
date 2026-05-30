@@ -1,5 +1,30 @@
 ﻿# Changelog
 
+## v4.6 — KOL 快照策略 + 并发 LLM + DB 重试 + 日志分天 (2026-05-30)
+
+### 新策略：KOL 认知快照
+- kol_snapshot 策略：与 KOL 完全并行，读 6 位交易员 _KnowledgeSnapshot_short.md
+- 独立 System Prompt（三步推演法 + 矩阵交叉推理）
+- 独立 API Key、Provider、冷却缓存、触发间隔（offset=4）
+- 监控页 /agent-kol-snapshot + K 线页 /kol?strategy=kol_snapshot 数据完全隔离
+
+### 并发 LLM 调用
+- analyze_candidates / analyze_candidates_snapshot 改为 ThreadPoolExecutor 并发
+- 4 key 同时请求，单轮从 12 分钟降到 3 分钟
+
+### DB 写入重试（5 次递增间隔）
+- kol_llm_log_insert / upsert_author / agent_candidates_insert_batch
+- realtime_upsert / snapshot_upsert 全部覆盖
+
+### 日志按天分文件
+- manage_processes.py：logs/{进程名}/{日期}.log，启动时自动清理 30 天前
+
+### Bug 修复
+- system_auto_trade_enabled：storage bool 转换集、allowed 集、defaults 全链路补齐
+- KOL/SNAP 监控页 LLM 日志 + K 线数据隔离
+- KOL_AGENT_HTML 补 strategy 参数传递
+- 爬虫 page.goto 加重试（3 次）
+
 ## v4.5 — 挂单全链路修复 + KOL 策略审查 (2026-05-29)
 
 ### order_type 字段（市价/挂单区分）
