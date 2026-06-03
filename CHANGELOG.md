@@ -1,8 +1,40 @@
 ﻿# Changelog
 
-## v4.6 — KOL 快照策略 + 并发 LLM + DB 重试 + 日志分天 (2026-05-30)
+## v4.7 — KOL 策略重构：全景 AI 方向 + 挂单全风控 + K 线摘要 + LLM 反馈 (2026-06-03)
 
-### 新策略：KOL 认知快照
+### 全景方向重构（AI 为核心）
+- AI 市场研判替代 BTC 成为方向判断核心依据，显式标注 →偏多/偏空/无方向
+- 四规则：BTC 与 AI 同向 full、分歧以 AI 为准 half、AI 震荡参考 BTC、BTC 闪崩 >3% 兜底
+- 全景数据全中文化：恐惧贪婪映射中文、z_depth→订单簿深度、BTC 标签替成交量 desc
+- 双重过滤器（全景方向 + KOL 框架）强制 LLM 按标准筛选，禁止自创逻辑
+
+### 挂单全风控
+- open_limit_position 补 5 项账户风控（日亏损熔断/日交易上限/最大持仓/冷却期/板块集中度）
+- ATR 止损 + compute_position_size 风险反推仓位，与 open_paper_position 对齐
+- 手动挂单豁免软风控（持仓数/冷却期/集中度），硬风控（日亏损/交易上限）永不豁免
+- 仅 ENTER + 有效 entry 挂单，去市价单路径
+- LLM position_size 字段控制 full/half 仓位档位
+
+### K 线数据优化
+- 裸 K 线改结构化摘要：趋势 + 区间 + 位置 + 量能（三层时间框架窗口独立）
+- 裸 K 线保留但限制输出根数（1h/4h/日线 = 6/6/7），摘要用全量数据
+- 日线扩至 90 根（大级别位置）、1h 扩至 24 根存储
+- get_daily_klines >=3 放宽，新币不丢数据
+
+### Prompt 增强
+- missing_data 字段：LLM 反馈还缺什么数据，写入 DB 并在 LLM 日志展示
+- 聪明钱多头/空头均价（覆盖 LLM 40+ 次"主力 OI 均价"需求）
+- KOL 知识改读 TradeSnapshot/_hermes_short_v1.md，清理仓位管理/执行规则等非分析内容
+- 快照四步交叉推演法、entry 必填强调、WAIT/ENTER 正确定义
+
+### Bug 修复
+- 快照间隔从 DB 独立刷新（之前永远等于 KOL 间隔）
+- get_kol_candidates 策略独立时间窗
+- analyze_candidates 显式设置 strategy="kol_agent"
+- 流动性双重"价差"修复
+- KOL 规则段"全景偏空"与第一层 AI 核心逻辑冲突修复
+
+## v4.6 — KOL 快照策略 + 并发 LLM + DB 重试 + 日志分天 (2026-05-30)
 - kol_snapshot 策略：与 KOL 完全并行，读 6 位交易员 _KnowledgeSnapshot_short.md
 - 独立 System Prompt（三步推演法 + 矩阵交叉推理）
 - 独立 API Key、Provider、冷却缓存、触发间隔（offset=4）
