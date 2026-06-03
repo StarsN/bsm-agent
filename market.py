@@ -507,7 +507,10 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
         except Exception:
             return None
 
-    if klines and len(klines) >= 24:
+    if klines and len(klines) >= 96:
+        n = len(klines)
+        snap["klines_1h"] = list(filter(None, (_agg_candle(klines[i:i+4]) for i in range(n-96, n, 4))))
+    elif klines and len(klines) >= 24:
         n = len(klines)
         snap["klines_1h"] = list(filter(None, (_agg_candle(klines[i:i+4]) for i in range(n-24, n, 4))))
     if klines and len(klines) >= 96:
@@ -599,7 +602,7 @@ def get_daily_klines(token: str, limit: int = 7) -> list[list[float]] | None:
         {"symbol": _perp_symbol(token), "interval": "1d", "limit": limit},
         timeout=5,
     )
-    if klines and len(klines) >= limit:
+    if klines and len(klines) >= 3:  # 至少 3 根才有结构意义
         try:
             return [[float(k[1]), float(k[2]), float(k[3]), float(k[4]),
                      float(k[5]), float(k[7])] for k in klines]

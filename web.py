@@ -350,6 +350,14 @@ def _collect_loop():
                     print(f"[kol-collect] KOL间隔变更: {kol_interval_seconds//60} → {new_kol_interval//60} 分钟", flush=True)
                     kol_interval_seconds = new_kol_interval
                 try:
+                    new_snapshot_interval = int(ts_settings.get("kol_snapshot_interval_minutes",
+                                                 getattr(config, "KOL_SNAPSHOT_INTERVAL_MINUTES", 8))) * 60
+                except Exception:
+                    new_snapshot_interval = kol_interval_seconds
+                if new_snapshot_interval != kol_snapshot_interval_seconds:
+                    print(f"[kol-snapshot-collect] 快照间隔变更: {kol_snapshot_interval_seconds//60} → {new_snapshot_interval//60} 分钟", flush=True)
+                    kol_snapshot_interval_seconds = new_snapshot_interval
+                try:
                     new_nl_interval = int(ts_settings.get("nl_agent_interval_minutes",
                                            getattr(config, "NL_AGENT_INTERVAL_MINUTES", 30))) * 60
                 except Exception:
@@ -972,6 +980,9 @@ def api_limit_order(body: dict):
             margin_amount=float(body.get("margin_amount", 50)),
             tier=body.get("tier", "half"),
             strategy=body.get("strategy", "manual"),
+            bypass_max_concurrent=True,
+            bypass_sector_limit=True,
+            bypass_cooldown=True,
         )
     _cache_invalidate()
     return result
@@ -4376,11 +4387,11 @@ async function loadLLMLogs(){
     const r=await fetch("/api/kol/llm-logs?limit=30&strategy=" + _strategy);
     const logs=await r.json();
     if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
-    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th></tr>";
+    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th><th>LLM反馈缺失</th></tr>";
     for(const l of logs){
       let t="";if(l.created_at){const d=new Date(l.created_at+"Z");d.setHours(d.getHours()+8);t=d.toISOString().replace("T"," ").substring(5,16);}
       const ok=l.success?"<span class=green>OK("+l.analyses_count+"条)</span>":"<span class=red>FAIL</span>";
-      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td></tr>";
+      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td><td class=muted>"+(l.missing_data||"").substring(0,120)+"</td></tr>";
     }
     document.getElementById("llm-logs").innerHTML=h+"</table>";
   }catch(e){}
@@ -4445,11 +4456,11 @@ async function loadLLMLogs(){
     const r=await fetch("/api/kol/llm-logs?limit=30&strategy=" + _strategy);
     const logs=await r.json();
     if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
-    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th></tr>";
+    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th><th>LLM反馈缺失</th></tr>";
     for(const l of logs){
       let t="";if(l.created_at){const d=new Date(l.created_at+"Z");d.setHours(d.getHours()+8);t=d.toISOString().replace("T"," ").substring(5,16);}
       const ok=l.success?"<span class=green>OK("+l.analyses_count+"条)</span>":"<span class=red>FAIL</span>";
-      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td></tr>";
+      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td><td class=muted>"+(l.missing_data||"").substring(0,120)+"</td></tr>";
     }
     document.getElementById("llm-logs").innerHTML=h+"</table>";
   }catch(e){}

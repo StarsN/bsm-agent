@@ -322,6 +322,7 @@ CREATE TABLE IF NOT EXISTS kol_analyses (
     status          TEXT,
     context_tag     TEXT,
     evidence_tags   TEXT,
+    missing_data    TEXT,
     raw_response    TEXT,
     system_prompt   TEXT,
     user_prompt     TEXT,
@@ -527,6 +528,8 @@ def _migrate(conn):
         conn.execute("ALTER TABLE kol_analyses ADD COLUMN summary TEXT")
     if "reasoning" not in ka_cols:
         conn.execute("ALTER TABLE kol_analyses ADD COLUMN reasoning TEXT")
+    if "missing_data" not in ka_cols:
+        conn.execute("ALTER TABLE kol_analyses ADD COLUMN missing_data TEXT")
     # kol_llm_logs 存 prompt（从 kol_analyses 迁出，减少冗余）
     kll_cols = [r[1] for r in conn.execute("PRAGMA table_info(kol_llm_logs)").fetchall()]
     if "system_prompt" not in kll_cols:
@@ -1570,8 +1573,8 @@ def kol_analysis_insert(conn, analysis: dict):
         """INSERT INTO kol_analyses
             (token, trend, timeline, price_levels, summary, reasoning,
              position_analysis, timing, risk_control, direction, confidence,
-             reason, llm_log_id, action, status, context_tag, evidence_tags, strategy)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             reason, llm_log_id, action, status, context_tag, evidence_tags, strategy, missing_data)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             analysis.get("token", ""), analysis.get("trend"),
             _json.dumps(analysis.get("timeline"), ensure_ascii=False),
@@ -1589,6 +1592,7 @@ def kol_analysis_insert(conn, analysis: dict):
             analysis.get("context_tag"),
             _json.dumps(analysis.get("evidence_tags"), ensure_ascii=False),
             analysis.get("strategy", "kol_agent"),
+            analysis.get("missing_data", "无"),
         ),
     )
 
@@ -1598,7 +1602,7 @@ def kol_analyses_latest(conn, symbol: str = "", strategy: str = ""):
     q = (
         "SELECT id, token, trend, timeline, price_levels, "
         "summary, reasoning, position_analysis, timing, risk_control, direction, confidence, reason, "
-        "action, status, context_tag, evidence_tags, "
+        "action, status, context_tag, evidence_tags, missing_data, "
         "strategy, created_at "
         "FROM kol_analyses "
         "WHERE created_at >= datetime('now', '-12 hours') "
@@ -1681,15 +1685,16 @@ def kol_llm_logs_recent(conn, limit: int = 30, strategy: str = ""):
     if strategy:
         rows = conn.execute(
             "SELECT DISTINCT l.id, l.provider, l.model, l.candidate_count, l.prompt_chars, l.response_chars, "
-            "l.duration_ms, l.success, l.error, l.analyses_count, l.created_at "
+            "l.duration_ms, l.success, l.error, l.analyses_count, l.created_at, "
+            "COALESCE(GROUP_CONCAT(CASE WHEN a.missing_data != '无' THEN a.token || ':' || a.missing_data END, ' | '), '') AS missing_data "
             "FROM kol_llm_logs l "
             "JOIN kol_analyses a ON a.llm_log_id = l.id AND a.strategy = ? "
-            "ORDER BY l.id DESC LIMIT ?", (strategy, limit)
+            "GROUP BY l.id ORDER BY l.id DESC LIMIT ?", (strategy, limit)
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT id, provider, model, candidate_count, prompt_chars, response_chars, "
-            "duration_ms, success, error, analyses_count, created_at "
+            "duration_ms, success, error, analyses_count, created_at, '' AS missing_data "
             "FROM kol_llm_logs ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]

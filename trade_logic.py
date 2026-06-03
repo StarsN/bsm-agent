@@ -874,10 +874,14 @@ def open_limit_position(
     conn, token: str, side: str, limit_price: float,
     margin_amount: float = 50.0, tier: str = "half",
     strategy: str = "manual", pending_decision_id: int = None,
+    bypass_max_concurrent: bool = False,
+    bypass_sector_limit: bool = False,
+    bypass_cooldown: bool = False,
 ) -> dict:
     """
     创建挂单 PENDING。止损在触发时补算。
     pending_decision_id 可选，关联 pending_decisions 记录（KOL 时间线用）。
+    bypass_* 用于手动挂单等强意愿场景，日亏损熔断和日交易上限永不豁免。
     返回 {"ok": True/False, "reason": "...", "position_id": int}
     """
     import storage as _st
@@ -891,13 +895,34 @@ def open_limit_position(
     if not limit_price or limit_price <= 0:
         return {"ok": False, "reason": "限价无效"}
 
+    # 账户级风控（与 open_paper_position 对齐）
+    account = _build_account_context(conn, strategy)
+    risk_decision = risk.check_account_risk(
+        account, token, side=side,
+        bypass_max_concurrent=bypass_max_concurrent,
+        bypass_sector_limit=bypass_sector_limit,
+        bypass_cooldown=bypass_cooldown,
+    )
+    if not risk_decision.allowed:
+        return {"ok": False, "reason": f"账户风控: {risk_decision.reason}"}
+
     settings = _st.trading_settings_get(conn)
     leverage = float(settings.get("leverage") or config.TRADING_LEVERAGE)
-    notional = margin_amount * leverage
-    quantity = notional / limit_price
 
-    if notional < config.TRADING_MIN_NOTIONAL:
-        return {"ok": False, "reason": f"名义价值${notional:.0f} < 最小 ${config.TRADING_MIN_NOTIONAL}"}
+    # 按 limit_price + 当前 ATR 止损计算风险调整仓位（与 open_paper_position 对齐）
+    klines = get_klines_1h(token, limit=max(30, config.TRADING_ATR_PERIOD + 2))
+    stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
+    if side == "LONG":
+        sl_est = limit_price * (1 + stop_pct / 100)
+    else:
+        sl_est = limit_price * (1 - stop_pct / 100)
+    sizing = risk.compute_position_size(account, limit_price, sl_est, leverage, tier, side=side)
+    if sizing.get("quantity", 0) <= 0:
+        return {"ok": False, "reason": f"仓位计算: {sizing.get('note')}"}
+
+    margin = sizing["margin"]
+    notional = sizing["notional"]
+    quantity = sizing["quantity"]
 
     signal_key = _st.leaderboard_signal_key(conn)
     if not _st.trade_signal_lock_acquire(conn, token, signal_key, strategy):
@@ -907,7 +932,7 @@ def open_limit_position(
     position = {
         "token": token, "symbol": symbol, "side": side,
         "status": "PENDING", "mode": settings.get("mode") or "paper",
-        "margin_amount": margin_amount, "leverage": leverage,
+        "margin_amount": margin, "leverage": leverage,
         "notional": notional, "quantity": round(quantity, 8),
         "limit_price": limit_price, "entry_price": None,
         "stop_loss_price": None, "tp1_price": None, "tp2_price": None,
@@ -915,7 +940,7 @@ def open_limit_position(
         "pnl_pct": 0, "closed_qty": 0, "realized_pnl": 0, "unrealized_pnl": 0,
         "highest_price": None, "lowest_price": None,
         "trailing_stop_price": None, "signal_snapshot": None,
-        "open_reason": f"挂单 {side} @ ${limit_price:.6g} margin=${margin_amount} tier={tier}",
+        "open_reason": f"挂单 {side} @ ${limit_price:.6g} margin=${margin:.2f} tier={tier}",
         "strategy": strategy, "advice": f"挂单中：{'涨破' if side == 'SHORT' else '跌破'} ${limit_price:.6g} 成交",
     }
     ok = _st.trade_position_insert(conn, position)

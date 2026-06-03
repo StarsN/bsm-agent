@@ -26,32 +26,23 @@ _kol_snapshot_token_last_sent: dict[str, float] = {}
 # ------------------------------------------------------------
 
 def _load_kol_files(kol_dir: str) -> list[dict]:
-    """扫描 kol_dir/TradeFramework/ 下的 KOL 交易框架 .md 文件。
+    """扫描 kol_dir/TradeSnapshot/ 下的 _hermes_short_v1.md 文件。
     返回 [{name, framework}, ...]
     """
-    subdirs = {
-        "TradeFramework": "framework",
-    }
+    d = Path(kol_dir) / "TradeSnapshot"
+    if not d.is_dir():
+        return []
 
-    kol_map: dict[str, dict] = {}
-
-    for dirname, key in subdirs.items():
-        d = Path(kol_dir) / dirname
-        if not d.is_dir():
+    kols = []
+    for fpath in sorted(d.glob("*_hermes_short_v1.md")):
+        name = fpath.stem.replace("_hermes_short_v1", "").strip()
+        if not name:
             continue
-        for fpath in sorted(d.glob("*.md")):
-            name = fpath.stem  # e.g. "BTC_Alert__TradeFramework"
-            if "__" not in name:
-                continue       # 跳过非 KOL 文件（如 #交易框架.md）
-            kol_name = name.split("__")[0].strip()
-            if not kol_name:
-                continue
-            text = fpath.read_text(encoding="utf-8").strip()
-            if not text:
-                continue
-            kol_map.setdefault(kol_name, {"name": kol_name})[key] = text
-
-    return [v for v in kol_map.values() if v.get("framework")]
+        text = fpath.read_text(encoding="utf-8").strip()
+        if not text:
+            continue
+        kols.append({"name": name, "framework": text})
+    return kols
 
 
 # ------------------------------------------------------------
@@ -59,10 +50,28 @@ def _load_kol_files(kol_dir: str) -> list[dict]:
 # ------------------------------------------------------------
 
 _SYSTEM_PROMPT_TEMPLATE = """\
-你是一位加密货币合约交易分析师，经过多位专业交易员（KOL）交易体系的深度训练。
+你是一位加密货币合约交易分析师，经过 {kol_count} 位专业交易员（KOL）交易体系的深度训练。
 
-以下是 {kol_count} 位KOL的交易框架。请仔细阅读并内化这些方法论，
-然后用这些框架分析候选币的盘面结构、交易机会和方向。
+## 分析方法：双重过滤器
+
+### 第一层：全景方向过滤
+用户 prompt 开头会提供"市场全景环境"（BTC涨跌幅、恐惧贪婪指数、AI市场研判等）。
+AI市场研判反映山寨币整体资金情绪和趋势，是方向判断的**核心依据**。
+
+方向判断规则：
+1. **同向共振**：BTC 方向与 AI 研判一致 → 该方向，**可给full仓位**
+2. **方向分歧**：BTC 方向与 AI 研判相反 → **以AI研判为准**，**half仓位**
+   （典型：山寨季 BTC 横盘/微跌，AI 看多 → 评估做多信号）
+3. **AI研判为震荡死水（chop）**：无山寨方向 → 以 BTC 3h 方向为参考，双向可评，half仓位
+4. **闪崩兜底**：BTC 1h 涨跌幅超过 3% 且方向与AI研判相悖 → 以 BTC 实时方向为准，忽略 AI
+
+### 第二层：KOL框架筛选
+在全景允许的方向内，逐一用KOL的交易框架审视候选币：
+- 盘面数据与至少一位KOL框架高度共振，且入场时机成熟 → 给出 ENTER + 对应方向
+- 盘面数据不匹配任何KOL框架 → direction=none（即使全景方向明确）
+- 禁止自行创造KOL框架之外的分析逻辑
+
+以下是 {kol_count} 位KOL的交易框架，请以这些框架为唯一筛选标准：
 
 {kol_sections}
 
@@ -88,7 +97,9 @@ _SYSTEM_PROMPT_TEMPLATE = """\
       "context_tag": "range_low · support_holding",
       "evidence_tags": ["taker 0.74", "24h -5.5%", "支撑未破", "BTC横盘"],
       "direction": "long / short / none",
-      "confidence": 75
+      "confidence": 75,
+      "position_size": "full / half",
+      "missing_data": "还缺什么数据？如无缺失填'无'"
     }}
   ]
 }}
@@ -103,7 +114,7 @@ _SYSTEM_PROMPT_TEMPLATE = """\
   - current: 当前标记价
   - support: 最近有效支撑位
   - resistance: 最近有效阻力位
-  - entry: 建议入场价（无交易机会时填 null）
+  - entry: 建议入场价。status=ENTER 时必须填有效价格；direction=none 时填 null
   - stop_loss: 建议止损价（无交易机会时填 null）
   - take_profit: 建议止盈目标（无交易机会时填 null）
 - summary: 盘面综合摘要，包含价格位置、支撑阻力、多空力量（100-200字）
@@ -122,13 +133,18 @@ _SYSTEM_PROMPT_TEMPLATE = """\
   direction=none或证据不足时填["无明显信号"]
 - direction: 交易方向，long(做多) / short(做空) / none(无机会)
 - confidence: 对当前判断的信心评分，0-100整数。≥80=高把握，50-79=中等，<50=低把握
+- position_size: 仓位档位。full(满仓) / half(半仓)
+  full: BTC与AI同向 + 结构明确 + 信号共振、把握较高的机会
+  half: BTC与AI分歧、或AI震荡、或信号部分共振、或盘面有不确定因素
+  direction=none时填half
+- missing_data: 做此判断时还缺什么指标或数据？列出缺失项；如数据充分则填"无"
 
 ## 规则
+- **全景定向**：按第一层规则确定综合方向，不逆方向开仓
+- **KOL框架为唯一标准**：只在KOL框架明确支持时给出ENTER。不匹配任何KOL框架的币 → direction=none
 - price_levels 中无明确依据的字段填 null
 - direction 为 none 时 price_levels 的 entry/stop_loss/take_profit 填 null
 - evidence_tags 必须引用用户 prompt 中的具体数据，不要笼统
-- 始终基于 KOL 的交易框架进行分析，用他们的视角看盘面
-- **全景优先**：用户 prompt 中"全景指引"的规则和方向偏好，优先于 KOL 框架信号
 """
 
 
@@ -138,16 +154,21 @@ _SNAPSHOT_SYSTEM_PROMPT_TEMPLATE = """# Role
 # Goal
 你需要通过"矩阵交叉推理（Matrix Cross-Reasoning）"，站在客观的系统整体风险回报比（R:R）的角度，将交易员的认知与实时盘面进行多维对齐，最终输出精准、可执行的交易建议。
 
-# Reasoning Methodology (三步交叉推演法)
-在给出最终决策前，你必须在底层思维链（Thinking Process）中完成以下推演：
-1. **情境共振校验**：逐一将实时的盘面数据矩阵投入到各位交易员的核心交易情境中。计算当前盘面究竟高度共振了谁的框架？触发了谁的警觉陷阱？
+# Reasoning Methodology (四步交叉推演法)
+在给出最终决策前，你必须按以下顺序完成推演：
+0. **全景定向**：先读取用户 prompt 中的"市场全景环境"。AI市场研判是方向核心依据。
+   - BTC与AI同向 → 该方向，可full
+   - BTC与AI分歧 → 以AI为准，half（典型：山寨季BTC横盘AI看多）
+   - AI震荡死水（chop） → 参考BTC方向，双向half
+   - BTC 1h >3%闪崩且与AI相悖 → 以BTC为准
+1. **情境共振校验**：在全景确定的方向内，逐一将实时的盘面数据矩阵投入到各位交易员的核心交易情境中。计算当前盘面究竟高度共振了谁的框架？触发了谁的警觉陷阱？
 2. **多维冲突仲裁**：如果盘面数据导致交易员们的策略产生了冲突（例如：交易员 A 认为当前 OI 暴增符合他的右侧追多框架；但交易员 B 的盘口模型提示当前深度单薄，属于薄盘口滑点黑洞），你必须根据当前的系统性流动性（Beta 环境）进行硬核仲裁，决定谁的权重在当前情境下更高。
 3. **启发式执行映射**：根据当前价格在支撑阻力位的实际微观表现（如是否放量突破、是否假跌破收回），动态判断入场时机和执行价格。
 
 # Output Control
 1. 保持分析简洁、专业、高信息密度，避免冗余描述。
 2. 严禁带有任何情绪化色彩。
-3. 如果盘面指标不足以支撑任何交易员的框架，必须果断给出 WAIT（观望）指令。
+3. 如果盘面指标不足以支撑任何交易员的框架，必须果断给出 WAIT + direction=none（观望，无交易方向）。
 
 ---
 
@@ -177,7 +198,9 @@ _SNAPSHOT_SYSTEM_PROMPT_TEMPLATE = """# Role
       "context_tag": "range_low · support_holding",
       "evidence_tags": ["taker 0.74", "24h -5.5%", "支撑未破", "BTC横盘"],
       "direction": "long / short / none",
-      "confidence": 75
+      "confidence": 75,
+      "position_size": "full / half",
+      "missing_data": "还缺什么数据？如无缺失填'无'"
     }}
   ]
 }}
@@ -189,23 +212,32 @@ _SNAPSHOT_SYSTEM_PROMPT_TEMPLATE = """# Role
   "空头出货结构" — 阻力位受阻、抛压信号，适合做空
   "区间盘整" — 无明显方向，等待突破
 - price_levels: 关键价格位，无依据填 null
+  - entry: status=ENTER 时必须填有效价格，direction=none 时填 null
 - summary: 盘面综合摘要，100-200字
 - reasoning: 逻辑推演（键值对结构）
   - wz (位置): 当前价格在支撑阻力中的位置分析
   - sj (时机): 什么条件下入场、等待的具体说明
   - fk (风控): 止损/止盈设置逻辑
-- status: 执行时机 ENTER/WAIT，direction=none 时填 WAIT
+- status: 执行时机
+  ENTER: 条件已满足，可以入场
+  WAIT: 时机未到或框架不支持，等待条件触发
+  direction=none时填WAIT
 - context_tag: 盘面场景标签，用" · "连接
 - evidence_tags: 做出判断引用的具体数据证据，每条约5-15字。direction=none或证据不足时填["无明显信号"]
 - direction: 交易方向 long/short/none
 - confidence: 0-100整数。>=80=高把握，50-79=中等，<50=低把握
+- position_size: 仓位档位。full(满仓) / half(半仓)
+  full: BTC与AI同向 + 结构明确 + 信号共振、把握较高的机会
+  half: BTC与AI分歧、或AI震荡、或信号部分共振、或盘面有不确定因素
+  direction=none时填half
+- missing_data: 做此判断时还缺什么指标或数据？列出缺失项；如数据充分则填"无"
 
 ## 规则
+- **全景定向**：先判断宏观方向，在此方向内筛选交易员信号，不逆宏观
+- **交易员框架为唯一标准**：不匹配任何交易员框架的币 → direction=none
 - price_levels 中无明确依据的字段填 null
 - direction 为 none 时 price_levels 的 entry/stop_loss/take_profit 填 null
 - evidence_tags 必须引用用户 prompt 中的具体数据，不要笼统
-- 始终基于交易员的认知快照进行分析，用他们的视角看盘面
-- **全景优先**：用户 prompt 中"全景指引"的规则和方向偏好，优先于交易员信号
 """
 
 
@@ -291,15 +323,60 @@ def _fmt_price(v):
         return str(v)
 
 
-def _fmt_klines(klines):
-    """格式化 K 线: O/H/L/C/Vol/额, ..."""
+def _fmt_klines(klines, limit: int = 0):
+    """格式化 K 线: O/H/L/C/Vol/额, ... limit=0 表示全部"""
     if not klines:
         return None
+    k = klines[-limit:] if limit > 0 else klines
     parts = []
-    for k in klines:
+    for k in k:
         if len(k) >= 6:
             parts.append(f"{k[0]:.4f}/{k[1]:.4f}/{k[2]:.4f}/{k[3]:.4f}/{k[4]:.0f}/{k[5]:.0f}")
     return ", ".join(parts) if parts else None
+
+
+def _build_kline_summary(klines, label: str = "", limit: int = 0):
+    """从 K 线提取结构化摘要：趋势 + 区间 + 位置 + 量能。limit>0 时只取最近 N 根"""
+    if not klines or len(klines) < 3:
+        return None
+    if limit > 0 and len(klines) > limit:
+        klines = klines[-limit:]
+    try:
+        highs = [float(k[1]) for k in klines]
+        lows  = [float(k[2]) for k in klines]
+        closes = [float(k[3]) for k in klines]
+        vols = [float(k[4]) for k in klines]
+
+        hi, lo = max(highs), min(lows)
+        cur = closes[-1]
+        rng = hi - lo
+        pos_pct = (cur - lo) / rng * 100 if rng > 0 else 50
+
+        # 前后半段均价比
+        mid = len(closes) // 2
+        first_avg = sum(closes[:mid]) / mid
+        second_avg = sum(closes[mid:]) / (len(closes) - mid)
+        if second_avg > first_avg * 1.005:
+            trend = "上升"
+        elif second_avg < first_avg * 0.995:
+            trend = "下降"
+        else:
+            trend = "横盘"
+
+        # 量能
+        avg_vol = sum(vols) / len(vols) if vols else 1
+        last_vol = vols[-1]
+        if last_vol > avg_vol * 1.5:
+            vol_label = "放量"
+        elif last_vol < avg_vol * 0.7:
+            vol_label = "缩量"
+        else:
+            vol_label = "量平"
+
+        prefix = f"{label} " if label else ""
+        return f"{prefix}{trend} | 区间 ${lo:.4f}-${hi:.4f} | 当前在{pos_pct:.0f}%位 | {vol_label}"
+    except Exception:
+        return None
 
 
 def build_user_prompt(candidates: list[dict]) -> str:
@@ -344,10 +421,15 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("聪明钱净头寸(USD)", _fmt_usd(c.get("sm_net_notional_usdt")) if c.get("sm_net_notional_usdt") else None),
             ("聪明钱多头胜率", _fmt_pct(c.get("sm_avg_long_win_rate"))),
             ("聪明钱关注人数", c.get("sm_traders_with_position")),
+            ("聪明钱多头均价", _fmt_price(c.get("sm_long_avg_entry")) if c.get("sm_long_avg_entry") else None),
+            ("聪明钱空头均价", _fmt_price(c.get("sm_short_avg_entry")) if c.get("sm_short_avg_entry") else None),
             ("OI/市值", _fmt_pct(c.get("oi_marketcap"))),
-            ("1H K线(开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_1h"))),
-            ("4H K线(开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_4h"))),
-            ("日K (开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_1d"))),
+            ("1h结构", _build_kline_summary(c.get("klines_1h"), limit=6)),
+            ("1H K线(开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_1h"), 6)),
+            ("4h结构", _build_kline_summary(c.get("klines_4h"))),
+            ("4H K线(开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_4h"), 6)),
+            ("日线位置", _build_kline_summary(c.get("klines_1d"), "日线")),
+            ("日K (开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_1d"), 7)),
             ("信号标签", c.get("tags")),
         ]
         for label, val in fields:
@@ -454,12 +536,13 @@ def kol_is_interesting(candidate: dict) -> bool:
     return score >= getattr(config, "KOL_MIN_ANOMALY_SCORE", 2)
 
 
-def get_kol_candidates(conn: sqlite3.Connection) -> list[dict]:
-    """从 kol_candidates 读取候选币（按时间窗口，跟主 Agent 一致）"""
+def get_kol_candidates(conn: sqlite3.Connection, strategy: str = "kol_agent") -> list[dict]:
+    """从 kol_candidates 读取候选币（按策略对应的时间窗口）"""
     import json as _json
     ts = storage.trading_settings_get(conn)
-    inter_min = int(ts.get("kol_agent_interval_minutes",
-                    getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15)))
+    key = "kol_agent_interval_minutes" if strategy == "kol_agent" else "kol_snapshot_interval_minutes"
+    default = getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15) if strategy == "kol_agent" else getattr(config, "KOL_SNAPSHOT_INTERVAL_MINUTES", 8)
+    inter_min = int(ts.get(key, default))
     rows = conn.execute(
         f"SELECT data FROM kol_candidates "
         f"WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
@@ -484,12 +567,7 @@ def _build_panorama_context() -> str:
     lines = [
         "## 市场全景环境",
         "",
-        "**全景指引：以下宏观数据调整你的交易偏好。**",
-        "- BTC 3h 微跌或下跌 → 优先考虑做空或 direction=none",
-        "- BTC 3h 微涨          → 可以正常评估做多机会",
-        "- BTC 3h 大涨（>0.5%） → 做多优于做空",
-        "- 恐惧贪婪 < 30         → 市场恐慌中等待 BTC 企稳信号，不急于开仓",
-        "- AI 市场研判           → 参考下方研判描述，理解当前市场阶段和资金情绪",
+        "**市场全景环境：AI市场研判是方向判断的核心依据。请结合以下数据判断趋势。**",
         "",
         "---",
         "",
@@ -504,7 +582,11 @@ def _build_panorama_context() -> str:
             d = _json.loads(resp.read().decode("utf-8"))
             if d.get("data"):
                 fng = d["data"][0]
-                lines.append(f"- 恐惧贪婪: {fng.get('value')} ({fng.get('value_classification', '')})")
+                fng_cn = {"Extreme Fear": "极度恐惧", "Fear": "恐惧", "Neutral": "中性",
+                          "Greed": "贪婪", "Extreme Greed": "极度贪婪"}
+                class_en = fng.get("value_classification", "")
+                class_cn = fng_cn.get(class_en, class_en)
+                lines.append(f"- 恐惧贪婪指数: {fng.get('value')} ({class_cn})")
     except Exception:
         pass
     # BTC / 流动性 / 宏观
@@ -515,9 +597,18 @@ def _build_panorama_context() -> str:
         m3h = rm["metrics"]["macro_3h"]
         zd = rm["metrics"]["z_depth"]
         liq = rm["metrics"]["liquidity"]
-        lines.append(f"- BTC 1h: {m1h['value']}% ({m1h['desc']}) | BTC 3h: {m3h['value']}% ({m3h['desc']})")
-        lines.append(f"- z_depth: ${zd['value']}M ({zd['desc']})")
-        lines.append(f"- 流动性: {liq['status']} (价差{liq['desc']})")
+        def _btc_label(v):
+            if v > 0.5: return "大涨"
+            if v > 0.0: return "微涨"
+            if v > -0.1: return "横盘"
+            if v > -0.5: return "微跌"
+            return "下跌"
+        v1, v3 = m1h["value"], m3h["value"]
+        lines.append(f"- BTC 1h: {v1:+.2f}% ({_btc_label(v1)}) | BTC 3h: {v3:+.2f}% ({_btc_label(v3)})")
+        zd_desc = zd.get("desc", "")
+        zd_note = "偏薄" if "RISK_OFF" in zd_desc else ""
+        lines.append(f"- 订单簿深度: ${zd['value']}M{' (' + zd_note + ')' if zd_note else ''}")
+        lines.append(f"- 流动性: {liq['status']} ({liq['desc']})")
         # V3 AI Regime（只有缓存命中才附加，loading 中不喂）
         try:
             from dashboard import get_ai_regime
@@ -528,7 +619,9 @@ def _build_panorama_context() -> str:
             else:
                 regime_cn = {"alt_season": "山寨行情", "alt_pullback": "回调兑现",
                              "chop": "震荡死水", "risk_off": "趋势空"}.get(regime.get("current_regime", ""), regime.get("current_regime", ""))
-                lines.append(f"- AI 市场研判: {regime_cn} (conf {regime.get('confidence', 0)})")
+                regime_dir = {"alt_season": "偏多", "alt_pullback": "中性偏空", "chop": "无方向", "risk_off": "偏空"}
+                dir_tag = regime_dir.get(regime.get("current_regime", ""), "")
+                lines.append(f"- AI 市场研判: {regime_cn} (conf {regime.get('confidence', 0)}) → {dir_tag}")
                 lines.append(f"  {jt[:200]}")
         except Exception:
             pass
@@ -600,7 +693,7 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
         print("[kol_snapshot] 未找到有效的 KOL 认知快照文件")
         return []
 
-    candidates = get_kol_candidates(conn)
+    candidates = get_kol_candidates(conn, "kol_snapshot")
     if not candidates:
         print("[kol_snapshot] kol_candidates 无数据")
         return []
@@ -629,7 +722,7 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
     try:
         from market import get_daily_klines
         for c in candidates:
-            c["klines_1d"] = get_daily_klines(c.get("token", ""))
+            c["klines_1d"] = get_daily_klines(c.get("token", ""), 90)
     except Exception:
         pass
 
@@ -743,7 +836,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
         return []
 
     # 从 KOL 专属累积表读候选币（passed 的才入库）
-    candidates = get_kol_candidates(conn)
+    candidates = get_kol_candidates(conn, "kol_agent")
     if not candidates:
         print("[kol_agent] kol_candidates 无数据")
         return []
@@ -775,7 +868,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
     try:
         from market import get_daily_klines
         for c in candidates:
-            c["klines_1d"] = get_daily_klines(c.get("token", ""))
+            c["klines_1d"] = get_daily_klines(c.get("token", ""), 90)
     except Exception:
         pass
 
@@ -861,6 +954,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
             continue
         a["token"] = token
         a["llm_log_id"] = log_id
+        a["strategy"] = "kol_agent"
         storage.kol_analysis_insert(conn, a)
         written += 1
 
@@ -881,17 +975,16 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
 
 
 def _execute_kol_trades(conn, analyses, candidates, strategy="kol_agent"):
-    """对 KOL 分析结果中满足条件的，接入系统下单（策略隔离）
+    """对 KOL 分析结果中满足条件的，挂单接入（策略隔离）
 
-    status=ENTER → 市价单；status=WAIT → 挂单（需 entry）；
-    direction=long/short + confidence≥min_conf。
+    status=ENTER + direction=long/short + confidence>=min_conf → 挂单。
+    统一走限价单，不设市价单。
     """
-    from trade_logic import open_limit_position, open_paper_position, _last_reject_reason
+    from trade_logic import open_limit_position
     candidate_map = {c["token"]: c for c in candidates}
     settings = storage.trading_settings_get(conn)
     prefix = "kol_snapshot" if strategy == "kol_snapshot" else "kol_agent"
     min_conf = int(settings.get(f"{prefix}_min_confidence", 70) or 70)
-    margin = float(settings.get(f"{prefix}_margin") or getattr(config, "KOL_AGENT_MARGIN", 50))
     opened = 0
     for a in analyses:
         direction = a.get("direction", "")
@@ -899,100 +992,58 @@ def _execute_kol_trades(conn, analyses, candidates, strategy="kol_agent"):
         if direction not in ("long", "short") or confidence < min_conf:
             continue
         llm_status = a.get("status", "")
-        if llm_status not in ("ENTER", "WAIT"):
+        if llm_status != "ENTER":
             continue
         token = a.get("token", "").upper()
         if not token:
             continue
         original = candidate_map.get(token)
         if not original:
-            print(f"[kol_agent] 下单跳过 {token}: 无原始行情数据")
+            print(f"[{strategy}] 下单跳过 {token}: 无原始行情数据")
             continue
 
         side = "LONG" if direction == "long" else "SHORT"
-        tier = "half"
+        tier = a.get("position_size", "half")
+        if tier not in ("full", "half"):
+            tier = "half"
         action = "open_long" if side == "LONG" else "open_short"
         reason = a.get("summary", "") or f"KOL {direction} conf={confidence}"
 
-        if llm_status == "WAIT":
-            # 挂单：取 LLM 给的 entry 价格
-            price_levels = a.get("price_levels", {}) or {}
-            entry_price = price_levels.get("entry")
-            try:
-                entry_price_f = float(entry_price) if entry_price is not None else 0
-            except (ValueError, TypeError):
-                entry_price_f = 0
-            if entry_price_f <= 0:
-                print(f"[kol_agent] 挂单跳过 {token}: WAIT 但无有效 entry 价格")
-                continue
+        # 挂单：必须 LLM 给出有效 entry 价格
+        price_levels = a.get("price_levels", {}) or {}
+        entry_price = price_levels.get("entry")
+        try:
+            entry_price_f = float(entry_price) if entry_price is not None else 0
+        except (ValueError, TypeError):
+            entry_price_f = 0
+        if entry_price_f <= 0:
+            print(f"[{strategy}] 挂单跳过 {token}: ENTER 但无有效 entry 价格")
+            continue
 
-            conn.execute(
-                "INSERT INTO pending_decisions "
-                "(action, token, tier, entry_price, reason, status, source, social_score, mentions) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
-                (action, token, tier, entry_price_f, reason, strategy,
-                 original.get("social_score", 0), original.get("mentions", 0)),
-            )
-            pd_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            result = open_limit_position(
-                conn, token, side, entry_price_f,
-                margin_amount=margin, tier=tier, strategy=strategy,
-                pending_decision_id=pd_id,
-            )
-            ok = result.get("ok", False)
-            if ok:
-                print(f"[kol_agent] 挂单 {token} {side} @ {entry_price_f} conf={confidence} tier={tier}")
-                opened += 1
-            else:
-                reject_reason = result.get("reason", "")
-                print(f"[kol_agent] 挂单被拒 {token} {side}: {reject_reason}")
-                conn.execute(
-                    "UPDATE pending_decisions SET status = 'rejected', reject_reason = ? WHERE id = ?",
-                    (reject_reason, pd_id),
-                )
+        conn.execute(
+            "INSERT INTO pending_decisions "
+            "(action, token, tier, entry_price, reason, status, source, social_score, mentions) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (action, token, tier, entry_price_f, reason, strategy,
+             original.get("social_score", 0), original.get("mentions", 0)),
+        )
+        pd_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        result = open_limit_position(
+            conn, token, side, entry_price_f,
+            tier=tier, strategy=strategy,
+            pending_decision_id=pd_id,
+        )
+        ok = result.get("ok", False)
+        if ok:
+            print(f"[{strategy}] 挂单 {token} {side} @ {entry_price_f} conf={confidence} tier={tier}")
+            opened += 1
         else:
-            # ENTER → 市价单：先写决策记录，再开仓，按结果更新
+            reject_reason = result.get("reason", "")
+            print(f"[{strategy}] 挂单被拒 {token} {side}: {reject_reason}")
             conn.execute(
-                "INSERT INTO pending_decisions "
-                "(action, token, tier, reason, status, source, social_score, mentions) "
-                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
-                (action, token, tier, reason, strategy,
-                 original.get("social_score", 0), original.get("mentions", 0)),
+                "UPDATE pending_decisions SET status = 'rejected', reject_reason = ? WHERE id = ?",
+                (reject_reason, pd_id),
             )
-            pd_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            candidate = {
-                "token": token,
-                "side": side,
-                "passed": True,
-                "has_active_position": False,
-                "tier": tier,
-                "price": original.get("price"),
-                "signal_key": original.get("signal_key", ""),
-                "analysis_score": confidence,
-                "pass_count": confidence,
-            }
-            ok = open_paper_position(conn, candidate, settings, strategy=strategy, side=side)
-            if ok:
-                conn.execute(
-                    "UPDATE pending_decisions SET status = 'consumed', consumed_at = datetime('now') WHERE id = ?",
-                    (pd_id,),
-                )
-                pos_id = conn.execute(
-                    f"SELECT id FROM trade_positions WHERE token=? AND strategy='{strategy}' ORDER BY id DESC LIMIT 1",
-                    (token,),
-                ).fetchone()[0]
-                conn.execute(
-                    "UPDATE journal SET pending_decision_id = ? WHERE order_id = ?",
-                    (pd_id, pos_id),
-                )
-                print(f"[kol_agent] 市价开仓 {token} {side} conf={confidence} tier={tier}")
-                opened += 1
-            else:
-                reject_reason = _last_reject_reason.get(token, "系统拒绝")
-                conn.execute(
-                    "UPDATE pending_decisions SET status = 'rejected', reject_reason = ? WHERE id = ?",
-                    (reject_reason, pd_id),
-                )
     return opened
 
 
