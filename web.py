@@ -276,15 +276,17 @@ def _collect_loop():
             candidates = _cached("candidates_scan", cache_ttl, _scan_candidates)
 
             for c in candidates:
-                _collected[c["token"]] = {
-                    "token": c["token"],
-                    "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
-                    "tier": c["tier"],
-                    "passed": 1 if c["passed"] else 0,
-                    "hard_blocks": json.dumps(c.get("hard_block", []), ensure_ascii=False),
-                    "pass_count": c.get("pass_count", 0),
-                    "signal_key": c.get("signal_key", ""),
-                }
+                # 主 Agent：开关关闭时跳过收集
+                if ts_settings.get("agent_trade_enabled", True):
+                    _collected[c["token"]] = {
+                        "token": c["token"],
+                        "data": json.dumps(_build_data_blob(c), default=str, ensure_ascii=False),
+                        "tier": c["tier"],
+                        "passed": 1 if c["passed"] else 0,
+                        "hard_blocks": json.dumps(c.get("hard_block", []), ensure_ascii=False),
+                        "pass_count": c.get("pass_count", 0),
+                        "signal_key": c.get("signal_key", ""),
+                    }
                 # 无教训版 Agent：独立累积（开关关闭时跳过，passed 的才收）
                 if ts_settings.get("nl_agent_enabled", True) and c.get("passed"):
                     _nl_collected[c["token"]] = {
@@ -390,20 +392,21 @@ def _collect_loop():
                     elapsed = now - _last_flush
                     batch = list(_collected.values())
 
-                    with storage.get_conn() as conn:
-                        last_round = conn.execute(
-                            "SELECT COALESCE(MAX(round_number), 0) FROM token_heat_history"
-                        ).fetchone()[0]
-                        storage.agent_candidates_insert_batch(conn, last_round, batch)
-                        storage.agent_candidates_purge_old(conn, keep_last_rounds=50)
+                    if ts_settings.get("agent_trade_enabled", True):
+                        with storage.get_conn() as conn:
+                            last_round = conn.execute(
+                                "SELECT COALESCE(MAX(round_number), 0) FROM token_heat_history"
+                            ).fetchone()[0]
+                            storage.agent_candidates_insert_batch(conn, last_round, batch)
+                            storage.agent_candidates_purge_old(conn, keep_last_rounds=50)
 
                     _collected.clear()
                     _last_flush = now
 
-                    ts_str = datetime.now().strftime("%H:%M:%S")
-                    print(f"[collect] {ts_str} 入库 {len(batch)} 个候选"
-                          f"（距上次 {elapsed/60:.0f} 分钟），已触发 Agent", flush=True)
                     if ts_settings.get("agent_trade_enabled", True):
+                        ts_str = datetime.now().strftime("%H:%M:%S")
+                        print(f"[collect] {ts_str} 入库 {len(batch)} 个候选"
+                              f"（距上次 {elapsed/60:.0f} 分钟），已触发 Agent", flush=True)
                         job_id = getattr(config, "AGENT_HERMES_JOB_ID", "")
                         if job_id:
                             subprocess.run(
