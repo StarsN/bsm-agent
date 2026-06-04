@@ -1,5 +1,11 @@
 ﻿# Changelog
 
+## v4.7.1 — KOL 策略简化 + Agent 采集守卫 (2026-06-04)
+
+- KOL 模板：去全景方向规则，只保留 KOL 框架筛选，LLM 自行结合数据判断方向
+- KOL+快照：去 missing_data 字段
+- 主 Agent：`agent_trade_enabled` 关闭时跳过数据收集+入库，避免无效 DB 写入
+
 ## v4.7 — KOL 策略重构：全景 AI 方向 + 挂单全风控 + K 线摘要 + LLM 反馈 (2026-06-03)
 
 ### 全景方向重构（AI 为核心）
