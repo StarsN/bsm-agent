@@ -9,7 +9,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Write Agent decisions to pending_decisions")
 parser.add_argument("--decisions", required=True, help="Path to Agent-generated decisions JSON file")
-parser.add_argument("--source", default="token_heat_history", help="Data source")
+parser.add_argument("--source", default="token_heat_history_lessons", help="Data source")
 args = parser.parse_args()
 
 # 路径：基于脚本自身位置，不依赖工作目录
@@ -17,13 +17,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent          # agent-trade/scripts/
 PROJECT_DIR = SCRIPT_DIR.parent.parent                # bsm-agent/
 sys.path.insert(0, str(PROJECT_DIR))
 
-DB_NAME = "binance_square.db"
-
 try:
     import config
     db_root = getattr(config, "AGENT_DB_ROOT", "")
+    DB_NAME = getattr(config, "DB_PATH", "db/binance_square.db")
 except Exception:
     db_root = ""
+    DB_NAME = "db/binance_square.db"
 
 if db_root:
     DB = str(Path(os.path.expanduser(db_root)) / DB_NAME)

@@ -1,4 +1,5 @@
 """SQLite 存储：帖子、作者、代币提及、观察列表、行情快照"""
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -385,8 +386,14 @@ CREATE INDEX IF NOT EXISTS idx_kol_llm_logs_created ON kol_llm_logs(created_at);
 
 
 @contextmanager
-def get_conn():
-    conn = sqlite3.connect(config.DB_PATH, timeout=30.0)
+def get_conn(db_path: str = None):
+    """db_path=None → system.db；否则 → 指定路径"""
+    path = db_path if db_path else config.DB_PATH
+    # 确保 db/ 目录存在（sqlite3 不会自动创建父目录）
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
@@ -550,6 +557,116 @@ def init_db():
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA)
         _migrate(conn)
+    init_agent_dbs()
+
+
+def _init_one_agent_db(db_path: str, ddl: str):
+    """单个 Agent DB 初始化"""
+    with get_conn(db_path) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(ddl)
+
+
+_AGENT_MAIN_DDL = """\
+CREATE TABLE IF NOT EXISTS agent_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number    INTEGER NOT NULL,
+    token           TEXT    NOT NULL,
+    data            TEXT,
+    tier            TEXT,
+    passed          INTEGER DEFAULT 0,
+    hard_blocks     TEXT,
+    pass_count      INTEGER DEFAULT 0,
+    signal_key      TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_agent_candidates_token ON agent_candidates(token);
+CREATE INDEX IF NOT EXISTS idx_agent_candidates_round ON agent_candidates(round_number);
+"""
+
+_KOL_DDL = """\
+CREATE TABLE IF NOT EXISTS kol_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number    INTEGER NOT NULL,
+    token           TEXT    NOT NULL,
+    data            TEXT,
+    tier            TEXT,
+    passed          INTEGER DEFAULT 0,
+    hard_blocks     TEXT,
+    pass_count      INTEGER DEFAULT 0,
+    signal_key      TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_kol_candidates_token ON kol_candidates(token);
+CREATE TABLE IF NOT EXISTS kol_analyses (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token           TEXT NOT NULL,
+    trend           TEXT,
+    timeline        TEXT,
+    price_levels    TEXT,
+    summary         TEXT,
+    reasoning       TEXT,
+    position_analysis TEXT,
+    timing          TEXT,
+    risk_control    TEXT,
+    direction       TEXT,
+    confidence      TEXT,
+    reason          TEXT,
+    llm_log_id      INTEGER,
+    action          TEXT,
+    status          TEXT,
+    context_tag     TEXT,
+    evidence_tags   TEXT,
+    missing_data    TEXT,
+    raw_response    TEXT,
+    system_prompt   TEXT,
+    user_prompt     TEXT,
+    strategy        TEXT DEFAULT 'kol_agent',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_kol_analyses_token ON kol_analyses(token);
+CREATE INDEX IF NOT EXISTS idx_kol_analyses_created ON kol_analyses(created_at);
+CREATE TABLE IF NOT EXISTS kol_llm_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider        TEXT,
+    model           TEXT,
+    candidate_count INTEGER,
+    prompt_chars    INTEGER,
+    response_chars  INTEGER,
+    duration_ms     INTEGER,
+    success         INTEGER,
+    error           TEXT,
+    analyses_count  INTEGER,
+    system_prompt   TEXT,
+    user_prompt     TEXT,
+    raw_response    TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_NL_DDL = """\
+CREATE TABLE IF NOT EXISTS nl_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number    INTEGER NOT NULL,
+    token           TEXT    NOT NULL,
+    data            TEXT,
+    tier            TEXT,
+    passed          INTEGER DEFAULT 0,
+    hard_blocks     TEXT,
+    pass_count      INTEGER DEFAULT 0,
+    signal_key      TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_nl_candidates_token ON nl_candidates(token);
+"""
+
+
+def init_agent_dbs():
+    _init_one_agent_db(config.AGENT_MAIN_DB, _AGENT_MAIN_DDL)
+    _init_one_agent_db(config.KOL_DB, _KOL_DDL)
+    _init_one_agent_db(config.SNAPSHOT_DB, _KOL_DDL)
+    _init_one_agent_db(config.NL_DB, _NL_DDL)
 
 
 def upsert_author(conn, author: dict):
@@ -1048,26 +1165,29 @@ def trade_positions_all(conn, limit: int = 50) -> list[dict]:
 
 
 def trade_positions_with_kol_enrichment(conn) -> list[dict]:
-    """对所有持仓，对 kol_agent 策略补 entry_trend/confidence / latest_trend/confidence"""
+    """对所有持仓，对 kol_agent/snapshot 策略补 entry_trend/confidence"""
     positions = trade_positions_all(conn, limit=10000)
-    for p in positions:
-        if p.get("strategy") not in ("kol_agent", "kol_snapshot"):
-            continue
-        token = p["token"]
-        row = conn.execute(
-            "SELECT trend, confidence FROM kol_analyses WHERE token=? AND created_at <= ? ORDER BY id DESC LIMIT 1",
-            (token, p["created_at"]),
-        ).fetchone()
-        if row:
-            p["entry_trend"] = row["trend"]
-            p["entry_confidence"] = row["confidence"]
-        row = conn.execute(
-            "SELECT trend, confidence FROM kol_analyses WHERE token=? ORDER BY id DESC LIMIT 1",
-            (token,),
-        ).fetchone()
-        if row:
-            p["latest_trend"] = row["trend"]
-            p["latest_confidence"] = row["confidence"]
+    with get_conn(config.KOL_DB) as kol_conn, \
+         get_conn(config.SNAPSHOT_DB) as snap_conn:
+        for p in positions:
+            if p.get("strategy") not in ("kol_agent", "kol_snapshot"):
+                continue
+            token = p["token"]
+            c = snap_conn if p.get("strategy") == "kol_snapshot" else kol_conn
+            row = c.execute(
+                "SELECT trend, confidence FROM kol_analyses WHERE token=? AND created_at <= ? ORDER BY id DESC LIMIT 1",
+                (token, p["created_at"]),
+            ).fetchone()
+            if row:
+                p["entry_trend"] = row["trend"]
+                p["entry_confidence"] = row["confidence"]
+            row = c.execute(
+                "SELECT trend, confidence FROM kol_analyses WHERE token=? ORDER BY id DESC LIMIT 1",
+                (token,),
+            ).fetchone()
+            if row:
+                p["latest_trend"] = row["trend"]
+                p["latest_confidence"] = row["confidence"]
     return positions
 
 
@@ -1261,18 +1381,32 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
 
     返回：各表删除的行数 + 新配置
     """
-    # 旧日志/教训标记失效，避免关联已删除的持仓数据
+    # 旧日志标记失效
     conn.execute("UPDATE journal SET reviewed = 1")
-    conn.execute("UPDATE lessons SET learned = 1")
     positions_deleted = conn.execute("DELETE FROM trade_positions").rowcount or 0
     locks_deleted = conn.execute("DELETE FROM trade_signal_locks").rowcount or 0
     decisions_deleted = conn.execute("DELETE FROM pending_decisions").rowcount or 0
-    candidates_deleted = conn.execute("DELETE FROM agent_candidates").rowcount or 0
+
+    # 候选池和分析记录在 agent DB
+    candidates_deleted = 0
+    with get_conn(config.AGENT_MAIN_DB) as ac:
+        candidates_deleted += ac.execute("DELETE FROM agent_candidates").rowcount or 0
+    with get_conn(config.NL_DB) as ac:
+        candidates_deleted += ac.execute("DELETE FROM nl_candidates").rowcount or 0
+    with get_conn(config.KOL_DB) as ac:
+        candidates_deleted += ac.execute("DELETE FROM kol_candidates").rowcount or 0
+        ac.execute("DELETE FROM kol_analyses")
+        ac.execute("DELETE FROM kol_llm_logs")
+    with get_conn(config.SNAPSHOT_DB) as ac:
+        candidates_deleted += ac.execute("DELETE FROM kol_candidates").rowcount or 0
+        ac.execute("DELETE FROM kol_analyses")
+        ac.execute("DELETE FROM kol_llm_logs")
 
     # AUTOINCREMENT 计数器也重置
-    for tbl in ("trade_positions", "trade_signal_locks",
-                "pending_decisions", "agent_candidates"):
+    for tbl in ("trade_positions", "trade_signal_locks", "pending_decisions"):
         conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (tbl,))
+    with get_conn(config.AGENT_MAIN_DB) as ac:
+        ac.execute("DELETE FROM sqlite_sequence WHERE name = 'agent_candidates'")
 
     if new_initial_balance is not None and new_initial_balance > 0:
         trading_settings_update(conn, {"initial_balance": new_initial_balance})
@@ -1320,9 +1454,6 @@ def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None 
         "UPDATE journal SET reviewed = 1 WHERE order_id IN "
         "(SELECT id FROM trade_positions WHERE strategy = ?)", (strategy,)
     ).rowcount or 0
-    lesson_marked = conn.execute(
-        "UPDATE lessons SET learned = 1 WHERE strategy = ?", (strategy,)
-    ).rowcount or 0
 
     pos_del = conn.execute(
         "DELETE FROM trade_positions WHERE strategy = ?", (strategy,)
@@ -1340,17 +1471,21 @@ def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None 
 
     cand_del = 0
     if strategy == "agent":
-        cand_del = conn.execute("DELETE FROM agent_candidates").rowcount or 0
+        with get_conn(config.AGENT_MAIN_DB) as ac:
+            cand_del = ac.execute("DELETE FROM agent_candidates").rowcount or 0
     elif strategy == "agent_no_lessons":
-        cand_del = conn.execute("DELETE FROM nl_candidates").rowcount or 0
+        with get_conn(config.NL_DB) as ac:
+            cand_del = ac.execute("DELETE FROM nl_candidates").rowcount or 0
     elif strategy == "kol_agent":
-        cand_del = conn.execute("DELETE FROM kol_candidates").rowcount or 0
-        conn.execute("DELETE FROM kol_analyses")
-        conn.execute("DELETE FROM kol_llm_logs")
+        with get_conn(config.KOL_DB) as ac:
+            cand_del = ac.execute("DELETE FROM kol_candidates").rowcount or 0
+            ac.execute("DELETE FROM kol_analyses WHERE strategy = 'kol_agent'")
+            ac.execute("DELETE FROM kol_llm_logs")  # 无 strategy 列，物理隔离=过滤
     elif strategy == "kol_snapshot":
-        cand_del = conn.execute("DELETE FROM kol_candidates").rowcount or 0
-        conn.execute("DELETE FROM kol_analyses WHERE strategy = 'kol_snapshot'")
-        conn.execute("DELETE FROM kol_llm_logs")
+        with get_conn(config.SNAPSHOT_DB) as ac:
+            cand_del = ac.execute("DELETE FROM kol_candidates").rowcount or 0
+            ac.execute("DELETE FROM kol_analyses WHERE strategy = 'kol_snapshot'")
+            ac.execute("DELETE FROM kol_llm_logs")  # 无 strategy 列，物理隔离=过滤
 
     settings = trading_settings_get(conn)
     return {
@@ -1567,9 +1702,14 @@ def watchlist_followups_purge_old(conn, days: int = 3):
 
 # === KOL Agent ===
 
-def kol_analysis_insert(conn, analysis: dict):
+def kol_analysis_insert(conn, analysis: dict, agent_db: str = None):
     import json as _json
-    conn.execute(
+    c = conn
+    if agent_db:
+        os.makedirs(os.path.dirname(agent_db) or ".", exist_ok=True)
+        c = sqlite3.connect(agent_db, timeout=30.0)
+        c.execute("PRAGMA journal_mode = WAL")
+    c.execute(
         """INSERT INTO kol_analyses
             (token, trend, timeline, price_levels, summary, reasoning,
              position_analysis, timing, risk_control, direction, confidence,
@@ -1595,6 +1735,9 @@ def kol_analysis_insert(conn, analysis: dict):
             analysis.get("missing_data", "无"),
         ),
     )
+    if agent_db:
+        c.commit()
+        c.close()
 
 
 def kol_analyses_latest(conn, symbol: str = "", strategy: str = ""):
@@ -1658,11 +1801,18 @@ def kol_analyses_latest(conn, symbol: str = "", strategy: str = ""):
     return results
 
 
-def kol_llm_log_insert(conn, log: dict):
+def kol_llm_log_insert(conn, log: dict, agent_db: str = None):
     import time as _t
+    c = conn
+    close_after = False
+    if agent_db:
+        os.makedirs(os.path.dirname(agent_db) or ".", exist_ok=True)
+        c = sqlite3.connect(agent_db, timeout=30.0)
+        c.execute("PRAGMA journal_mode = WAL")
+        close_after = True
     for attempt in range(5):
         try:
-            conn.execute(
+            c.execute(
                 """INSERT INTO kol_llm_logs
                     (provider, model, candidate_count, prompt_chars, response_chars,
                      duration_ms, success, error, analyses_count,
@@ -1673,11 +1823,17 @@ def kol_llm_log_insert(conn, log: dict):
                  log.get("success", 0), log.get("error"), log.get("analyses_count", 0),
                  log.get("system_prompt"), log.get("user_prompt"), log.get("raw_response")),
             )
-            return
+            log_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            if close_after:
+                c.commit()
+                c.close()
+            return log_id
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower() and attempt < 4:
                 _t.sleep(1 + attempt * 0.5)
             else:
+                if close_after:
+                    c.close()
                 raise
 
 

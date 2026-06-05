@@ -62,7 +62,7 @@ def _cache_invalidate(*keys):
 
 
 # === Agent 候选币收集器 ===
-# 后台线程每 3 秒复现面板"合约扫描与操作建议"，
+# 后台线程每 3 秒复现面板"做多建议"，
 # 累计后每隔指定分钟入库 agent_candidates 并触发 Agent。
 _collected = {}          # token → {token, data, tier, passed, ...}
 _last_flush = time.time()
@@ -163,12 +163,41 @@ def _scan_candidates():
             conn, items, passed_only=True)
 
 
+def _scan_short_candidates():
+    """做空候选币"""
+    with storage.get_conn() as conn:
+        items, skipped = _build_leaderboard_items(conn)
+        return trade_logic.build_trade_candidates_from_leaderboard(
+            conn, items, passed_only=True, direction="short")
+
+
 def _scan_candidates_kol():
     """KOL 专用 — 返回所有有行情数据的代币（不过滤 passed）"""
     with storage.get_conn() as conn:
         items, skipped = _build_leaderboard_items(conn)
         return trade_logic.build_trade_candidates_from_leaderboard(
             conn, items, passed_only=False)
+
+
+def _scan_kol_display():
+    """KOL 候选展示 — 跟 KOL 策略同筛选逻辑，纯读，不触发 LLM"""
+    with storage.get_conn() as conn:
+        items, skipped = _build_leaderboard_items(conn)
+        candidates = []
+        for rank, item in enumerate(items, 1):
+            is_kol, kol_reasons = kol_agent.kol_is_interesting(item)
+            if not is_kol:
+                continue
+            market = item.get("market") or trade_logic._load_market(conn, item["token"])
+            realtime = trade_logic._load_realtime(conn, item["token"])
+            price = trade_logic._current_price(market, realtime)
+            candidates.append({
+                "token": item["token"], "rank": rank, "price": price,
+                "suggestion": "KOL关注", "reasons": kol_reasons,
+                "has_active_position": storage.trade_has_active(conn, item["token"]),
+                "direction": "kol", "passed": True,
+            })
+        return candidates
 
 
 def _run_kol_agent():
@@ -261,9 +290,13 @@ def _collect_loop():
     ts_settings = {}  # 心跳刷新，供 flush 点读取开关
     # 从 DB 恢复 _kol_round 和 _nl_round，防止重启后读到旧轮数据
     try:
-        with storage.get_conn() as conn:
+        with storage.get_conn(config.KOL_DB) as conn:
             row = conn.execute("SELECT COALESCE(MAX(round_number), 0) FROM kol_candidates").fetchone()
             _kol_round = row[0] if row else 0
+        with storage.get_conn(config.SNAPSHOT_DB) as conn:
+            row = conn.execute("SELECT COALESCE(MAX(round_number), 0) FROM kol_candidates").fetchone()
+            _kol_snapshot_round = row[0] if row else 0
+        with storage.get_conn(config.NL_DB) as conn:
             row = conn.execute("SELECT COALESCE(MAX(round_number), 0) FROM nl_candidates").fetchone()
             _nl_round = row[0] if row else 0
     except Exception:
@@ -302,21 +335,22 @@ def _collect_loop():
             # === KOL Agent：独立数据源，异常度筛选 ===
             if ts_settings.get("kol_agent_enabled", True) or ts_settings.get("kol_snapshot_enabled", True):
                 kol_candidates = _cached("kol_candidates_scan", cache_ttl, _scan_candidates_kol)
-                for c in kol_candidates:
-                    if not kol_agent.kol_is_interesting(c):
-                        continue
-                    _kol_collected[c["token"]] = {
-                        "token": c["token"],
-                        "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
-                        "tier": c.get("tier", ""),
-                        "passed": 1,
-                        "hard_blocks": json.dumps(c.get("hard_block", [])),
-                        "pass_count": c.get("pass_count", 0),
-                        "signal_key": c.get("signal_key", ""),
-                    }
+                if ts_settings.get("kol_agent_enabled", True):
+                    for c in kol_candidates:
+                        if not kol_agent.kol_is_interesting(c)[0]:
+                            continue
+                        _kol_collected[c["token"]] = {
+                            "token": c["token"],
+                            "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
+                            "tier": c.get("tier", ""),
+                            "passed": 1,
+                            "hard_blocks": json.dumps(c.get("hard_block", [])),
+                            "pass_count": c.get("pass_count", 0),
+                            "signal_key": c.get("signal_key", ""),
+                        }
                 if ts_settings.get("kol_snapshot_enabled", True):
                     for c in kol_candidates:
-                        if not kol_agent.kol_is_interesting(c):
+                        if not kol_agent.kol_is_interesting(c)[0]:
                             continue
                         _kol_snapshot_collected[c["token"]] = {
                             "token": c["token"],
@@ -393,10 +427,11 @@ def _collect_loop():
                     batch = list(_collected.values())
 
                     if ts_settings.get("agent_trade_enabled", True):
-                        with storage.get_conn() as conn:
-                            last_round = conn.execute(
+                        with storage.get_conn() as sys_conn:
+                            last_round = sys_conn.execute(
                                 "SELECT COALESCE(MAX(round_number), 0) FROM token_heat_history"
                             ).fetchone()[0]
+                        with storage.get_conn(config.AGENT_MAIN_DB) as conn:
                             storage.agent_candidates_insert_batch(conn, last_round, batch)
                             storage.agent_candidates_purge_old(conn, keep_last_rounds=50)
 
@@ -418,7 +453,7 @@ def _collect_loop():
             if (ts_settings.get("kol_agent_enabled", True) and _kol_collected
                     and not _kol_running and now - _kol_last_flush >= kol_interval_seconds):
                 batch = list(_kol_collected.values())
-                with storage.get_conn() as conn:
+                with storage.get_conn(config.KOL_DB) as conn:
                     storage.kol_candidates_insert_batch(conn, _kol_round + 1, batch)
                     storage.kol_candidates_purge_old(conn, keep_last_rounds=30)
                 _kol_last_flush = now
@@ -434,7 +469,7 @@ def _collect_loop():
             if (ts_settings.get("kol_snapshot_enabled", True) and _kol_snapshot_collected
                     and not _kol_snapshot_running and now - _kol_snapshot_last_flush >= kol_snapshot_interval_seconds):
                 batch = list(_kol_snapshot_collected.values())
-                with storage.get_conn() as conn:
+                with storage.get_conn(config.SNAPSHOT_DB) as conn:
                     storage.kol_candidates_insert_batch(conn, _kol_snapshot_round + 1, batch)
                     storage.kol_candidates_purge_old(conn, keep_last_rounds=30)
                 _kol_snapshot_last_flush = now
@@ -450,7 +485,7 @@ def _collect_loop():
             if (ts_settings.get("nl_agent_enabled", True) and _nl_collected
                     and not _nl_running and now - _nl_last_flush >= nl_interval_seconds):
                 batch = list(_nl_collected.values())
-                with storage.get_conn() as conn:
+                with storage.get_conn(config.NL_DB) as conn:
                     storage.nl_candidates_insert_batch(conn, _nl_round + 1, batch)
                     storage.nl_candidates_purge_old(conn, keep_last_rounds=30)
                 _nl_last_flush = now
@@ -896,12 +931,17 @@ def api_trading():
         with storage.get_conn() as conn:
             account = trade_logic.account_summary(conn)
             positions = storage.trade_positions_with_kol_enrichment(conn)
-            candidates = _cached("candidates_scan", getattr(config, "AGENT_COLLECT_CACHE_TTL", 5), _scan_candidates)
+            candidates = _cached("candidates_scan", ttl, _scan_candidates)
+        short_candidates = _cached("short_candidates_scan", ttl, _scan_short_candidates)
+        kol_candidates = _cached("kol_display_scan", ttl, _scan_kol_display)
         return {
             "account": account,
             "positions": positions,
             "candidates": candidates,
+            "short_candidates": short_candidates,
+            "kol_candidates": kol_candidates,
         }
+    ttl = getattr(config, "AGENT_COLLECT_CACHE_TTL", 5)
     return _cached("trading", 2.0, compute)
 
 
@@ -1249,8 +1289,9 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
 
 @app.get("/api/agent/lessons")
 def api_agent_lessons(strategy: str = "agent", limit: int = 20, offset: int = 0, all: int = 0):
-    """Agent 教训库 + 统计（策略隔离），分页。all=1 显示全部含已失效"""
-    with storage.get_conn() as conn:
+    """Agent 教训库 + 统计（策略隔离）。lessons 在 system.db，按 strategy 列过滤"""
+    db = config.DB_PATH
+    with storage.get_conn(db) as conn:
         if all:
             total = conn.execute(
                 f"SELECT COUNT(*) FROM lessons WHERE strategy='{strategy}'"
@@ -1278,11 +1319,11 @@ def api_agent_lessons_toggle(id: int = 0):
         raise HTTPException(400, "需要 id")
     with storage.get_conn() as conn:
         row = conn.execute("SELECT learned FROM lessons WHERE id=?", (id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "不存在")
-        new_val = 0 if row["learned"] else 1
-        conn.execute("UPDATE lessons SET learned=? WHERE id=?", (new_val, id))
-    return {"ok": True, "id": id, "learned": bool(new_val)}
+        if row:
+            new_val = 0 if row["learned"] else 1
+            conn.execute("UPDATE lessons SET learned=? WHERE id=?", (new_val, id))
+            return {"ok": True, "id": id, "learned": bool(new_val)}
+    raise HTTPException(404, "不存在")
 
 
 # === 前端页面 ===
@@ -1579,6 +1620,9 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 }
 .candidate-item.pass { border-left: 3px solid var(--green); }
 .candidate-item.wait { border-left: 3px solid var(--yellow); }
+.candidate-item.short.pass { border-left: 3px solid var(--red); }
+.candidate-item.short.wait { border-left: 3px solid var(--orange); }
+.candidate-item.kol { border-left: 3px solid var(--purple); }
 .open-btn {
   background: var(--green); color: #000; border: none;
   padding: 2px 8px; border-radius: 3px; cursor: pointer;
@@ -1661,8 +1705,14 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 </div>
 
 <div class="panel">
-  <h2 style="margin-top:0">合约扫描与操作建议</h2>
+  <h2 style="margin-top:0">做多建议</h2>
   <div id="trade-candidates"><div class="empty">等待扫描数据...</div></div>
+
+  <h2 style="margin-top:16px">做空建议</h2>
+  <div id="short-candidates"><div class="empty">等待扫描数据...</div></div>
+
+  <h2 style="margin-top:16px">综合建议</h2>
+  <div id="kol-candidates"><div class="empty">等待扫描数据...</div></div>
 </div>
 
 <div class="panel">
@@ -2277,12 +2327,14 @@ async function loadLossSamples() {
 // === 自动交易面板 ===
 function renderTradingPanel(data) {
   renderTradeCandidates(data.candidates || []);
+  renderShortCandidates(data.short_candidates || []);
+  renderKolCandidates(data.kol_candidates || []);
 }
 
 function renderTradeCandidates(items) {
   const el = document.getElementById('trade-candidates');
   if (!items.length) {
-    el.innerHTML = '<div class="empty">暂无符合自动开仓要求的代币</div>';
+    el.innerHTML = '<div class="empty">暂无做多建议</div>';
     return;
   }
   el.innerHTML = '<div class="candidate-list">' + items.map(c => {
@@ -2296,13 +2348,45 @@ function renderTradeCandidates(items) {
   }).join('') + '</div>';
 }
 
+function renderShortCandidates(items) {
+  const el = document.getElementById('short-candidates');
+  if (!items.length) {
+    el.innerHTML = '<div class="empty">暂无做空建议</div>';
+    return;
+  }
+  el.innerHTML = '<div class="candidate-list">' + items.map(c => {
+    const cls = c.passed ? 'pass' : 'wait';
+    const action = c.has_active_position ? '已有持仓/挂单' : c.suggestion;
+    const reasons = (c.reasons || []).slice(0, 6).join(' · ');
+    return `<div class="candidate-item short ${cls}">
+      <div><span class="token">${c.token}</span> #${c.rank} · ${action} · 市价 ${fmtPrice(c.price)}</div>
+      <div class="muted" style="margin-top:5px;">${reasons}</div>
+    </div>`;
+  }).join('') + '</div>';
+}
+
+function renderKolCandidates(items) {
+  const el = document.getElementById('kol-candidates');
+  if (!items.length) {
+    el.innerHTML = '<div class="empty">暂无综合建议</div>';
+    return;
+  }
+  el.innerHTML = '<div class="candidate-list">' + items.map(c => {
+    const action = c.has_active_position ? '已有持仓/挂单' : '综合建议';
+    const reasons = (c.reasons || []).length ? ' · ' + c.reasons.join(' · ') : '';
+    return `<div class="candidate-item kol pass">
+      <div><span class="token">${c.token}</span> #${c.rank} · ${action}${reasons} · 市价 ${fmtPrice(c.price)}</div>
+    </div>`;
+  }).join('') + '</div>';
+}
+
 async function loadTradingPanel() {
   try {
     const resp = await fetch('/api/trading');
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     renderTradingPanel(await resp.json());
   } catch (e) {
-    document.getElementById('trade-summary').innerHTML =
+    document.getElementById('trade-candidates').innerHTML =
       `<div class="empty">交易面板加载失败：${e.message}</div>`;
   }
 }
@@ -3754,24 +3838,27 @@ def api_strategy_stats():
             "FROM trade_positions WHERE strategy IS NOT NULL "
             "ORDER BY id DESC LIMIT 500"
         )]
-        # 为 KOL 策略持仓补 trend + confidence
-        for p in positions:
-            if p.get("strategy") not in ("kol_agent", "kol_snapshot"):
-                continue
-            row = conn.execute(
-                "SELECT trend, confidence FROM kol_analyses WHERE token=? AND created_at <= ? ORDER BY id DESC LIMIT 1",
-                (p["token"], p["created_at"]),
-            ).fetchone()
-            if row:
-                p["entry_trend"] = row["trend"]
-                p["entry_confidence"] = row["confidence"]
-            row = conn.execute(
-                "SELECT trend, confidence FROM kol_analyses WHERE token=? ORDER BY id DESC LIMIT 1",
-                (p["token"],),
-            ).fetchone()
-            if row:
-                p["latest_trend"] = row["trend"]
-                p["latest_confidence"] = row["confidence"]
+        # 为 KOL 策略持仓补 trend + confidence（kol_analyses 在 agent DB）
+        with storage.get_conn(config.KOL_DB) as kol_conn, \
+             storage.get_conn(config.SNAPSHOT_DB) as snap_conn:
+            for p in positions:
+                if p.get("strategy") not in ("kol_agent", "kol_snapshot"):
+                    continue
+                c = snap_conn if p.get("strategy") == "kol_snapshot" else kol_conn
+                row = c.execute(
+                    "SELECT trend, confidence FROM kol_analyses WHERE token=? AND created_at <= ? ORDER BY id DESC LIMIT 1",
+                    (p["token"], p["created_at"]),
+                ).fetchone()
+                if row:
+                    p["entry_trend"] = row["trend"]
+                    p["entry_confidence"] = row["confidence"]
+                row = c.execute(
+                    "SELECT trend, confidence FROM kol_analyses WHERE token=? ORDER BY id DESC LIMIT 1",
+                    (p["token"],),
+                ).fetchone()
+                if row:
+                    p["latest_trend"] = row["trend"]
+                    p["latest_confidence"] = row["confidence"]
         for s in strategies:
             s["loss_tags"] = loss_tags.get(s["strategy"], {})
             s["account"] = trade_logic.strategy_account_summary(conn, s["strategy"])
@@ -3816,13 +3903,15 @@ def api_ai_regime_refresh():
 
 @app.get("/api/kol/llm-logs")
 def api_kol_llm_logs(limit: int = 30, strategy: str = ""):
-    with storage.get_conn() as conn:
+    db = config.SNAPSHOT_DB if strategy == "kol_snapshot" else config.KOL_DB
+    with storage.get_conn(db) as conn:
         return storage.kol_llm_logs_recent(conn, limit, strategy=strategy)
 
 
 @app.get("/api/kol/analyses")
 def api_kol_analyses(symbol: str = "", strategy: str = ""):
-    with storage.get_conn() as conn:
+    db = config.SNAPSHOT_DB if strategy == "kol_snapshot" else config.KOL_DB
+    with storage.get_conn(db) as conn:
         rows = storage.kol_analyses_latest(conn, symbol=symbol, strategy=strategy)
     tokens = list(dict.fromkeys(r["token"] for r in rows))
     by_token = {}

@@ -16,12 +16,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent          # agent-review/scripts/
 PROJECT_DIR = SCRIPT_DIR.parent.parent                # bsm-agent/
 sys.path.insert(0, str(PROJECT_DIR))
 
-DB_NAME = "binance_square.db"
 try:
     import config
     db_root = getattr(config, "AGENT_DB_ROOT", "")
+    DB_NAME = getattr(config, "DB_PATH", "db/binance_square.db")
 except Exception:
     db_root = ""
+    DB_NAME = "db/binance_square.db"
 
 if db_root:
     DB = str(Path(os.path.expanduser(db_root)) / DB_NAME)
@@ -200,7 +201,7 @@ if close_order_ids:
         close_order_ids,
     )]
 
-# ---- 已有 lessons ----
+# ---- 已有 lessons（在 system.db，按 strategy 过滤）----
 existing_lessons = [dict(r) for r in conn.execute(
     "SELECT id, token, root_cause, rule_update, severity, created_at "
     "FROM lessons WHERE learned=0 AND strategy='heat_agent_lessons' ORDER BY id DESC"

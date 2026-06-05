@@ -1,4 +1,5 @@
 """修复 heat_agent 复盘教训的串位数据：strategy='0' + learned='heat_agent' → strategy='heat_agent' + learned=0"""
+import os
 import sqlite3
 import sys
 
@@ -6,6 +7,7 @@ import config
 import storage
 
 DB = config.DB_PATH
+os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
 
 conn = sqlite3.connect(DB)
 conn.row_factory = sqlite3.Row

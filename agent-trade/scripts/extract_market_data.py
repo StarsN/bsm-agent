@@ -18,13 +18,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent          # agent-trade/scripts/
 PROJECT_DIR = SCRIPT_DIR.parent.parent                # bsm-agent/
 sys.path.insert(0, str(PROJECT_DIR))
 
-DB_NAME = "binance_square.db"
-
 try:
     import config
     db_root = getattr(config, "AGENT_DB_ROOT", "")
+    DB_NAME = getattr(config, "DB_PATH", "db/binance_square.db")
 except Exception:
     db_root = ""
+    DB_NAME = "db/binance_square.db"
 
 if db_root:
     DB = str(Path(os.path.expanduser(db_root)) / DB_NAME)
@@ -145,22 +145,30 @@ if fng_data and fng_data.get("data"):
     except (TypeError, ValueError, KeyError, IndexError):
         pass
 
-# ---- 候选币（agent_candidates 时间窗口）----
+# ---- 候选币（agent_candidates 在 agent_main.db）----
 inter_min = 15
 try:
     ts = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM trading_settings").fetchall()}
     inter_min = int(ts.get("agent_collect_interval_minutes", getattr(config, "AGENT_COLLECT_INTERVAL_MINUTES", 15)))
 except Exception:
     pass
-ac_rows = conn.execute(
-    "SELECT a.data FROM agent_candidates a "
-    "INNER JOIN ("
-    "  SELECT token, MAX(id) AS max_id FROM agent_candidates "
-    f"  WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
-    "  GROUP BY token"
-    ") b ON a.id = b.max_id "
-    "ORDER BY a.id"
-).fetchall()
+ac_rows = []
+try:
+    _agent_db = str(PROJECT_DIR / getattr(config, "AGENT_MAIN_DB", "db/agent_main.db"))
+    _agent_conn = sqlite3.connect(_agent_db)
+    _agent_conn.row_factory = sqlite3.Row
+    ac_rows = _agent_conn.execute(
+        f"SELECT a.data FROM agent_candidates a "
+        "INNER JOIN ("
+        "  SELECT token, MAX(id) AS max_id FROM agent_candidates "
+        f"  WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
+        "  GROUP BY token"
+        ") b ON a.id = b.max_id "
+        "ORDER BY a.id"
+    ).fetchall()
+    _agent_conn.close()
+except Exception:
+    pass
 
 candidates = []
 for r in ac_rows:

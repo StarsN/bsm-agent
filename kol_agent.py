@@ -500,37 +500,44 @@ def _parse_response(raw: str) -> list[dict]:
     return []
 
 
-def kol_is_interesting(candidate: dict) -> bool:
-    """KOL 策略代币异常度筛选。OI异常 + 费率异常 + 价格乖离 ≥2 → 入选 | vol/OI > 20x → 排除"""
+def kol_is_interesting(candidate: dict):
+    """KOL 策略代币异常度筛选。OI异常 + 费率异常 + 价格乖离 ≥2 → 入选 | vol/OI > 20x → 排除
+    返回 (是否关注, 异常原因列表)"""
+    reasons = []
     snap = candidate.get("market", {}).get("snapshot", {})
     if not snap or not snap.get("mark_price"):
-        return False
+        return False, reasons
     vol_oi = snap.get("vol_oi_ratio")
     if vol_oi is not None and float(vol_oi) > getattr(config, "KOL_MAX_VOL_OI", 20):
-        return False
+        return False, reasons
     score = 0
-    if abs(snap.get("oi_change_1h_pct") or 0) > getattr(config, "KOL_MIN_OI_CHANGE_1H_PCT", 3) \
-       or abs(snap.get("oi_change_4h_pct") or 0) > getattr(config, "KOL_MIN_OI_CHANGE_4H_PCT", 8):
+    if abs(snap.get("oi_change_1h_pct") or 0) > getattr(config, "KOL_MIN_OI_CHANGE_1H_PCT", 4) \
+       or abs(snap.get("oi_change_4h_pct") or 0) > getattr(config, "KOL_MIN_OI_CHANGE_4H_PCT", 10):
         score += 1
+        reasons.append("OI异动")
     if abs(snap.get("funding_rate_pct") or 0) > getattr(config, "KOL_MIN_FUNDING_ABS_PCT", 0.03):
         score += 1
-    if abs(snap.get("ma20_deviation_pct") or 0) > getattr(config, "KOL_MIN_MA20_DEVIATION_PCT", 5):
+        reasons.append("费率异常")
+    if abs(snap.get("ma20_deviation_pct") or 0) > getattr(config, "KOL_MIN_MA20_DEVIATION_PCT", 2.5):
         score += 1
-    return score >= getattr(config, "KOL_MIN_ANOMALY_SCORE", 2)
+        reasons.append("MA20乖离")
+    return score >= getattr(config, "KOL_MIN_ANOMALY_SCORE", 2), reasons
 
 
 def get_kol_candidates(conn: sqlite3.Connection, strategy: str = "kol_agent") -> list[dict]:
-    """从 kol_candidates 读取候选币（按策略对应的时间窗口）"""
+    """从 kol_candidates 读取候选币（strategy 决定读哪个 agent DB）"""
     import json as _json
     ts = storage.trading_settings_get(conn)
     key = "kol_agent_interval_minutes" if strategy == "kol_agent" else "kol_snapshot_interval_minutes"
     default = getattr(config, "KOL_AGENT_INTERVAL_MINUTES", 15) if strategy == "kol_agent" else getattr(config, "KOL_SNAPSHOT_INTERVAL_MINUTES", 8)
     inter_min = int(ts.get(key, default))
-    rows = conn.execute(
-        f"SELECT data FROM kol_candidates "
-        f"WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
-        "ORDER BY id"
-    ).fetchall()
+    db_path = config.KOL_DB if strategy == "kol_agent" else config.SNAPSHOT_DB
+    with storage.get_conn(db_path) as agent_conn:
+        rows = agent_conn.execute(
+            f"SELECT data FROM kol_candidates "
+            f"WHERE created_at >= datetime('now', '-{inter_min + 2} minutes') "
+            "ORDER BY id"
+        ).fetchall()
     candidates = []
     for r in rows:
         try:
@@ -761,7 +768,7 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
             if batch_analyses:
                 for c in batch:
                     cooldown_tokens.add(c.get("token", "").upper())
-            storage.kol_llm_log_insert(conn, {
+            log_id = storage.kol_llm_log_insert(conn, {
                 "provider": provider, "model": model,
                 "candidate_count": len(batch),
                 "prompt_chars": len(system) + len(user),
@@ -771,8 +778,7 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
                 "error": "" if (raw and batch_analyses) else ("解析失败" if raw else "API调用失败"),
                 "analyses_count": len(batch_analyses),
                 "system_prompt": system, "user_prompt": user, "raw_response": raw,
-            })
-            log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            }, agent_db=config.SNAPSHOT_DB)
             for a in batch_analyses:
                 all_analyses.append((a, log_id))
             print(f"[kol_snapshot] key {i+1}/{len(api_keys)}: {len(batch)}候选 -> {len(batch_analyses)}条 ({_elapsed}ms)")
@@ -788,7 +794,7 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
         a["token"] = token
         a["llm_log_id"] = log_id
         a["strategy"] = "kol_snapshot"
-        storage.kol_analysis_insert(conn, a)
+        storage.kol_analysis_insert(conn, a, agent_db=config.SNAPSHOT_DB)
         written += 1
 
     conn.commit()
@@ -798,10 +804,9 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
 
     if all_analyses:
         analyses = [a for a, _ in all_analyses]
-        opened = _execute_kol_trades(conn, analyses, candidates, strategy="kol_snapshot")
-        if opened:
-            conn.commit()
-            print(f"[kol_snapshot] 下单 {opened} 笔")
+        _execute_kol_trades(conn, analyses, candidates, strategy="kol_snapshot")
+        conn.commit()
+        print("[kol_snapshot] 决策已入库，等待 auto_trader 执行")
 
     return analyses
 
@@ -907,7 +912,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
             if batch_analyses:
                 for c in batch:
                     cooldown_tokens.add(c.get("token", "").upper())
-            storage.kol_llm_log_insert(conn, {
+            log_id = storage.kol_llm_log_insert(conn, {
                 "provider": provider,
                 "model": model,
                 "candidate_count": len(batch),
@@ -920,8 +925,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
                 "system_prompt": system,
                 "user_prompt": user,
                 "raw_response": raw,
-            })
-            log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            }, agent_db=config.KOL_DB)
             for a in batch_analyses:
                 all_analyses.append((a, log_id))
             print(f"[kol_agent]   key {i+1}/{len(api_keys)}: {len(batch)}个候选 → {len(batch_analyses)}条分析 ({_elapsed}ms)")
@@ -938,7 +942,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
         a["token"] = token
         a["llm_log_id"] = log_id
         a["strategy"] = "kol_agent"
-        storage.kol_analysis_insert(conn, a)
+        storage.kol_analysis_insert(conn, a, agent_db=config.KOL_DB)
         written += 1
 
     conn.commit()
@@ -949,10 +953,9 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
     # 接入系统下单：confidence>=70 且 direction=long/short
     if all_analyses:
         analyses = [a for a, _ in all_analyses]
-        opened = _execute_kol_trades(conn, analyses, candidates)
-        if opened:
-            conn.commit()
-            print(f"[kol_agent] 下单 {opened} 笔")
+        _execute_kol_trades(conn, analyses, candidates)
+        conn.commit()
+        print("[kol_agent] 决策已入库，等待 auto_trader 执行")
 
     return analyses
 
@@ -961,14 +964,12 @@ def _execute_kol_trades(conn, analyses, candidates, strategy="kol_agent"):
     """对 KOL 分析结果中满足条件的，挂单接入（策略隔离）
 
     status=ENTER + direction=long/short + confidence>=min_conf → 挂单。
-    统一走限价单，不设市价单。
-    """
-    from trade_logic import open_limit_position
+    auto_trader 统一执行挂单，避免多进程抢 DB 锁。"""
     candidate_map = {c["token"]: c for c in candidates}
     settings = storage.trading_settings_get(conn)
     prefix = "kol_snapshot" if strategy == "kol_snapshot" else "kol_agent"
     min_conf = int(settings.get(f"{prefix}_min_confidence", 70) or 70)
-    opened = 0
+    inserted = 0
     for a in analyses:
         direction = a.get("direction", "")
         confidence = int(a.get("confidence", 0) or 0)
@@ -1010,24 +1011,9 @@ def _execute_kol_trades(conn, analyses, candidates, strategy="kol_agent"):
             (action, token, tier, entry_price_f, reason, strategy,
              original.get("social_score", 0), original.get("mentions", 0)),
         )
-        pd_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        result = open_limit_position(
-            conn, token, side, entry_price_f,
-            tier=tier, strategy=strategy,
-            pending_decision_id=pd_id,
-        )
-        ok = result.get("ok", False)
-        if ok:
-            print(f"[{strategy}] 挂单 {token} {side} @ {entry_price_f} conf={confidence} tier={tier}")
-            opened += 1
-        else:
-            reject_reason = result.get("reason", "")
-            print(f"[{strategy}] 挂单被拒 {token} {side}: {reject_reason}")
-            conn.execute(
-                "UPDATE pending_decisions SET status = 'rejected', reject_reason = ? WHERE id = ?",
-                (reject_reason, pd_id),
-            )
-    return opened
+        print(f"[{strategy}] 决策入库 {token} {side} @ {entry_price_f} conf={confidence} tier={tier}")
+        inserted += 1
+    return inserted
 
 
 # ------------------------------------------------------------

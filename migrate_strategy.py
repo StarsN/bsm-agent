@@ -2,7 +2,7 @@
 """一次性脚本：存量 NULL 回填（DDL 由 init_db() 启动时自动处理，脚本只管数据）"""
 import sqlite3, sys, os
 
-DB = "binance_square.db"
+DB = "db/binance_square.db"
 if len(sys.argv) > 1:
     DB = sys.argv[1]
 

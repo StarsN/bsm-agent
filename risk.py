@@ -421,6 +421,136 @@ def evaluate_entry_quality(
     }
 
 
+def evaluate_short_entry_quality(
+    snap: dict,
+    realtime: dict,
+    signal_score: float | None,
+    social_mentions: int = 0,
+) -> dict:
+    """
+    评估做空入场质量。7 项核心条件 + 8 项硬否决。
+    """
+    reasons_pass = []
+    reasons_fail = []
+    hard_block = []
+
+    def pct(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    ch15 = pct(snap.get("change_15m_pct"))
+    ch1h = pct(snap.get("change_1h_pct"))
+    ch4h = pct(snap.get("change_4h_pct"))
+    ch24h = pct(snap.get("change_24h_pct"))
+    oi15 = pct(snap.get("oi_change_15m_pct"))
+    oi4h = pct(snap.get("oi_change_4h_pct"))
+    taker = pct(realtime.get("trade_buy_sell_ratio_60s") or snap.get("taker_buy_sell_ratio"))
+    taker_trend = pct(snap.get("taker_trend_pct"))
+    fr_pct = pct(snap.get("funding_rate_pct"))
+    lsr = pct(snap.get("long_short_ratio"))
+    vol_oi = pct(snap.get("vol_oi_ratio"))
+
+    def _s(v, digits=2, sign=True):
+        if v is None:
+            return "-"
+        fmt = f"{{:+.{digits}f}}" if sign else f"{{:.{digits}f}}"
+        return fmt.format(v)
+
+    # ---- 硬否决 ----
+    # 1. 超卖
+    if ch24h is not None and ch24h <= config.TRADING_SHORT_MAX_CHANGE_24H_PCT:
+        hard_block.append(f"24h 跌幅 {_s(ch24h)}% 超过超卖下限 {config.TRADING_SHORT_MAX_CHANGE_24H_PCT}%")
+    # 2. 未充分拉伸
+    if ch4h is not None and ch4h < config.TRADING_SHORT_MIN_CHANGE_4H_PCT:
+        hard_block.append(f"4h 涨幅 {_s(ch4h)}% 低于做空最低阈值 {config.TRADING_SHORT_MIN_CHANGE_4H_PCT}%")
+    # 3. 空头拥挤
+    if fr_pct is not None and fr_pct <= config.TRADING_SHORT_MAX_FUNDING_PCT:
+        hard_block.append(f"资金费率 {_s(fr_pct,3)}%/8h <= {config.TRADING_SHORT_MAX_FUNDING_PCT}%，空头拥挤")
+    # 4. 散户空头过热
+    if lsr is not None and lsr <= config.TRADING_SHORT_MIN_LSR:
+        hard_block.append(f"散户多空比 {lsr:.2f} <= {config.TRADING_SHORT_MIN_LSR}，空头过热")
+    # 5. 买盘恢复
+    if taker is not None and taker >= config.TRADING_SHORT_MAX_TAKER_RATIO:
+        hard_block.append(f"主动买卖比 {taker:.2f} >= {config.TRADING_SHORT_MAX_TAKER_RATIO}，买盘恢复")
+    # 6. 买盘趋势恢复
+    if taker_trend is not None and taker_trend >= config.TRADING_SHORT_MAX_TAKER_RECOVERY:
+        hard_block.append(f"taker 趋势 {_s(taker_trend)}% >= {config.TRADING_SHORT_MAX_TAKER_RECOVERY}%，买盘恢复中")
+    # 7. 换手异常
+    max_vol_oi = getattr(config, "KOL_MAX_VOL_OI", 20)
+    if vol_oi is not None and vol_oi > max_vol_oi:
+        hard_block.append(f"vol/OI {vol_oi:.1f} > {max_vol_oi}，换手异常")
+    # 8. 全局开关
+    if not getattr(config, "SHORT_SELLING_ENABLED", False):
+        hard_block.append("做空功能未启用")
+
+    # 7 项核心条件
+    pass_count = 0
+    def check(cond, ok_msg, fail_msg):
+        nonlocal pass_count
+        if cond:
+            reasons_pass.append(ok_msg)
+            pass_count += 1
+        else:
+            reasons_fail.append(fail_msg)
+
+    # 1. 15m 短线在跌
+    check(ch15 is not None and ch15 < 0,
+          f"15m {_s(ch15)}% 短线下跌",
+          f"15m {_s(ch15)}% 未下跌")
+    # 2. 1h 短期向下
+    check(ch1h is not None and ch1h < 0,
+          f"1h {_s(ch1h)}% 短期向下",
+          f"1h {_s(ch1h)}% 未向下")
+    # 3. 多头拥挤
+    check(fr_pct is not None and fr_pct >= config.TRADING_SHORT_MIN_FUNDING_PCT,
+          f"资金费率 {_s(fr_pct,3)}%/8h >= {config.TRADING_SHORT_MIN_FUNDING_PCT}%，多头拥挤",
+          f"资金费率 {_s(fr_pct,3) if fr_pct else '-'}%/8h 不满足做空条件")
+    # 4. 卖压主导
+    check(taker is not None and taker < 1.0,
+          f"taker {taker:.2f} < 1.0 卖压主导",
+          f"taker {_s(taker)} >= 1.0 非卖压主导")
+    # 5. OI 15m 多头撤退
+    check(oi15 is not None and oi15 <= 0,
+          f"OI15m {_s(oi15,1)}% 多头撤退",
+          f"OI15m {_s(oi15,1)}% 未撤退")
+    # 6. OI 4h 派发 — OI 不增且价格未崩
+    oi4h_ok = oi4h is not None and oi4h <= 0
+    ch4h_check = ch4h is not None and ch4h > -3
+    check(oi4h_ok and ch4h_check,
+          f"OI4h {_s(oi4h,1)}% 多头撤退 + 价格仍高位",
+          f"OI4h {_s(oi4h,1)}% 或价格已崩，不满足派发条件")
+    # 7. 社交热度
+    check(social_mentions >= 3,
+          f"社交提及 {social_mentions} >= 3",
+          f"社交提及 {social_mentions} < 3")
+
+    # ---- 分档 ----
+    sig = signal_score if signal_score is not None else 0
+    all_pass = pass_count >= 7
+
+    if hard_block:
+        tier = "skip"
+    elif all_pass and sig >= config.TRADING_SIGNAL_FULL_THRESHOLD:
+        tier = "full"
+    elif pass_count >= config.TRADING_CORE_REQUIRED_PASS_COUNT and sig >= config.TRADING_SIGNAL_HALF_THRESHOLD:
+        tier = "half"
+    else:
+        tier = "skip"
+
+    return {
+        "tier": tier,
+        "pass_count": pass_count,
+        "total_count": 7,
+        "signal_score": signal_score,
+        "hard_block": hard_block,
+        "reasons_pass": reasons_pass,
+        "reasons_fail": reasons_fail,
+        "all_pass": all_pass,
+    }
+
+
 # ==========================================================================
 #                        组合/账户级风控检查
 # ==========================================================================

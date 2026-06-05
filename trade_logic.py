@@ -188,31 +188,25 @@ def _margin_pnl_pct(realized: float, unrealized: float, margin: float) -> float:
     return ((realized + unrealized) / (margin or 1)) * 100
 
 
-def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict) -> dict:
+def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict, direction: str = "long") -> dict:
     """
-    评估一个候选币是否可以开仓。
-
-    新架构（v2）：调用 risk.evaluate_entry_quality 得到 tier（full/half/skip），
-    而不是所有条件硬 AND。这样轻度不满足的信号可以半仓进场，同时保留追高硬否决。
-
-    返回字典新增字段：
-      tier:         "full" / "half" / "skip"
-      pass_count:   7 项核心条件通过数
-      hard_block:   硬否决原因列表（非空则必 skip）
-    原有 passed 字段继续保留，语义 = tier != "skip"，用于兼容旧代码。
+    评估一个候选币是否可以开仓。direction="short" 时评估做空。
     """
     token = score_row["token"]
     snap = market.get("snapshot") or {}
     analysis = market.get("analysis") or {}
     verdict = analysis.get("verdict") or ""
     signal_score = analysis.get("score")
+    social_mentions = score_row.get("mentions", 0)
 
-    quality = risk.evaluate_entry_quality(snap, realtime, signal_score, verdict)
+    if direction == "short":
+        quality = risk.evaluate_short_entry_quality(snap, realtime, signal_score, social_mentions)
+    else:
+        quality = risk.evaluate_entry_quality(snap, realtime, signal_score, verdict)
 
     tier = quality["tier"]
     passed = tier != "skip"
 
-    # 把 reasons 组装成旧格式，方便 UI 继续展示
     reasons = []
     for r in quality["reasons_pass"]:
         reasons.append("OK " + r)
@@ -227,13 +221,22 @@ def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict)
         tier = "skip"
         reasons.append("NO 缺少可用价格")
 
-    suggestion = {
-        "full": "可开多（满仓）",
-        "half": "可开多（半仓）",
-        "skip": "观察",
-    }[tier]
-    if quality["hard_block"]:
-        suggestion = "不追高"
+    if direction == "short":
+        suggestion = {
+            "full": "可开空（满仓）",
+            "half": "可开空（半仓）",
+            "skip": "观察",
+        }[tier]
+        if quality["hard_block"]:
+            suggestion = "不宜做空"
+    else:
+        suggestion = {
+            "full": "可开多（满仓）",
+            "half": "可开多（半仓）",
+            "skip": "观察",
+        }[tier]
+        if quality["hard_block"]:
+            suggestion = "不追高"
 
     return {
         "token": token,
@@ -249,12 +252,13 @@ def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict)
         "market": market,
         "realtime": realtime,
         "analysis_score": signal_score,
+        "direction": direction,
     }
 
 
 def build_trade_candidates_from_leaderboard(
         conn, leaderboard_items: list[dict], limit: int | None = None,
-        passed_only: bool = False) -> list[dict]:
+        passed_only: bool = False, direction: str = "long") -> list[dict]:
     candidates = []
     items = leaderboard_items[:limit] if limit else leaderboard_items
     signal_key = storage.leaderboard_signal_key(conn)
@@ -265,7 +269,7 @@ def build_trade_candidates_from_leaderboard(
             continue
         realtime = _load_realtime(conn, token)
         score_row = item.get("score_row") or item
-        result = evaluate_candidate(score_row, rank, market, realtime)
+        result = evaluate_candidate(score_row, rank, market, realtime, direction=direction)
         result["score"] = score_row
         result["signal_key"] = signal_key
         result["has_active_position"] = storage.trade_has_active(conn, token)

@@ -9,6 +9,7 @@
 """
 import asyncio
 import json
+import os
 import signal
 import sys
 import time
@@ -437,6 +438,12 @@ async def main():
                 if not _running:
                     break
                 await asyncio.sleep(1)
+
+            # 每轮结束后清理 Chromium 僵尸进程，防止内存累积
+            try:
+                os.system("pkill -f chromium 2>/dev/null")
+            except Exception:
+                pass
 
     console.print("[green]已退出[/green]")
 

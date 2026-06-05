@@ -18,13 +18,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent          # agent-trade/scripts/
 PROJECT_DIR = SCRIPT_DIR.parent.parent                # bsm-agent/
 sys.path.insert(0, str(PROJECT_DIR))
 
-DB_NAME = "binance_square.db"
-
 try:
     import config
     db_root = getattr(config, "AGENT_DB_ROOT", "")
+    DB_NAME = getattr(config, "DB_PATH", "db/binance_square.db")
 except Exception:
     db_root = ""
+    DB_NAME = "db/binance_square.db"
 
 if db_root:
     DB = str(Path(os.path.expanduser(db_root)) / DB_NAME)
@@ -275,6 +275,7 @@ for r in conn.execute(
     for t in json.loads(r["reason_tags"]):
         tag_stats[t] = tag_stats.get(t, 0) + 1
 
+# lessons 在 system.db，按 strategy 过滤
 agent_lessons = [dict(r) for r in conn.execute(
     """SELECT id, token, direction, entry_price, exit_price, pnl_pct,
        signal_error, what_missed, root_cause, lesson, rule_update, severity

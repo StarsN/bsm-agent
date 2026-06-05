@@ -256,7 +256,8 @@ def execute_close(conn, decision: dict) -> dict:
         qty = float(pos.get("quantity", 0))
         closed_qty = float(pos.get("closed_qty", 0))
         open_qty = max(qty - closed_qty, 0)
-        pnl = (price - entry) * open_qty
+        is_short = pos.get("side", "LONG") == "SHORT"
+        pnl = (entry - price) * open_qty if is_short else (price - entry) * open_qty
         realized = float(pos.get("realized_pnl", 0)) + pnl
         margin = float(pos.get("margin_amount", 1))
 
@@ -362,43 +363,67 @@ def one_scan():
     with storage.get_conn() as conn:
         pending = conn.execute(
             "SELECT * FROM pending_decisions "
-            "WHERE status = 'pending' AND source NOT IN ('kol_agent', 'kol_snapshot') "
+            "WHERE status = 'pending' "
             "ORDER BY created_at ASC "
             "LIMIT 5"
         ).fetchall()
 
-    source_map = {"agent_candidates": "agent", "token_heat_history": "heat_agent", "token_heat_history_lessons": "heat_agent_lessons", "nl_candidates": "agent_no_lessons"}
+    source_map = {"agent_candidates": "agent", "token_heat_history": "heat_agent", "token_heat_history_lessons": "heat_agent_lessons", "nl_candidates": "agent_no_lessons", "kol_agent": "kol_agent", "kol_snapshot": "kol_snapshot"}
     executed = 0
     for dec in pending:
         dec = dict(dec)
         strategy = source_map.get(dec.get("source", "agent_candidates"), "agent")
-        with storage.get_conn() as conn:
-            if dec["action"] == "open_long":
-                result = execute_open(conn, dec, settings, strategy)
-            elif dec["action"] == "close":
-                result = execute_close(conn, dec)
-            else:
-                result = {"ok": False, "reason": f"未知action: {dec['action']}"}
+        try:
+            with storage.get_conn() as conn:
+                if dec["action"] in ("open_long", "open_short") and dec.get("entry_price"):
+                    # 挂单：有 entry_price 走限价单
+                    side = "LONG" if dec["action"] == "open_long" else "SHORT"
+                    result = trade_logic.open_limit_position(
+                        conn, dec["token"], side, float(dec["entry_price"]),
+                        tier=dec.get("tier", "half"), strategy=strategy,
+                        pending_decision_id=dec["id"],
+                    )
+                elif dec["action"] == "open_long":
+                    result = execute_open(conn, dec, settings, strategy)
+                elif dec["action"] == "open_short":
+                    result = {"ok": False, "reason": "做空仅支持限价单（需要 entry_price），市价做空未实现"}
+                elif dec["action"] == "close":
+                    result = execute_close(conn, dec)
+                else:
+                    result = {"ok": False, "reason": f"未知action: {dec['action']}"}
 
-            # 更新决策状态
-            new_status = "consumed" if result.get("ok") else "rejected"
-            conn.execute(
-                "UPDATE pending_decisions "
-                "SET status = ?, consumed_at = datetime('now'), reject_reason = ? "
-                "WHERE id = ?",
-                (new_status, result.get("reason", ""), dec["id"]),
-            )
+                # 更新决策状态
+                new_status = "consumed" if result.get("ok") else "rejected"
+                conn.execute(
+                    "UPDATE pending_decisions "
+                    "SET status = ?, consumed_at = datetime('now'), reject_reason = ? "
+                    "WHERE id = ?",
+                    (new_status, result.get("reason", ""), dec["id"]),
+                )
 
-            if result.get("ok"):
-                executed += 1
-                console.print(
-                    f"[green]✓ 执行: {dec['action']} {dec['token']} "
-                    f"— {dec.get('reason', '')[:60]}[/green]"
-                )
-            else:
-                console.print(
-                    f"[yellow]✗ 拒绝: {dec['token']} — {result.get('reason', '')}[/yellow]"
-                )
+                if result.get("ok"):
+                    executed += 1
+                    console.print(
+                        f"[green]✓ 执行: {dec['action']} {dec['token']} "
+                        f"— {dec.get('reason', '')[:60]}[/green]"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]✗ 拒绝: {dec['token']} — {result.get('reason', '')}[/yellow]"
+                    )
+        except Exception as e:
+            import traceback
+            console.print(f"[red]决策执行异常: {dec.get('token', '?')} — {e}[/red]")
+            traceback.print_exc()
+            try:
+                with storage.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE pending_decisions SET status = 'rejected', "
+                        "consumed_at = datetime('now'), reject_reason = ? WHERE id = ?",
+                        (f"异常: {str(e)[:200]}", dec["id"]),
+                    )
+            except Exception:
+                pass  # 连状态更新都失败就没办法了
 
     # 4. 策略 B：系统自动开仓（读榜单 passed 币直接开，signal_lock 防重复）
     system_opened = 0
