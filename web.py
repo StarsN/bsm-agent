@@ -123,6 +123,22 @@ def _build_data_blob(candidate: dict) -> dict:
         "pass_count": candidate["pass_count"],
         "signal_key": candidate.get("signal_key", ""),
         "suggestion": candidate["suggestion"], "reasons": candidate["reasons"],
+        "market_cap_usd": snap.get("market_cap_usd"),
+        "fdv_usd": snap.get("fdv_usd"),
+        "chain": snap.get("chain"),
+        "contract_address": snap.get("contract_address"),
+        "holder_distribution": snap.get("holder_distribution"),
+        "gmgn_smart_wallets": snap.get("gmgn_smart_wallets"),
+        "gmgn_whale_wallets": snap.get("gmgn_whale_wallets"),
+        "gmgn_renowned_wallets": snap.get("gmgn_renowned_wallets"),
+        "gmgn_sniper_wallets": snap.get("gmgn_sniper_wallets"),
+        "gmgn_fresh_wallets": snap.get("gmgn_fresh_wallets"),
+        "gmgn_bundler_wallets": snap.get("gmgn_bundler_wallets"),
+        "gmgn_rat_trader_wallets": snap.get("gmgn_rat_trader_wallets"),
+        "gmgn_top_10_holder_rate": snap.get("gmgn_top_10_holder_rate"),
+        "gmgn_dev_hold_rate": snap.get("gmgn_dev_hold_rate"),
+        "gmgn_sniper_hold_rate": snap.get("gmgn_sniper_hold_rate"),
+        "gmgn_holder_count": snap.get("gmgn_holder_count"),
     }
 
 
@@ -141,7 +157,20 @@ def _build_kol_data_blob(candidate: dict) -> dict:
         # 乖离率 + 市值 + 聪明钱
         "ma20_deviation": snap.get("ma20_deviation_pct"),
         "market_cap_usd": snap.get("market_cap_usd"),
+        "fdv_usd": snap.get("fdv_usd"),
         "market_cap_rank": snap.get("market_cap_rank"),
+        "holder_distribution": snap.get("holder_distribution"),
+        "gmgn_smart_wallets": snap.get("gmgn_smart_wallets"),
+        "gmgn_whale_wallets": snap.get("gmgn_whale_wallets"),
+        "gmgn_renowned_wallets": snap.get("gmgn_renowned_wallets"),
+        "gmgn_sniper_wallets": snap.get("gmgn_sniper_wallets"),
+        "gmgn_fresh_wallets": snap.get("gmgn_fresh_wallets"),
+        "gmgn_bundler_wallets": snap.get("gmgn_bundler_wallets"),
+        "gmgn_rat_trader_wallets": snap.get("gmgn_rat_trader_wallets"),
+        "gmgn_top_10_holder_rate": snap.get("gmgn_top_10_holder_rate"),
+        "gmgn_dev_hold_rate": snap.get("gmgn_dev_hold_rate"),
+        "gmgn_sniper_hold_rate": snap.get("gmgn_sniper_hold_rate"),
+        "gmgn_holder_count": snap.get("gmgn_holder_count"),
         "sm_long_ratio": snap.get("sm_long_ratio"),
         "sm_net_notional_usdt": snap.get("sm_net_notional_usdt"),
         "sm_long_avg_entry": snap.get("sm_long_avg_entry"),
@@ -595,6 +624,13 @@ def _refresh_watchlist_tokens(tokens: list[str]) -> dict:
         social_map = {s["token"]: s["score"] for s in short_scores}
 
     futures_set = get_futures_symbols()
+    # CoinGecko 批量补充
+    try:
+        from market import get_coingecko_metrics
+        cg_metrics = get_coingecko_metrics(tokens)
+    except Exception as e:
+        print(f"[watchlist] CoinGecko 批量查询失败: {e}")
+        cg_metrics = {}
     refreshed = 0
     skipped = 0
     for token in tokens:
@@ -608,6 +644,35 @@ def _refresh_watchlist_tokens(tokens: list[str]) -> dict:
             continue
         if not snap:
             continue
+
+        # CoinGecko 覆盖链 + 市值
+        if token in cg_metrics:
+            for k in ("chain", "contract_address", "market_cap_usd", "fdv_usd"):
+                if k in cg_metrics[token]:
+                    snap[k] = cg_metrics[token][k]
+
+        # GMGN 持仓 + 聪明钱统计
+        if snap.get("contract_address") and snap.get("chain"):
+            try:
+                from market import get_gmgn_holders, get_gmgn_token_info
+                holders = get_gmgn_holders(snap["chain"], snap["contract_address"])
+                if holders:
+                    snap["holder_distribution"] = holders
+                else:
+                    print(f"[watchlist] GMGN holders 无数据: {token} ({snap['chain']})")
+                info = get_gmgn_token_info(snap["chain"], snap["contract_address"])
+                if info:
+                    for k, v in info.items():
+                        if v is not None:
+                            snap[k] = v
+                else:
+                    print(f"[watchlist] GMGN token info 无数据: {token} ({snap['chain']})")
+            except Exception as e:
+                print(f"[watchlist] GMGN 查询异常: {token} — {e}")
+
+        # OI/市值 杠杆率
+        if snap.get("market_cap_usd") and snap.get("oi_usd") and snap["market_cap_usd"] > 0:
+            snap["oi_marketcap_ratio"] = snap["oi_usd"] / snap["market_cap_usd"] * 100
 
         analysis = analyze_signals(snap, social_map.get(up, 0.0))
         snap_json = json.dumps(snap, default=str, ensure_ascii=False)
@@ -656,6 +721,23 @@ def _build_leaderboard_items(conn) -> tuple[list[dict], int]:
     scored = compute_composite_scores(conn, raw_scores, config.COMPOSITE_HISTORY_WINDOW)
 
     watchlist = set(storage.watchlist_get_all(conn))
+    # 用实时价格覆盖快照的旧 mark_price（快照 ~5min 刷新，realtime ~1s 刷新）
+    tokens = [s["token"] for s in scored]
+    rt_price = {}
+    if tokens:
+        ph = ",".join("?" * len(tokens))
+        rows = conn.execute(
+            f"SELECT token, snapshot FROM market_realtime_cache WHERE token IN ({ph})",
+            tokens,
+        ).fetchall()
+        for r in rows:
+            try:
+                rt = json.loads(r["snapshot"]) if isinstance(r["snapshot"], str) else r["snapshot"]
+                if rt and rt.get("mark_price"):
+                    rt_price[r["token"]] = rt["mark_price"]
+            except Exception:
+                pass
+
     pool = []
     skipped_no_contract = 0
     for s in scored:
@@ -663,6 +745,9 @@ def _build_leaderboard_items(conn) -> tuple[list[dict], int]:
         if not snap_row or not (snap_row.get("snapshot") or {}).get("mark_price"):
             skipped_no_contract += 1
             continue
+        # 实时价格覆盖快照旧价
+        if s["token"] in rt_price:
+            snap_row["snapshot"]["mark_price"] = rt_price[s["token"]]
         pool.append({
             "token": s["token"],
             "score": round(s["score"], 1),
@@ -852,37 +937,6 @@ def api_watchlist_refresh():
     except Exception as e:
         raise HTTPException(503, f"刷新观察列表合约数据失败: {e}")
     return {"ok": True, **result}
-
-    try:
-        futures_set = get_futures_symbols()
-    except Exception as e:
-        raise HTTPException(503, f"获取合约列表失败: {e}")
-
-    refreshed = 0
-    skipped = 0
-    for token in tokens:
-        if token.upper() not in futures_set:
-            skipped += 1
-            continue
-        try:
-            snap = get_market_snapshot(token)
-        except Exception:
-            continue
-        if not snap:
-            continue
-        social_score = social_map.get(token, 0.0)
-        analysis = analyze_signals(snap, social_score)
-        with storage.get_conn() as conn:
-            storage.snapshot_upsert(
-                conn, token,
-                json.dumps(snap, default=str, ensure_ascii=False),
-                json.dumps(analysis, default=str, ensure_ascii=False),
-            )
-        refreshed += 1
-        time.sleep(0.3)  # 节流
-
-    return {"ok": True, "refreshed": refreshed, "skipped_no_contract": skipped,
-            "tokens": tokens}
 
 
 @app.get("/api/loss_samples")
@@ -2008,6 +2062,32 @@ function renderDeepAnalysis(items) {
 
           <div class="metric"><div class="label">OKX 费率趋势</div><div class="value" style="font-size:11px">${(()=>{const h=s.funding_history;if(!h||!h.length)return'-';return h.slice(-4).map(x=>(x.r>0?'+':'')+x.r.toFixed(4)+'%').join(' → ')})()}</div></div>
           <div class="metric"><div class="label">市值</div><div class="value">${fmtMc(s.market_cap_usd)}${s.market_cap_rank ? ' <span class="muted">#'+s.market_cap_rank+'</span>' : ''}</div></div>
+          ${s.holder_distribution ? `
+          <div class="metric" style="flex-basis:100%">
+            <div class="label">持仓分布（前10）<span style="font-weight:400;color:var(--muted)"> · 合约 ${s.chain||'?'} · ${s.gmgn_holder_count||0} 持币地址</span></div>
+            <div style="font-size:11px;margin-top:4px">
+              ${Array.isArray(s.holder_distribution.top10) ? s.holder_distribution.top10.slice(0,10).map(h => `
+                <div style="display:flex;justify-content:space-between;padding:1px 0">
+                  <span><span style="color:var(--muted)">${h.rank}.</span> ${h.tag || h.address_short}${h.address_short && !h.tag ? '...' : ''}</span>
+                  <span>${h.pct.toFixed(1)}%</span>
+                </div>
+              `).join('')}
+              <div style="display:flex;justify-content:space-between;padding:2px 0;border-top:1px solid var(--border);margin-top:2px">
+                <span style="color:var(--muted)">前10合计</span>
+                <span>${s.holder_distribution.top10_pct.toFixed(1)}%</span>
+              </div>
+            </div>
+          </div>
+          ` : `<div class="metric"><div class="label">持仓分布（前10）</div><div class="value">-</div></div>`}
+          <div class="metric"><div class="label">链上聪明钱 (GMGN)</div><div class="value" style="font-size:11px">
+            ${s.gmgn_smart_wallets != null ? `
+            <div>🧠 ${s.gmgn_smart_wallets||0} 聪明钱 · 🐳 ${s.gmgn_whale_wallets||0} 巨鲸 · ⭐ ${s.gmgn_renowned_wallets||0} KOL${s.gmgn_sniper_wallets ? ' · 🎯 '+s.gmgn_sniper_wallets+' 狙击手' : ''}</div>
+            <div style="margin-top:2px">
+            ${s.gmgn_dev_hold_rate != null ? ' <span style="color:'+(s.gmgn_dev_hold_rate>5?'var(--red)':'var(--muted)')+'">团队持币 '+s.gmgn_dev_hold_rate.toFixed(1)+'%</span>' : ''}
+            ${s.gmgn_top_10_holder_rate != null ? ' <span style="margin-left:6px;color:'+(s.gmgn_top_10_holder_rate>50?'var(--red)':s.gmgn_top_10_holder_rate>30?'var(--yellow)':'var(--muted)')+'">前10占比 '+s.gmgn_top_10_holder_rate.toFixed(1)+'%</span>' : ''}
+            </div>
+            ` : '-'}
+          </div></div>
           <div class="metric"><div class="label">OI/市值 (杠杆率)</div><div class="value">${s.oi_marketcap_ratio != null ? s.oi_marketcap_ratio.toFixed(2)+'%' : '-'}${s.oi_marketcap_ratio > 5 ? ' <span style="color:var(--red);font-size:11px">高杠杆</span>' : s.oi_marketcap_ratio > 2 ? ' <span style="color:var(--yellow);font-size:11px">注意</span>' : ''}</div></div>
           <div class="metric"><div class="label">MA20 乖离 (5h)</div><div class="value">${fmtPct2(s.ma20_deviation_pct)}</div></div>
           <div class="metric" title="${fmtSmTooltip(s)}" style="cursor:help"><div class="label">聪明钱 ▾</div><div class="value">多头${fmtPct2(s.sm_long_ratio)} | 净头寸${fmtUsd(s.sm_net_notional_usdt)} | ${s.sm_traders_with_position||0}人</div></div>

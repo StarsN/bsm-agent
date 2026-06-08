@@ -306,6 +306,28 @@ def _fmt_price(v):
         return str(v)
 
 
+def _fmt_holders(hd: dict) -> str | None:
+    """持仓分布 → 简洁文本，如 TOP1: whale 12.3% | TOP2: Binance 8.1%"""
+    top = hd.get("top10", [])
+    if not top:
+        return None
+    parts = []
+    for h in top[:5]:
+        tag = h.get("tag") or h.get("address_short", "?")
+        pct = h.get("pct", 0)
+        parts.append(f"#{h['rank']} {tag} {pct:.1f}%")
+    return " | ".join(parts)
+
+
+def _fmt_funding_hist(hist: list) -> str | None:
+    """OKX 费率历史 → 趋势文本，如 +0.0050% → -0.0020%"""
+    if not hist or not isinstance(hist, list):
+        return None
+    return " → ".join(
+        f"{h.get('r', 0):+.4f}%" for h in hist[-4:]
+    )
+
+
 def _fmt_klines(klines, limit: int = 0):
     """格式化 K 线: O/H/L/C/Vol/额, ... limit=0 表示全部"""
     if not klines:
@@ -373,9 +395,11 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("1h涨跌", _fmt_pct(c.get("1h"))),
             ("4h涨跌", _fmt_pct(c.get("4h"))),
             ("24h涨跌", _fmt_pct(c.get("24h"))),
+            ("48h涨跌", _fmt_pct(c.get("chg_48h"))),
             ("OI 15m变化", _fmt_pct(c.get("oi_15m"))),
             ("OI 1h变化", _fmt_pct(c.get("oi_1h"))),
             ("OI 4h变化", _fmt_pct(c.get("oi_4h"))),
+            ("OI 48h变化", _fmt_pct(c.get("oi_48h"))),
             ("资金费率", f"{_fmt_ratio(c.get('funding'))}%/8h" if c.get('funding') is not None else None),
             ("主动买卖比", _fmt_ratio(c.get("taker"))),
             ("主动买入占比", _fmt_pct(c.get("taker_pct"))),
@@ -396,6 +420,7 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("链", c.get("chain")),
             ("基差", _fmt_pct(c.get("basis")) if c.get("basis") is not None else None),
             ("OKX 资金费率", _fmt_pct(c.get("okx_funding")) if c.get("okx_funding") is not None else None),
+            ("OKX 费率趋势(最近4条)", _fmt_funding_hist(c.get("funding_hist"))),
             # 市值 + 乖离 + 聪明钱
             ("市值", _fmt_usd(c.get("market_cap_usd")) if c.get("market_cap_usd") else None),
             ("市值排名", f"#{int(c.get('market_cap_rank'))}" if c.get("market_cap_rank") else None),
@@ -406,7 +431,24 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("聪明钱关注人数", c.get("sm_traders_with_position")),
             ("聪明钱多头均价", _fmt_price(c.get("sm_long_avg_entry")) if c.get("sm_long_avg_entry") else None),
             ("聪明钱空头均价", _fmt_price(c.get("sm_short_avg_entry")) if c.get("sm_short_avg_entry") else None),
+            ("聪明钱空头胜率", _fmt_pct(c.get("sm_avg_short_win_rate"))),
             ("OI/市值", _fmt_pct(c.get("oi_marketcap"))),
+            # 链上数据 (CoinGecko + GMGN)
+            ("FDV", _fmt_usd(c.get("fdv_usd")) if c.get("fdv_usd") else None),
+            ("持币地址总数", f"{int(c['gmgn_holder_count']):,}" if c.get("gmgn_holder_count") else None),
+            ("前10持仓占比", _fmt_pct(c.get("gmgn_top_10_holder_rate")) if c.get("gmgn_top_10_holder_rate") is not None else None),
+            ("团队持币占比", _fmt_pct(c.get("gmgn_dev_hold_rate")) if c.get("gmgn_dev_hold_rate") is not None else None),
+            ("狙击手持币占比", _fmt_pct(c.get("gmgn_sniper_hold_rate")) if c.get("gmgn_sniper_hold_rate") is not None else None),
+            ("持仓分布(前10合计)", _fmt_pct(c.get("holder_distribution", {}).get("top10_pct")) if c.get("holder_distribution") else None),
+            ("持仓TOP5", _fmt_holders(c.get("holder_distribution")) if c.get("holder_distribution") else None),
+            ("链上聪明钱", f"{c['gmgn_smart_wallets']}个" if c.get("gmgn_smart_wallets") else None),
+            ("链上巨鲸", f"{c['gmgn_whale_wallets']}个" if c.get("gmgn_whale_wallets") else None),
+            ("链上KOL", f"{c['gmgn_renowned_wallets']}个" if c.get("gmgn_renowned_wallets") else None),
+            ("链上狙击手", f"{c['gmgn_sniper_wallets']}个" if c.get("gmgn_sniper_wallets") else None),
+            ("链上新钱包", f"{c['gmgn_fresh_wallets']}个" if c.get("gmgn_fresh_wallets") else None),
+            ("链上捆绑包", f"{c['gmgn_bundler_wallets']}个" if c.get("gmgn_bundler_wallets") else None),
+            ("链上老鼠仓", f"{c['gmgn_rat_trader_wallets']}个" if c.get("gmgn_rat_trader_wallets") else None),
+            # K线结构
             ("1h结构", _build_kline_summary(c.get("klines_1h"), limit=6)),
             ("1H K线(开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_1h"), 6)),
             ("4h结构", _build_kline_summary(c.get("klines_4h"))),

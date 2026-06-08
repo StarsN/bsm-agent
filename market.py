@@ -595,6 +595,223 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
     return snap
 
 
+# ==========================================================================
+# CoinGecko 免费 API — 代币名 → 链 + 市值 + 合约地址
+# ==========================================================================
+
+_cg_cache: dict = {}      # {token_lower: {data, ts}}
+_CG_CACHE_TTL = 3600       # 缓存 1 小时
+
+
+def _coingecko_search(token: str) -> str | None:
+    """代币名 → CoinGecko coin_id"""
+    try:
+        url = f"https://api.coingecko.com/api/v3/search?query={token}"
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        coins = data.get("coins", [])
+        if not coins:
+            return None
+        # 优先精确匹配 symbol
+        token_u = token.upper()
+        for c in coins:
+            if c.get("symbol", "").upper() == token_u:
+                return c["id"]
+        return coins[0]["id"]
+    except Exception:
+        return None
+
+
+def _coingecko_meta(coin_id: str) -> dict | None:
+    """CoinGecko coin_id → {chain, contract_address, market_cap_usd, fdv_usd}"""
+    try:
+        url = (
+            f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+            "?localization=false&tickers=false&community_data=false"
+            "&developer_data=false&sparkline=false"
+        )
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    result = {}
+    # 市值
+    mcap = data.get("market_data", {}).get("market_cap", {}).get("usd")
+    if mcap:
+        result["market_cap_usd"] = mcap
+    fdv = data.get("market_data", {}).get("fully_diluted_valuation", {}).get("usd")
+    if fdv:
+        result["fdv_usd"] = fdv
+
+    # 链 + 合约地址（GMGN 支持的链优先级选，都没有则 fallback 取第一个）
+    _GMGN_CHAINS = ["solana", "binance-smart-chain", "base", "ethereum"]
+    platforms = data.get("detail_platforms", {})
+    best = None
+    fallback = None
+    for chain_name, info in platforms.items():
+        if isinstance(info, dict) and info.get("contract_address"):
+            if fallback is None:
+                fallback = (chain_name, info["contract_address"])
+            if chain_name in _GMGN_CHAINS:
+                if best is None or _GMGN_CHAINS.index(chain_name) < _GMGN_CHAINS.index(best[0]):
+                    best = (chain_name, info["contract_address"])
+    if best:
+        result["chain"], result["contract_address"] = best
+    elif fallback:
+        result["chain"], result["contract_address"] = fallback
+
+    return result if "chain" in result else None
+
+
+def get_coingecko_metrics(tokens: list[str]) -> dict[str, dict]:
+    """批量获取 CoinGecko 数据，内置缓存"""
+    global _cg_cache
+    now = time.time()
+    result = {}
+    to_fetch = []
+
+    for t in tokens:
+        key = t.lower()
+        cached = _cg_cache.get(key)
+        if cached and now - cached["ts"] < _CG_CACHE_TTL:
+            if cached["data"]:
+                result[t] = cached["data"]
+        else:
+            to_fetch.append(t)
+
+    if not to_fetch:
+        return result
+
+    for token in to_fetch:
+        coin_id = _coingecko_search(token)
+        if not coin_id:
+            _cg_cache[token.lower()] = {"data": None, "ts": now}
+            continue
+        meta = _coingecko_meta(coin_id)
+        _cg_cache[token.lower()] = {"data": meta, "ts": now}
+        if meta:
+            result[token] = meta
+
+    return result
+
+
+# ==========================================================================
+# GMGN 持仓分布 — 合约地址 → 前10持仓占比
+# ==========================================================================
+
+_CG_TO_GMGN_CHAIN = {
+    "solana": "sol", "ethereum": "eth", "binance-smart-chain": "bsc",
+    "base": "base", "arbitrum-one": "arb", "polygon-pos": "polygon",
+    "avalanche": "avax", "optimistic-ethereum": "op", "sui": "sui",
+}
+
+
+def _gmgn_chain(chain: str) -> str:
+    """CoinGecko chain → GMGN CLI 格式"""
+    return _CG_TO_GMGN_CHAIN.get(chain.lower(), chain.lower())
+
+
+def get_gmgn_holders(chain: str, address: str) -> dict | None:
+    """GMGN CLI → {top10_pct, top10: [{rank, address_short, tag, pct}, ...]}"""
+    import subprocess
+    try:
+        chain = _gmgn_chain(chain)
+        npm_bin = os.environ.get("APPDATA", "") + r"\npm\gmgn-cli.cmd"
+        if os.path.exists(npm_bin):
+            npx_cmd = [npm_bin]
+        else:
+            npx_cmd = ["npx", "gmgn-cli"]
+        cmd = npx_cmd + [
+            "token", "holders",
+            "--chain", chain,
+            "--address", address,
+            "--limit", "10",
+            "--raw",
+        ]
+        env = os.environ.copy()
+        env["GMGN_API_KEY"] = env.get("GMGN_API_KEY", "")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout)
+        holders = data.get("list", [])
+        if not holders:
+            return None
+        top10_pct = sum(
+            h.get("amount_percentage", 0) * 100 for h in holders[:10]
+            if h.get("amount_percentage")
+        )
+        top = []
+        for i, h in enumerate(holders[:10]):
+            tag = h.get("wallet_tag_v2") or h.get("name") or ""
+            pct = (h.get("amount_percentage") or 0) * 100
+            addr_short = h.get("address", "")[:6] if h.get("address") else ""
+            top.append({"rank": i + 1, "address_short": addr_short, "tag": tag, "pct": pct})
+        return {"top10_pct": top10_pct, "top10": top}
+    except Exception:
+        return None
+
+
+def get_gmgn_token_info(chain: str, address: str) -> dict | None:
+    """GMGN token info → 聪明钱统计 + 持仓安全指标"""
+    import subprocess
+    try:
+        chain = _gmgn_chain(chain)
+        npm_bin = os.environ.get("APPDATA", "") + r"\npm\gmgn-cli.cmd"
+        if os.path.exists(npm_bin):
+            npx_cmd = [npm_bin]
+        else:
+            npx_cmd = ["npx", "gmgn-cli"]
+        cmd = npx_cmd + [
+            "token", "info",
+            "--chain", chain,
+            "--address", address,
+            "--raw",
+        ]
+        env = os.environ.copy()
+        env["GMGN_API_KEY"] = env.get("GMGN_API_KEY", "")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout)
+        wts = data.get("wallet_tags_stat", {})
+        stat = data.get("stat", {})
+        return {
+            "gmgn_smart_wallets": wts.get("smart_wallets", 0),
+            "gmgn_whale_wallets": wts.get("whale_wallets", 0),
+            "gmgn_renowned_wallets": wts.get("renowned_wallets", 0),
+            "gmgn_sniper_wallets": wts.get("sniper_wallets", 0),
+            "gmgn_fresh_wallets": wts.get("fresh_wallets", 0),
+            "gmgn_bundler_wallets": wts.get("bundler_wallets", 0),
+            "gmgn_rat_trader_wallets": wts.get("rat_trader_wallets", 0),
+            # rate 字段 GMGN 返回小数（0.084=8.4%），统一乘 100 转为百分比
+            "gmgn_top_10_holder_rate": _pct(stat.get("top_10_holder_rate")),
+            "gmgn_dev_hold_rate": _pct(stat.get("dev_team_hold_rate")),
+            "gmgn_sniper_hold_rate": _pct(stat.get("top70_sniper_hold_rate")),
+            "gmgn_holder_count": stat.get("holder_count", 0),
+        }
+    except Exception:
+        return None
+
+
+def _safe_float(v):
+    try:
+        if v is not None:
+            return float(v)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _pct(v) -> float | None:
+    """GMGN 小数 rate → 百分比，如 0.084 → 8.4"""
+    f = _safe_float(v)
+    return f * 100 if f is not None else None
+
+
 def get_daily_klines(token: str, limit: int = 7) -> list[list[float]] | None:
     """拉日线 [O,H,L,C,Vol,QuoteVol] × limit，供 KOL 策略用"""
     klines = _http_get(
