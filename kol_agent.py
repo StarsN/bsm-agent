@@ -312,7 +312,7 @@ def _fmt_holders(hd: dict) -> str | None:
     if not top:
         return None
     parts = []
-    for h in top[:5]:
+    for h in top:
         tag = h.get("tag") or h.get("address_short", "?")
         pct = h.get("pct", 0)
         parts.append(f"#{h['rank']} {tag} {pct:.1f}%")

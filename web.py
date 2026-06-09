@@ -2071,7 +2071,7 @@ function renderDeepAnalysis(items) {
                   <span><span style="color:var(--muted)">${h.rank}.</span> ${h.tag || h.address_short}${h.address_short && !h.tag ? '...' : ''}</span>
                   <span>${h.pct.toFixed(1)}%</span>
                 </div>
-              `).join('')}
+              `).join('') : ''}
               <div style="display:flex;justify-content:space-between;padding:2px 0;border-top:1px solid var(--border);margin-top:2px">
                 <span style="color:var(--muted)">前10合计</span>
                 <span>${s.holder_distribution.top10_pct.toFixed(1)}%</span>
@@ -2082,9 +2082,9 @@ function renderDeepAnalysis(items) {
           <div class="metric"><div class="label">链上聪明钱 (GMGN)</div><div class="value" style="font-size:11px">
             ${s.gmgn_smart_wallets != null ? `
             <div>🧠 ${s.gmgn_smart_wallets||0} 聪明钱 · 🐳 ${s.gmgn_whale_wallets||0} 巨鲸 · ⭐ ${s.gmgn_renowned_wallets||0} KOL${s.gmgn_sniper_wallets ? ' · 🎯 '+s.gmgn_sniper_wallets+' 狙击手' : ''}</div>
-            <div style="margin-top:2px">
-            ${s.gmgn_dev_hold_rate != null ? ' <span style="color:'+(s.gmgn_dev_hold_rate>5?'var(--red)':'var(--muted)')+'">团队持币 '+s.gmgn_dev_hold_rate.toFixed(1)+'%</span>' : ''}
-            ${s.gmgn_top_10_holder_rate != null ? ' <span style="margin-left:6px;color:'+(s.gmgn_top_10_holder_rate>50?'var(--red)':s.gmgn_top_10_holder_rate>30?'var(--yellow)':'var(--muted)')+'">前10占比 '+s.gmgn_top_10_holder_rate.toFixed(1)+'%</span>' : ''}
+            <div style="margin-top:2px;line-height:1.6">
+            ${s.gmgn_dev_hold_rate != null ? '<div>团队持币 <span style="color:'+(s.gmgn_dev_hold_rate>5?'var(--red)':'var(--muted)')+'">'+s.gmgn_dev_hold_rate.toFixed(1)+'%</span></div>' : ''}
+            ${s.gmgn_top_10_holder_rate != null ? '<div>前10占比 <span style="color:'+(s.gmgn_top_10_holder_rate>50?'var(--red)':s.gmgn_top_10_holder_rate>30?'var(--yellow)':'var(--muted)')+'">'+s.gmgn_top_10_holder_rate.toFixed(1)+'%</span></div>' : ''}
             </div>
             ` : '-'}
           </div></div>
@@ -3472,6 +3472,15 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .nav-dropdown-content a { display: block; padding: 6px 14px; color: var(--text); border-bottom: none !important; font-size: 12px; white-space: nowrap; }
 .nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
 .nav-dropdown:hover .nav-dropdown-content { display: block; }
+.strategy-block {
+  border-bottom: 1px solid var(--border); padding: 12px 0;
+}
+.strategy-block:first-of-type { padding-top: 0; }
+.strategy-block:last-of-type { border-bottom: none; padding-bottom: 0; }
+.strategy-name {
+  color: var(--muted); font-size: 12px; font-weight: 500;
+  margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px;
+}
 </style>
 </head>
 <body>
@@ -3496,8 +3505,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 <h1>⚙ 系统设置</h1>
 
 <div class="panel">
-  <h2>交易参数</h2>
-  <div class="grid2">
+  <h2>系统参数</h2>
+  <div class="grid3">
     <div>
       <label>自动交易</label>
       <select id="trade-enabled">
@@ -3506,14 +3515,21 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       </select>
     </div>
     <div>
-      <label>模式</label>
+      <label>交易模式</label>
       <select id="trade-mode">
         <option value="paper">模拟</option>
         <option value="live">实盘（暂未启用）</option>
       </select>
     </div>
+    <div>
+      <label>日交易限制（每策略15次）</label>
+      <select id="trade-daily-limit-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
   </div>
-  <div class="grid2">
+  <div class="grid3">
     <div>
       <label>账户初始金额 USDT</label>
       <input id="trade-initial" type="number" min="1" step="1">
@@ -3522,168 +3538,6 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       <label>交易倍数</label>
       <input id="trade-leverage" type="number" min="1" max="125" step="1">
     </div>
-  </div>
-</div>
-
-<div class="panel">
-  <h2>策略独立账户</h2>
-  <div class="grid3">
-    <div>
-      <label>Agent 策略初始 USDT</label>
-      <input id="trade-strategy-agent" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>热度Agent 初始 USDT</label>
-      <input id="trade-strategy-heat" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>系统策略初始 USDT</label>
-      <input id="trade-strategy-system" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>手动策略初始 USDT</label>
-      <input id="trade-strategy-manual" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>KOL 策略初始 USDT</label>
-      <input id="trade-strategy-kol" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>KOL认知快照 初始 USDT</label>
-      <input id="trade-strategy-kol-snapshot" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>无教训版初始 USDT</label>
-      <input id="trade-strategy-nl" type="number" min="1" step="1">
-    </div>
-    <div>
-      <label>热度有教训初始 USDT</label>
-      <input id="trade-strategy-heat-lessons" type="number" min="1" step="1">
-    </div>
-  </div>
-</div>
-
-<div class="panel">
-  <h2>Agent 开关</h2>
-  <div class="grid2">
-    <div>
-      <label>Agent-合约扫描</label>
-      <select id="trade-agent-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-    <div>
-      <label>Agent-热度榜单</label>
-      <select id="trade-heat-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-    <div>
-      <label>Agent-KOL认知快照</label>
-      <select id="trade-kol-snapshot-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-    <div>
-      <label>Agent-KOL</label>
-      <select id="trade-kol-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-    <div>
-      <label>Agent-无教训</label>
-      <select id="trade-nl-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-    <div>
-      <label>Agent-热度有教训</label>
-      <select id="trade-heat-lessons-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-    <div>
-      <label>系统策略自动开仓</label>
-      <select id="trade-system-auto-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-  </div>
-</div>
-
-<div class="panel">
-  <h2>风控参数</h2>
-  <div class="grid2">
-    <div>
-      <label>KOL Agent 最低信心分</label>
-      <input id="trade-kol-min-conf" type="number" min="50" max="95" step="5">
-    </div>
-    <div>
-      <label>KOL Token 冷却时间（分钟）</label>
-      <input id="trade-kol-cooldown" type="number" min="1" max="1440" step="5">
-    </div>
-    <div>
-      <label>日交易次数限制（每策略15次）</label>
-      <select id="trade-daily-limit-switch">
-        <option value="true">启用</option>
-        <option value="false">关闭</option>
-      </select>
-    </div>
-  </div>
-</div>
-
-<div class="panel">
-  <h2>Agent 参数</h2>
-  <div class="grid2">
-    <div>
-      <label>收集间隔（分钟）</label>
-      <input id="trade-collect-interval" type="number" min="5" max="60" step="1">
-    </div>
-    <div>
-      <label>热度Agent触发间隔（轮）</label>
-      <input id="trade-trigger-interval" type="number" min="1" max="10" step="1">
-    </div>
-    <div>
-      <label>KOL Agent 触发间隔（分钟）</label>
-      <input id="trade-kol-interval" type="number" min="10" max="480" step="5">
-    </div>
-    <div>
-      <label>Agent-KOL认知快照 触发间隔（分钟）</label>
-      <input id="trade-kol-snapshot-interval" type="number" min="10" max="480" step="5">
-    </div>
-    <div>
-      <label>KOL Agent LLM 提供商</label>
-      <select id="trade-kol-provider">
-        <option value="deepseek">DeepSeek</option>
-        <option value="nvidia">NVIDIA</option>
-      </select>
-    </div>
-    <div>
-      <label>KOL认知快照 LLM 提供商</label>
-      <select id="trade-kol-snapshot-provider">
-        <option value="deepseek">DeepSeek</option>
-        <option value="nvidia">NVIDIA</option>
-      </select>
-    </div>
-    <div>
-      <label>NL Agent 触发间隔（分钟）</label>
-      <input id="trade-nl-interval" type="number" min="10" max="480" step="5">
-    </div>
-    <div>
-      <label>热度有教训 触发间隔（轮）</label>
-      <input id="trade-heat-lessons-interval" type="number" min="1" max="20" step="1">
-    </div>
-    <div>
-      <label>AI 研判间隔（分钟）</label>
-      <input id="trade-ai-regime-interval" type="number" min="10" max="240" step="5">
-    </div>
     <div>
       <label>挂单超时（秒）</label>
       <input id="trade-limit-timeout" type="number" min="60" max="7200" step="60">
@@ -3691,13 +3545,193 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   </div>
 </div>
 
-<div class="btn-row">
-  <button class="btn btn-save" onclick="saveTradingSettings()">保存设置</button>
+<div class="panel">
+  <h2>策略配置</h2>
+
+  <div class="strategy-block">
+    <div class="strategy-name">Agent-合约扫描</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-agent-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-agent" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>收集间隔（分钟）</label>
+        <input id="trade-collect-interval" type="number" min="5" max="60" step="1">
+      </div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">Agent-热度榜单</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-heat-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-heat" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>触发间隔（轮）</label>
+        <input id="trade-trigger-interval" type="number" min="1" max="10" step="1">
+      </div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">Agent-热度有教训</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-heat-lessons-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-heat-lessons" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>触发间隔（轮）</label>
+        <input id="trade-heat-lessons-interval" type="number" min="1" max="20" step="1">
+      </div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">Agent-无教训</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-nl-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-nl" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>触发间隔（分钟）</label>
+        <input id="trade-nl-interval" type="number" min="10" max="480" step="5">
+      </div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">Agent-KOL</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-kol-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-kol" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>触发间隔（分钟）</label>
+        <input id="trade-kol-interval" type="number" min="10" max="480" step="5">
+      </div>
+    </div>
+    <div class="grid3">
+      <div>
+        <label>LLM 提供商</label>
+        <select id="trade-kol-provider">
+          <option value="deepseek">DeepSeek</option>
+          <option value="nvidia">NVIDIA</option>
+        </select>
+      </div>
+      <div>
+        <label>最低信心分</label>
+        <input id="trade-kol-min-conf" type="number" min="50" max="95" step="5">
+      </div>
+      <div>
+        <label>Token 冷却时间（分钟）</label>
+        <input id="trade-kol-cooldown" type="number" min="1" max="1440" step="5">
+      </div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">Agent-KOL认知快照</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-kol-snapshot-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-kol-snapshot" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>触发间隔（分钟）</label>
+        <input id="trade-kol-snapshot-interval" type="number" min="10" max="480" step="5">
+      </div>
+    </div>
+    <div>
+      <label>LLM 提供商</label>
+      <select id="trade-kol-snapshot-provider">
+        <option value="deepseek">DeepSeek</option>
+        <option value="nvidia">NVIDIA</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">系统策略</div>
+    <div class="grid3">
+      <div>
+        <label>自动开仓</label>
+        <select id="trade-system-auto-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-system" type="number" min="1" step="1">
+      </div>
+      <div></div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">手动策略</div>
+    <div>
+      <label>初始金额 USDT（手动触发，无自动开关）</label>
+      <input id="trade-strategy-manual" type="number" min="1" step="1">
+    </div>
+  </div>
 </div>
 
-<div class="panel" style="margin-top:16px">
-  <h2>操作</h2>
-  <div class="grid2">
+<div class="panel">
+  <h2>系统操作</h2>
+  <div>
+    <label>AI 研判间隔（分钟）</label>
+    <input id="trade-ai-regime-interval" type="number" min="10" max="240" step="5">
+  </div>
+  <div class="grid2" style="margin-top:14px">
     <div>
       <label>策略重置</label>
       <select id="trade-reset-strategy">
@@ -3728,6 +3762,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     全部重置：清除所有策略数据<br>
     重启系统：强制终止所有进程，等 3 分钟后自动重启
   </div>
+</div>
+
+<div class="btn-row">
+  <button class="btn btn-save" onclick="saveTradingSettings()">保存设置</button>
 </div>
 
 <div class="toast" id="toast"></div>

@@ -606,19 +606,20 @@ _CG_CACHE_TTL = 3600       # 缓存 1 小时
 def _coingecko_search(token: str) -> str | None:
     """代币名 → CoinGecko coin_id"""
     try:
-        url = f"https://api.coingecko.com/api/v3/search?query={token}"
+        from urllib.parse import quote
+        url = f"https://api.coingecko.com/api/v3/search?query={quote(token)}"
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         coins = data.get("coins", [])
         if not coins:
             return None
-        # 优先精确匹配 symbol
+        # 精确匹配 symbol（CG 的 symbol 全大写）
         token_u = token.upper()
         for c in coins:
             if c.get("symbol", "").upper() == token_u:
                 return c["id"]
-        return coins[0]["id"]
+        # 无精确匹配不取兜底，避免匹配到无关代币浪费 API 额度
     except Exception:
         return None
 
@@ -646,24 +647,15 @@ def _coingecko_meta(coin_id: str) -> dict | None:
     if fdv:
         result["fdv_usd"] = fdv
 
-    # 链 + 合约地址（GMGN 支持的链优先级选，都没有则 fallback 取第一个）
-    _GMGN_CHAINS = ["solana", "binance-smart-chain", "base", "ethereum"]
-    platforms = data.get("detail_platforms", {})
-    best = None
-    fallback = None
-    for chain_name, info in platforms.items():
+    # 链 + 合约地址
+    # 仅当 asset_platform_id 明确指向 GMGN 支持的链才取
+    native_chain = data.get("asset_platform_id")
+    if native_chain and native_chain in _CG_TO_GMGN_CHAIN:
+        info = data.get("detail_platforms", {}).get(native_chain)
         if isinstance(info, dict) and info.get("contract_address"):
-            if fallback is None:
-                fallback = (chain_name, info["contract_address"])
-            if chain_name in _GMGN_CHAINS:
-                if best is None or _GMGN_CHAINS.index(chain_name) < _GMGN_CHAINS.index(best[0]):
-                    best = (chain_name, info["contract_address"])
-    if best:
-        result["chain"], result["contract_address"] = best
-    elif fallback:
-        result["chain"], result["contract_address"] = fallback
+            result["chain"], result["contract_address"] = native_chain, info["contract_address"]
 
-    return result if "chain" in result else None
+    return result if result else None  # 至少要有市值或链信息
 
 
 def get_coingecko_metrics(tokens: list[str]) -> dict[str, dict]:
@@ -688,12 +680,14 @@ def get_coingecko_metrics(tokens: list[str]) -> dict[str, dict]:
     for token in to_fetch:
         coin_id = _coingecko_search(token)
         if not coin_id:
-            _cg_cache[token.lower()] = {"data": None, "ts": now}
+            # 搜索失败不缓存，下一轮重试（避免因限流/超时导致 1h 无数据）
             continue
         meta = _coingecko_meta(coin_id)
-        _cg_cache[token.lower()] = {"data": meta, "ts": now}
         if meta:
+            _cg_cache[token.lower()] = {"data": meta, "ts": now}
             result[token] = meta
+        # meta=None 也不缓存：可能是 CG 搜索匹配到错误代币（无合约地址），
+        # 下一轮 CG 搜索结果可能不同（如 "PUMP" 等泛称代币）
 
     return result
 
@@ -704,14 +698,17 @@ def get_coingecko_metrics(tokens: list[str]) -> dict[str, dict]:
 
 _CG_TO_GMGN_CHAIN = {
     "solana": "sol", "ethereum": "eth", "binance-smart-chain": "bsc",
-    "base": "base", "arbitrum-one": "arb", "polygon-pos": "polygon",
-    "avalanche": "avax", "optimistic-ethereum": "op", "sui": "sui",
+    "base": "base",
 }
 
+# GMGN CLI 实际支持的链（npx gmgn-cli 报错提示的合法值）
+_GMGN_SUPPORTED_CHAINS = {"sol", "bsc", "base", "eth", "monad"}
 
-def _gmgn_chain(chain: str) -> str:
-    """CoinGecko chain → GMGN CLI 格式"""
-    return _CG_TO_GMGN_CHAIN.get(chain.lower(), chain.lower())
+
+def _gmgn_chain(chain: str) -> str | None:
+    """CoinGecko chain → GMGN CLI 格式；不支持则返回 None"""
+    mapped = _CG_TO_GMGN_CHAIN.get(chain.lower(), chain.lower())
+    return mapped if mapped in _GMGN_SUPPORTED_CHAINS else None
 
 
 def get_gmgn_holders(chain: str, address: str) -> dict | None:
@@ -719,6 +716,8 @@ def get_gmgn_holders(chain: str, address: str) -> dict | None:
     import subprocess
     try:
         chain = _gmgn_chain(chain)
+        if chain is None:
+            return None
         npm_bin = os.environ.get("APPDATA", "") + r"\npm\gmgn-cli.cmd"
         if os.path.exists(npm_bin):
             npx_cmd = [npm_bin]
@@ -760,6 +759,8 @@ def get_gmgn_token_info(chain: str, address: str) -> dict | None:
     import subprocess
     try:
         chain = _gmgn_chain(chain)
+        if chain is None:
+            return None
         npm_bin = os.environ.get("APPDATA", "") + r"\npm\gmgn-cli.cmd"
         if os.path.exists(npm_bin):
             npx_cmd = [npm_bin]
