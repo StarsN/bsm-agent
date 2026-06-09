@@ -605,37 +605,60 @@ _CG_CACHE_TTL = 3600       # 缓存 1 小时
 
 def _coingecko_search(token: str) -> str | None:
     """代币名 → CoinGecko coin_id"""
-    try:
-        from urllib.parse import quote
-        url = f"https://api.coingecko.com/api/v3/search?query={quote(token)}"
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        coins = data.get("coins", [])
-        if not coins:
-            return None
-        # 精确匹配 symbol（CG 的 symbol 全大写）
-        token_u = token.upper()
-        for c in coins:
-            if c.get("symbol", "").upper() == token_u:
-                return c["id"]
-        # 无精确匹配不取兜底，避免匹配到无关代币浪费 API 额度
-    except Exception:
-        return None
+    from urllib.parse import quote
+    url = f"https://api.coingecko.com/api/v3/search?query={quote(token)}"
+    for attempt in range(3):
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            coins = data.get("coins", [])
+            if not coins:
+                return None
+            token_u = token.upper()
+            for c in coins:
+                if c.get("symbol", "").upper() == token_u:
+                    return c["id"]
+            return None  # 无精确匹配
+        except HTTPError as e:
+            if e.code == 429:
+                print(f"  [CG] 搜索限流(429): {token} (attempt {attempt+1}/3)")
+            elif e.code >= 500 and attempt < 2:
+                _backoff_sleep(attempt + 1)
+                continue
+            if attempt < 2:
+                _backoff_sleep(attempt + 1)
+        except Exception:
+            if attempt < 2:
+                _backoff_sleep(attempt + 1)
+    return None
 
 
 def _coingecko_meta(coin_id: str) -> dict | None:
     """CoinGecko coin_id → {chain, contract_address, market_cap_usd, fdv_usd}"""
-    try:
-        url = (
-            f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-            "?localization=false&tickers=false&community_data=false"
-            "&developer_data=false&sparkline=false"
-        )
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    url = (
+        f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+        "?localization=false&tickers=false&community_data=false"
+        "&developer_data=false&sparkline=false"
+    )
+    for attempt in range(3):
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except HTTPError as e:
+            if e.code == 429:
+                print(f"  [CG] meta限流(429): {coin_id} (attempt {attempt+1}/3)")
+            elif e.code >= 500 and attempt < 2:
+                _backoff_sleep(attempt + 1)
+                continue
+            if attempt < 2:
+                _backoff_sleep(attempt + 1)
+        except Exception:
+            if attempt < 2:
+                _backoff_sleep(attempt + 1)
+    else:
         return None
 
     result = {}
@@ -648,12 +671,25 @@ def _coingecko_meta(coin_id: str) -> dict | None:
         result["fdv_usd"] = fdv
 
     # 链 + 合约地址
-    # 仅当 asset_platform_id 明确指向 GMGN 支持的链才取
-    native_chain = data.get("asset_platform_id")
-    if native_chain and native_chain in _CG_TO_GMGN_CHAIN:
-        info = data.get("detail_platforms", {}).get(native_chain)
-        if isinstance(info, dict) and info.get("contract_address"):
-            result["chain"], result["contract_address"] = native_chain, info["contract_address"]
+    # 优先 BSC，其次 asset_platform_id
+    chain = None
+    address = None
+    platforms = data.get("detail_platforms", {})
+    # 1) 遍历 detail_platforms，有 bsc 优先取
+    for name, info in platforms.items():
+        if "bsc" in name.lower() or "binance-smart" in name.lower():
+            if isinstance(info, dict) and info.get("contract_address"):
+                chain, address = name, info["contract_address"]
+                break
+    # 2) 没有 bsc，再看 asset_platform_id
+    if not chain:
+        native_chain = data.get("asset_platform_id")
+        if native_chain and native_chain in _CG_TO_GMGN_CHAIN:
+            info = platforms.get(native_chain)
+            if isinstance(info, dict) and info.get("contract_address"):
+                chain, address = native_chain, info["contract_address"]
+    if chain:
+        result["chain"], result["contract_address"] = chain, address
 
     return result if result else None  # 至少要有市值或链信息
 
@@ -734,6 +770,9 @@ def get_gmgn_holders(chain: str, address: str) -> dict | None:
         env["GMGN_API_KEY"] = env.get("GMGN_API_KEY", "")
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         if proc.returncode != 0:
+            err = (proc.stderr or "").strip()
+            if "429" in err or "rate" in err.lower():
+                print(f"  [GMGN] holders限流: {address[:10]}...")
             return None
         data = json.loads(proc.stdout)
         holders = data.get("list", [])
@@ -776,6 +815,9 @@ def get_gmgn_token_info(chain: str, address: str) -> dict | None:
         env["GMGN_API_KEY"] = env.get("GMGN_API_KEY", "")
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         if proc.returncode != 0:
+            err = (proc.stderr or "").strip()
+            if "429" in err or "rate" in err.lower():
+                print(f"  [GMGN] token info限流: {address[:10]}...")
             return None
         data = json.loads(proc.stdout)
         wts = data.get("wallet_tags_stat", {})

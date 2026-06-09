@@ -464,13 +464,13 @@ def test_lessons():
         conn.execute("UPDATE lessons SET learned=0 WHERE id=?", (les_id,))
         conn.commit()
 
-    # extract heat: learned=2 + rule_update (extract_market_data.py heat)
+    # extract heat: learned=0 + rule_update (extract_market_data.py heat)
     rows = conn.execute(
         "SELECT id, token, direction, entry_price, exit_price, pnl_pct, signal_error, what_missed, root_cause, lesson, rule_update, severity "
-        "FROM lessons WHERE learned=2 AND strategy='heat_agent' AND rule_update IS NOT NULL AND rule_update != '' "
+        "FROM lessons WHERE learned=0 AND strategy='heat_agent' AND rule_update IS NOT NULL AND rule_update != '' "
         "ORDER BY severity DESC, created_at DESC"
     ).fetchall()
-    check("7h. SELECT learned=2 heat", len(rows) >= 0, f"got {len(rows)} (may be 0)")
+    check("7h. SELECT learned=0 heat", len(rows) >= 0, f"got {len(rows)} (may be 0)")
 
     # extract heat_lessons: learned=0 + rule_update (extract_market_data.py heat_lessons)
     rows = conn.execute(
