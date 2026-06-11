@@ -206,9 +206,6 @@ class SquareScraper:
             getattr(config, "SCROLL_RESET_EVERY_MIN", 30),
             getattr(config, "SCROLL_RESET_EVERY_MAX", 55),
         )
-        burst_seconds = getattr(config, "SCRAPE_BURST_SECONDS", 50)
-        idle_seconds = getattr(config, "SCRAPE_IDLE_SECONDS", 45)
-
         # 清理 Windows Chromium 锁文件，防止 launch_persistent_context 卡死
         if USER_DATA_DIR.exists():
             for lock_name in ("SingletonLock", "SingletonSocket"):
@@ -235,31 +232,30 @@ class SquareScraper:
             page.on("response", self._handle_response)
 
             try:
-                goto_timeout = getattr(config, "PAGE_GOTO_TIMEOUT", 90000)
-                for goto_attempt in range(3):
-                    try:
-                        await page.goto(SQUARE_URL, wait_until="domcontentloaded",
-                                        timeout=goto_timeout)
-                        break
-                    except Exception as e:
-                        if "Target crashed" in str(e):
-                            raise
-                        if goto_attempt < 2:
-                            await page.wait_for_timeout(3000)
-                        else:
-                            raise
+                try:
+                    await asyncio.wait_for(
+                        page.goto(SQUARE_URL, wait_until="domcontentloaded",
+                                  timeout=getattr(config, "PAGE_GOTO_TIMEOUT", 30000)),
+                        timeout=90
+                    )
+                except asyncio.TimeoutError as e:
+                    print(f"[scraper] 出错：{e}")
+                    raise
                 await page.wait_for_timeout(random.randint(2500, 4500))
 
                 burst_start = time.time()
+                burst_sec = random.uniform(35, 45)
                 while time.time() - start < duration_seconds:
-                    # --- burst / idle 切换：模仿用户"看一看然后放下" ---
-                    if time.time() - burst_start >= burst_seconds:
-                        idle = random.uniform(idle_seconds * 0.7, idle_seconds * 1.3)
-                        if progress_cb:
-                            progress_cb(time.time() - start, scrolls,
-                                        len(self.captured_posts))
-                        await page.wait_for_timeout(int(idle * 1000))
+                    # --- burst / idle 切换：短区间随机，打破精确规律 ---
+                    if time.time() - burst_start >= burst_sec:
+                        idle = random.uniform(60, 70)
+                        if random.random() > 0.1:          # 10% 概率跳过休息
+                            if progress_cb:
+                                progress_cb(time.time() - start, scrolls,
+                                            len(self.captured_posts))
+                            await page.wait_for_timeout(int(idle * 1000))
                         burst_start = time.time()
+                        burst_sec = random.uniform(35, 45)
 
                     # --- 随机滚动距离和方向 ---
                     dist_min = getattr(config, "SCROLL_DISTANCE_MIN", 2500)
@@ -286,8 +282,11 @@ class SquareScraper:
                     # --- 随机间隔刷新页面 ---
                     if scrolls >= next_reset_at:
                         try:
-                            await page.goto(SQUARE_URL, wait_until="domcontentloaded",
-                                            timeout=getattr(config, "PAGE_GOTO_TIMEOUT", 90000))
+                            await asyncio.wait_for(
+                                page.goto(SQUARE_URL, wait_until="domcontentloaded",
+                                          timeout=getattr(config, "PAGE_GOTO_TIMEOUT", 30000)),
+                                timeout=90
+                            )
                             await page.wait_for_timeout(random.randint(2000, 4000))
                         except Exception:
                             pass
@@ -301,7 +300,10 @@ class SquareScraper:
             except Exception as e:
                 print(f"[scraper] 出错：{e}")
             finally:
-                await context.close()
+                try:
+                    await asyncio.wait_for(context.close(), timeout=10)
+                except Exception:
+                    pass
 
         # 去重
         seen = set()

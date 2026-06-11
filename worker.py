@@ -10,6 +10,7 @@
 import asyncio
 import json
 import os
+import random
 import signal
 import sys
 import time
@@ -71,20 +72,12 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
         short_scores = compute_short_scores(conn)
         social_map = {s["token"]: s["score"] for s in short_scores}
 
-    # Step 2：批量拉 OKX 衍生数据（一次调用覆盖所有候选币）
+    # Step 2：批量拉 OKX 衍生数据（市值 + 聪明钱，一次调用覆盖所有候选币）
     try:
         import dashboard
         okx_extra = dashboard.get_multi_token_okx_metrics(tokens_to_check, heavy=heavy)
     except Exception:
         okx_extra = {}
-
-    # Step 2.5：CoinGecko 补充链 + 市值（批量，有缓存）
-    try:
-        from market import get_coingecko_metrics
-        cg_metrics = get_coingecko_metrics(tokens_to_check)
-    except Exception as e:
-        console.print(f"   [dim]CoinGecko 批量查询失败: {e}[/dim]")
-        cg_metrics = {}
 
     # Step 3：逐个 token 处理，网络请求在事务外，写库用独立小事务
     for token in tokens_to_check:
@@ -101,41 +94,14 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
         if not snap:
             continue
 
-        # 合并 OKX 衍生数据（不含市值，市值改用 CoinGecko）
+        # 合并 OKX 衍生数据（市值 + 聪明钱）
         extra = okx_extra.get(up, {})
         if extra:
             for k, v in extra.items():
                 if k not in snap or snap.get(k) is None:
                     snap[k] = v
 
-        # CoinGecko 覆盖链 + 市值 + 合约地址
-        if token in cg_metrics:
-            for k in ("chain", "contract_address", "market_cap_usd", "fdv_usd"):
-                if k in cg_metrics[token]:
-                    snap[k] = cg_metrics[token][k]
-
-        # GMGN 持仓分布 + 聪明钱统计
-        if snap.get("contract_address") and snap.get("chain"):
-            try:
-                from market import get_gmgn_holders, get_gmgn_token_info
-                holders = get_gmgn_holders(snap["chain"], snap["contract_address"])
-                if holders:
-                    snap["holder_distribution"] = holders
-                else:
-                    console.print(f"   [dim]GMGN holders 无数据: {token} ({snap['chain']})[/dim]")
-                info = get_gmgn_token_info(snap["chain"], snap["contract_address"])
-                if info:
-                    for k, v in info.items():
-                        if v is not None:
-                            snap[k] = v
-                else:
-                    console.print(f"   [dim]GMGN token info 无数据: {token} ({snap['chain']})[/dim]")
-            except Exception as e:
-                console.print(f"   [dim]GMGN 查询异常: {token} — {e}[/dim]")
-        else:
-            console.print(f"   [dim]GMGN 跳过: {token} 无合约地址 (chain={snap.get('chain')})[/dim]")
-
-        # 计算 OI/市值（杠杆率），存为百分比值
+        # 计算 OI/市值
         if snap.get("market_cap_usd") and snap.get("oi_usd") and snap["market_cap_usd"] > 0:
             snap["oi_marketcap_ratio"] = snap["oi_usd"] / snap["market_cap_usd"] * 100
 
@@ -479,6 +445,15 @@ async def main():
             os.system("pkill -f chromium 2>/dev/null")
         except Exception:
             pass
+
+        if _running:
+            rest_sec = random.randint(45, 75)
+            console.print(f"[dim]轮间休息 {rest_sec}s...[/dim]")
+            _write_status(stage="resting", detail=f"轮间休息 {rest_sec}s...")
+            for _ in range(rest_sec):
+                if not _running:
+                    break
+                await asyncio.sleep(1)
 
     console.print("[green]已退出[/green]")
 

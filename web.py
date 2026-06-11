@@ -88,6 +88,12 @@ _nl_last_flush = 0.0
 _nl_round = 0
 _nl_running = False
 
+# 做空版 Agent 独立累积器
+_short_collected = {}
+_short_last_flush = 0.0
+_short_round = 0
+_short_running = False
+
 
 def _build_data_blob(candidate: dict) -> dict:
     """组装与 extract 脚本同格式的候选币 data JSON"""
@@ -124,21 +130,6 @@ def _build_data_blob(candidate: dict) -> dict:
         "signal_key": candidate.get("signal_key", ""),
         "suggestion": candidate["suggestion"], "reasons": candidate["reasons"],
         "market_cap_usd": snap.get("market_cap_usd"),
-        "fdv_usd": snap.get("fdv_usd"),
-        "chain": snap.get("chain"),
-        "contract_address": snap.get("contract_address"),
-        "holder_distribution": snap.get("holder_distribution"),
-        "gmgn_smart_wallets": snap.get("gmgn_smart_wallets"),
-        "gmgn_whale_wallets": snap.get("gmgn_whale_wallets"),
-        "gmgn_renowned_wallets": snap.get("gmgn_renowned_wallets"),
-        "gmgn_sniper_wallets": snap.get("gmgn_sniper_wallets"),
-        "gmgn_fresh_wallets": snap.get("gmgn_fresh_wallets"),
-        "gmgn_bundler_wallets": snap.get("gmgn_bundler_wallets"),
-        "gmgn_rat_trader_wallets": snap.get("gmgn_rat_trader_wallets"),
-        "gmgn_top_10_holder_rate": snap.get("gmgn_top_10_holder_rate"),
-        "gmgn_dev_hold_rate": snap.get("gmgn_dev_hold_rate"),
-        "gmgn_sniper_hold_rate": snap.get("gmgn_sniper_hold_rate"),
-        "gmgn_holder_count": snap.get("gmgn_holder_count"),
     }
 
 
@@ -159,18 +150,6 @@ def _build_kol_data_blob(candidate: dict) -> dict:
         "market_cap_usd": snap.get("market_cap_usd"),
         "fdv_usd": snap.get("fdv_usd"),
         "market_cap_rank": snap.get("market_cap_rank"),
-        "holder_distribution": snap.get("holder_distribution"),
-        "gmgn_smart_wallets": snap.get("gmgn_smart_wallets"),
-        "gmgn_whale_wallets": snap.get("gmgn_whale_wallets"),
-        "gmgn_renowned_wallets": snap.get("gmgn_renowned_wallets"),
-        "gmgn_sniper_wallets": snap.get("gmgn_sniper_wallets"),
-        "gmgn_fresh_wallets": snap.get("gmgn_fresh_wallets"),
-        "gmgn_bundler_wallets": snap.get("gmgn_bundler_wallets"),
-        "gmgn_rat_trader_wallets": snap.get("gmgn_rat_trader_wallets"),
-        "gmgn_top_10_holder_rate": snap.get("gmgn_top_10_holder_rate"),
-        "gmgn_dev_hold_rate": snap.get("gmgn_dev_hold_rate"),
-        "gmgn_sniper_hold_rate": snap.get("gmgn_sniper_hold_rate"),
-        "gmgn_holder_count": snap.get("gmgn_holder_count"),
         "sm_long_ratio": snap.get("sm_long_ratio"),
         "sm_net_notional_usdt": snap.get("sm_net_notional_usdt"),
         "sm_long_avg_entry": snap.get("sm_long_avg_entry"),
@@ -272,8 +251,25 @@ def _run_nl_agent():
         _nl_running = False
 
 
+def _run_short_agent():
+    """后台触发做空版 Agent（hermes cron）"""
+    global _short_running
+    try:
+        job_id = getattr(config, "AGENT_SHORT_HERMES_JOB_ID", "")
+        if job_id:
+            subprocess.run(
+                ["hermes", "cron", "run", job_id],
+                timeout=10, capture_output=True, text=True,
+            )
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        _short_running = False
+
+
 def _collect_loop():
-    global _collected, _last_flush, _kol_collected, _kol_last_flush, _kol_round, _kol_running, _nl_collected, _nl_last_flush, _nl_round, _nl_running, _kol_snapshot_collected, _kol_snapshot_last_flush, _kol_snapshot_round, _kol_snapshot_running
+    global _collected, _last_flush, _kol_collected, _kol_last_flush, _kol_round, _kol_running, _nl_collected, _nl_last_flush, _nl_round, _nl_running, _kol_snapshot_collected, _kol_snapshot_last_flush, _kol_snapshot_round, _kol_snapshot_running, _short_collected, _short_last_flush, _short_round, _short_running
     poll_seconds = getattr(config, "AGENT_COLLECT_POLL_SECONDS", 5)
     cache_ttl = getattr(config, "AGENT_COLLECT_CACHE_TTL", 5)
 
@@ -304,17 +300,28 @@ def _collect_loop():
         except Exception:
             return getattr(config, "NL_AGENT_INTERVAL_MINUTES", 30)
 
+    def _read_short_interval():
+        try:
+            with storage.get_conn() as conn:
+                ts = storage.trading_settings_get(conn)
+            return int(ts.get("agent_short_interval_minutes",
+                       getattr(config, "AGENT_SHORT_INTERVAL_MINUTES", 16)))
+        except Exception:
+            return getattr(config, "AGENT_SHORT_INTERVAL_MINUTES", 16)
+
     interval_seconds = _read_interval() * 60
     kol_interval_seconds = _read_kol_interval() * 60
     kol_snapshot_interval_seconds = kol_interval_seconds
     nl_interval_seconds = _read_nl_interval() * 60
+    short_interval_seconds = _read_short_interval() * 60
     now_start = time.time()
-    # 偏移量防撞车: KOL(8,offset=0) 主(16,offset=1) NL(16,offset=3) AI(32,offset=5) 永不重叠
+    # 偏移量防撞车: KOL(8,offset=0) 主(16,offset=1) NL(16,offset=3) 做空(16,offset=5) AI(32,offset=5) 永不重叠
     _ai_regime_last_refresh = now_start - (32*60 - 5*60)  # 首次 5 分钟后
     _last_flush       = now_start - (16*60 - 1*60)   # 首次 1 分钟后
     _kol_last_flush            = now_start               # 首次 8 分钟后
     _kol_snapshot_last_flush   = now_start - (8*60 - 4*60)  # offset=4
     _nl_last_flush    = now_start - (16*60 - 3*60)   # 首次 3 分钟后
+    _short_last_flush = now_start - (16*60 - 5*60)   # 首次 5 分钟后
     _last_heartbeat = 0
     ts_settings = {}  # 心跳刷新，供 flush 点读取开关
     # 从 DB 恢复 _kol_round 和 _nl_round，防止重启后读到旧轮数据
@@ -328,9 +335,12 @@ def _collect_loop():
         with storage.get_conn(config.NL_DB) as conn:
             row = conn.execute("SELECT COALESCE(MAX(round_number), 0) FROM nl_candidates").fetchone()
             _nl_round = row[0] if row else 0
+        with storage.get_conn(config.AGENT_SHORT_DB) as conn:
+            row = conn.execute("SELECT COALESCE(MAX(round_number), 0) FROM agent_short_candidates").fetchone()
+            _short_round = row[0] if row else 0
     except Exception:
         pass
-    print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库，KOL 每 {kol_interval_seconds // 60} 分钟触发，NL 每 {nl_interval_seconds // 60} 分钟触发", flush=True)
+    print(f"[collect] 线程已启动，每 {interval_seconds // 60} 分钟入库，KOL 每 {kol_interval_seconds // 60} 分钟触发，NL 每 {nl_interval_seconds // 60} 分钟触发，做空 每 {short_interval_seconds // 60} 分钟触发", flush=True)
 
     while True:
         try:
@@ -360,6 +370,19 @@ def _collect_loop():
                         "pass_count": c.get("pass_count", 0),
                         "signal_key": c.get("signal_key", ""),
                     }
+                # 做空版 Agent：取做空建议的候选币
+                if ts_settings.get("agent_short_enabled", True):
+                    for sc in _cached("short_candidates_scan", cache_ttl, _scan_short_candidates):
+                        if sc.get("passed"):
+                            _short_collected[sc["token"]] = {
+                                "token": sc["token"],
+                                "data": json.dumps(_build_data_blob(sc), default=str, ensure_ascii=False),
+                                "tier": sc.get("tier", ""),
+                                "passed": 1,
+                                "hard_blocks": json.dumps(sc.get("hard_block", [])),
+                                "pass_count": sc.get("pass_count", 0),
+                                "signal_key": sc.get("signal_key", ""),
+                            }
 
             # === KOL Agent：独立数据源，异常度筛选 ===
             if ts_settings.get("kol_agent_enabled", True) or ts_settings.get("kol_snapshot_enabled", True):
@@ -430,6 +453,14 @@ def _collect_loop():
                 if new_nl_interval != nl_interval_seconds:
                     print(f"[nl-collect] NL间隔变更: {nl_interval_seconds//60} → {new_nl_interval//60} 分钟", flush=True)
                     nl_interval_seconds = new_nl_interval
+                try:
+                    new_short_interval = int(ts_settings.get("agent_short_interval_minutes",
+                                             getattr(config, "AGENT_SHORT_INTERVAL_MINUTES", 16))) * 60
+                except Exception:
+                    new_short_interval = _read_short_interval() * 60
+                if new_short_interval != short_interval_seconds:
+                    print(f"[short-collect] 做空间隔变更: {short_interval_seconds//60} → {new_short_interval//60} 分钟", flush=True)
+                    short_interval_seconds = new_short_interval
                 # AI Regime 定时刷新（后台调用，不阻塞 collector）
                 try:
                     ai_interval = int(ts_settings.get("ai_regime_interval_minutes", 32)) * 60
@@ -445,10 +476,12 @@ def _collect_loop():
                 remaining = max(0, interval_seconds - (now - _last_flush))
                 kol_remaining = max(0, kol_interval_seconds - (now - _kol_last_flush))
                 nl_remaining = max(0, nl_interval_seconds - (now - _nl_last_flush))
+                short_remaining = max(0, short_interval_seconds - (now - _short_last_flush))
                 print(f"[collect] 距下次入库约 {remaining/60:.0f} 分钟"
                       f"（已收集 {len(_collected)} 个），"
                       f"KOL 距触发约 {kol_remaining/60:.0f} 分钟（{len(_kol_collected)}），"
-                      f"NL 距触发约 {nl_remaining/60:.0f} 分钟（{len(_nl_collected)}）", flush=True)
+                      f"NL 距触发约 {nl_remaining/60:.0f} 分钟（{len(_nl_collected)}），"
+                      f"做空 距触发约 {short_remaining/60:.0f} 分钟（{len(_short_collected)}）", flush=True)
 
             with _flush_lock:
                 if now - _last_flush >= interval_seconds and _collected:
@@ -526,6 +559,22 @@ def _collect_loop():
                       f"（第{_nl_round}轮），触发无教训版 Agent", flush=True)
                 threading.Thread(target=_run_nl_agent, daemon=True).start()
 
+            # === 做空版 Agent 独立定时触发 ===
+            if (ts_settings.get("agent_short_enabled", True) and _short_collected
+                    and not _short_running and now - _short_last_flush >= short_interval_seconds):
+                batch = list(_short_collected.values())
+                with storage.get_conn(config.AGENT_SHORT_DB) as conn:
+                    storage.agent_short_candidates_insert_batch(conn, _short_round + 1, batch)
+                    storage.agent_short_candidates_purge_old(conn, keep_last_rounds=30)
+                _short_last_flush = now
+                _short_running = True
+                _short_round += 1
+                _short_collected.clear()
+                ts_str = datetime.now().strftime("%H:%M:%S")
+                print(f"[short-collect] {ts_str} 入库 {len(batch)} 个做空候选"
+                      f"（第{_short_round}轮），触发做空版 Agent", flush=True)
+                threading.Thread(target=_run_short_agent, daemon=True).start()
+
         except Exception:
             import traceback
             traceback.print_exc()
@@ -551,10 +600,12 @@ class TradingSettingsBody(BaseModel):
     agent_trigger_interval: int | None = None
     strategy_initial_agent: float | None = None
     strategy_initial_heat_agent: float | None = None
+    strategy_initial_agent_short: float | None = None
     strategy_initial_system: float | None = None
     strategy_initial_manual: float | None = None
     kol_agent_interval_minutes: int | None = None
     nl_agent_interval_minutes: int | None = None
+    agent_short_interval_minutes: int | None = None
     heat_agent_lessons_trigger_interval: int | None = None
     ai_regime_interval_minutes: int | None = None
     kol_llm_provider: str | None = None
@@ -563,6 +614,7 @@ class TradingSettingsBody(BaseModel):
     strategy_initial_heat_agent_lessons: float | None = None
     agent_trade_enabled: bool | None = None
     heat_agent_enabled: bool | None = None
+    agent_short_enabled: bool | None = None
     kol_agent_enabled: bool | None = None
     nl_agent_enabled: bool | None = None
     heat_agent_lessons_enabled: bool | None = None
@@ -624,13 +676,6 @@ def _refresh_watchlist_tokens(tokens: list[str]) -> dict:
         social_map = {s["token"]: s["score"] for s in short_scores}
 
     futures_set = get_futures_symbols()
-    # CoinGecko 批量补充
-    try:
-        from market import get_coingecko_metrics
-        cg_metrics = get_coingecko_metrics(tokens)
-    except Exception as e:
-        print(f"[watchlist] CoinGecko 批量查询失败: {e}")
-        cg_metrics = {}
     refreshed = 0
     skipped = 0
     for token in tokens:
@@ -644,31 +689,6 @@ def _refresh_watchlist_tokens(tokens: list[str]) -> dict:
             continue
         if not snap:
             continue
-
-        # CoinGecko 覆盖链 + 市值
-        if token in cg_metrics:
-            for k in ("chain", "contract_address", "market_cap_usd", "fdv_usd"):
-                if k in cg_metrics[token]:
-                    snap[k] = cg_metrics[token][k]
-
-        # GMGN 持仓 + 聪明钱统计
-        if snap.get("contract_address") and snap.get("chain"):
-            try:
-                from market import get_gmgn_holders, get_gmgn_token_info
-                holders = get_gmgn_holders(snap["chain"], snap["contract_address"])
-                if holders:
-                    snap["holder_distribution"] = holders
-                else:
-                    print(f"[watchlist] GMGN holders 无数据: {token} ({snap['chain']})")
-                info = get_gmgn_token_info(snap["chain"], snap["contract_address"])
-                if info:
-                    for k, v in info.items():
-                        if v is not None:
-                            snap[k] = v
-                else:
-                    print(f"[watchlist] GMGN token info 无数据: {token} ({snap['chain']})")
-            except Exception as e:
-                print(f"[watchlist] GMGN 查询异常: {token} — {e}")
 
         # OI/市值 杠杆率
         if snap.get("market_cap_usd") and snap.get("oi_usd") and snap["market_cap_usd"] > 0:
@@ -1008,7 +1028,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1053,7 +1073,7 @@ def api_trading_reset_strategy(body: TradingResetStrategyBody):
         raise HTTPException(400, "需要 confirm=true 以确认重置")
     strategy = body.strategy.strip().lower()
     valid = {"agent", "heat_agent", "heat_agent_lessons", "agent_no_lessons",
-             "kol_agent", "kol_snapshot", "system", "manual"}
+             "kol_agent", "kol_snapshot", "system", "manual", "agent_short"}
     if strategy not in valid:
         raise HTTPException(400, f"无效策略: {body.strategy}")
     with storage.get_conn() as conn:
@@ -1178,7 +1198,8 @@ def api_agent_overview(strategy: str = "agent"):
 
             # 待处理决策（按 source 过滤策略）
             src_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history",
-                       "agent_no_lessons": "nl_candidates", "heat_agent_lessons": "token_heat_history_lessons",
+                       "agent_no_lessons": "nl_candidates",
+        "agent_short": "agent_candidates_short", "heat_agent_lessons": "token_heat_history_lessons",
                        "kol_agent": "kol_agent",
                        "kol_snapshot": "kol_snapshot"}
             src = src_map.get(strategy, "agent_candidates")
@@ -1282,7 +1303,8 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
     source_map = {"agent": "agent_candidates", "heat_agent": "token_heat_history",
                   "agent_no_lessons": "nl_candidates", "heat_agent_lessons": "token_heat_history_lessons",
                   "kol_agent": "kol_agent",
-                       "kol_snapshot": "kol_snapshot"}
+                       "kol_snapshot": "kol_snapshot",
+                       "agent_short": "agent_candidates_short"}
     src = source_map.get(strategy, "agent_candidates")
     with storage.get_conn() as conn:
         journal_total = conn.execute(
@@ -1733,6 +1755,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
     <a href="/heat-agent">Agent-热度榜单</a>
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
+                <a href="/agent-short">Agent-做空</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
               <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
           </div>
@@ -2056,38 +2079,12 @@ function renderDeepAnalysis(items) {
           <div class="metric"><div class="label">24h 成交额</div><div class="value">${fmtUsd(s.volume_24h_usd)}</div></div>
           <div class="metric"><div class="label">vol/OI 比值</div><div class="value">${s.vol_oi_ratio ? s.vol_oi_ratio.toFixed(2) : '-'}</div></div>
           <div class="metric"><div class="label">上线天数</div><div class="value">${s.listing_age_days ? Math.round(s.listing_age_days) + 'd' : '-'}</div></div>
-          <div class="metric"><div class="label">品类/链</div><div class="value" style="font-size:11px">${s.sector||'-'} / ${s.chain||'-'}</div></div>
+          <div class="metric"><div class="label">品类</div><div class="value" style="font-size:11px">${s.sector||'-'}</div></div>
           <div class="metric"><div class="label">Basis 基差</div><div class="value">${fmtPct2(s.basis_pct)}</div></div>
           <div class="metric"><div class="label">OKX 费率</div><div class="value">${fmtFR2(s.okx_funding_pct)}</div></div>
 
           <div class="metric"><div class="label">OKX 费率趋势</div><div class="value" style="font-size:11px">${(()=>{const h=s.funding_history;if(!h||!h.length)return'-';return h.slice(-4).map(x=>(x.r>0?'+':'')+x.r.toFixed(4)+'%').join(' → ')})()}</div></div>
           <div class="metric"><div class="label">市值</div><div class="value">${fmtMc(s.market_cap_usd)}${s.market_cap_rank ? ' <span class="muted">#'+s.market_cap_rank+'</span>' : ''}</div></div>
-          ${s.holder_distribution ? `
-          <div class="metric" style="flex-basis:100%">
-            <div class="label">持仓分布（前10）<span style="font-weight:400;color:var(--muted)"> · 合约 ${s.chain||'?'} · ${s.gmgn_holder_count||0} 持币地址</span></div>
-            <div style="font-size:11px;margin-top:4px">
-              ${Array.isArray(s.holder_distribution.top10) ? s.holder_distribution.top10.slice(0,10).map(h => `
-                <div style="display:flex;justify-content:space-between;padding:1px 0">
-                  <span><span style="color:var(--muted)">${h.rank}.</span> ${h.tag || h.address_short}${h.address_short && !h.tag ? '...' : ''}</span>
-                  <span>${h.pct.toFixed(1)}%</span>
-                </div>
-              `).join('') : ''}
-              <div style="display:flex;justify-content:space-between;padding:2px 0;border-top:1px solid var(--border);margin-top:2px">
-                <span style="color:var(--muted)">前10合计</span>
-                <span>${s.holder_distribution.top10_pct.toFixed(1)}%</span>
-              </div>
-            </div>
-          </div>
-          ` : `<div class="metric"><div class="label">持仓分布（前10）</div><div class="value">-</div></div>`}
-          <div class="metric"><div class="label">链上聪明钱 (GMGN)</div><div class="value" style="font-size:11px">
-            ${s.gmgn_smart_wallets != null ? `
-            <div>🧠 ${s.gmgn_smart_wallets||0} 聪明钱 · 🐳 ${s.gmgn_whale_wallets||0} 巨鲸 · ⭐ ${s.gmgn_renowned_wallets||0} KOL${s.gmgn_sniper_wallets ? ' · 🎯 '+s.gmgn_sniper_wallets+' 狙击手' : ''}</div>
-            <div style="margin-top:2px;line-height:1.6">
-            ${s.gmgn_dev_hold_rate != null ? '<div>团队持币 <span style="color:'+(s.gmgn_dev_hold_rate>5?'var(--red)':'var(--muted)')+'">'+s.gmgn_dev_hold_rate.toFixed(1)+'%</span></div>' : ''}
-            ${s.gmgn_top_10_holder_rate != null ? '<div>前10占比 <span style="color:'+(s.gmgn_top_10_holder_rate>50?'var(--red)':s.gmgn_top_10_holder_rate>30?'var(--yellow)':'var(--muted)')+'">'+s.gmgn_top_10_holder_rate.toFixed(1)+'%</span></div>' : ''}
-            </div>
-            ` : '-'}
-          </div></div>
           <div class="metric"><div class="label">OI/市值 (杠杆率)</div><div class="value">${s.oi_marketcap_ratio != null ? s.oi_marketcap_ratio.toFixed(2)+'%' : '-'}${s.oi_marketcap_ratio > 5 ? ' <span style="color:var(--red);font-size:11px">高杠杆</span>' : s.oi_marketcap_ratio > 2 ? ' <span style="color:var(--yellow);font-size:11px">注意</span>' : ''}</div></div>
           <div class="metric"><div class="label">MA20 乖离 (5h)</div><div class="value">${fmtPct2(s.ma20_deviation_pct)}</div></div>
           <div class="metric" title="${fmtSmTooltip(s)}" style="cursor:help"><div class="label">聪明钱 ▾</div><div class="value">多头${fmtPct2(s.sm_long_ratio)} | 净头寸${fmtUsd(s.sm_net_notional_usdt)} | ${s.sm_traders_with_position||0}人</div></div>
@@ -2801,6 +2798,7 @@ tr:hover { background: #1f2536; }
       <a href="/heat-agent">Agent-热度榜单</a>
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
+                <a href="/agent-short">Agent-做空</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
               <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
               </div>
@@ -3417,6 +3415,30 @@ NL_AGENT_HTML = AGENT_HTML.replace(
     '<a href="/agent-nl">', '<a href="/agent-nl" class="active">'
 )
 
+AGENT_SHORT_HTML = AGENT_HTML.replace(
+    "<title>Agent-合约扫描</title>", "<title>Agent-做空版</title>"
+).replace(
+    "<h1>Agent-合约扫描</h1>", "<h1>Agent-做空版</h1>"
+).replace(
+    "strategy_initial_agent", "strategy_initial_agent_short"
+).replace(
+    "p.strategy === 'agent'", "p.strategy === 'agent_short'"
+).replace(
+    "const AGENT_STRATEGY = 'agent'", "const AGENT_STRATEGY = 'agent_short'"
+).replace(
+    "'/api/agent/overview'", "'/api/agent/overview?strategy='+AGENT_STRATEGY"
+).replace(
+    "'/api/agent/journal?limit='", "'/api/agent/journal?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/timeline?limit='", "'/api/agent/timeline?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    "'/api/agent/lessons?limit='", "'/api/agent/lessons?strategy='+AGENT_STRATEGY+'&limit='"
+).replace(
+    '<a href="/agent" class="active">', '<a href="/agent">'
+).replace(
+    '<a href="/agent-short">', '<a href="/agent-short" class="active">'
+)
+
 
 SETTINGS_HTML = """
 <!DOCTYPE html>
@@ -3494,6 +3516,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <a href="/heat-agent">Agent-热度榜单</a>
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
+                <a href="/agent-short">Agent-做空</a>
     <a href="/agent-kol">Agent-KOL 监控</a>
               <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
   </div>
@@ -3699,6 +3722,27 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   </div>
 
   <div class="strategy-block">
+    <div class="strategy-name">Agent-做空版</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-short-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-short" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>触发间隔（分钟）</label>
+        <input id="trade-short-interval" type="number" min="5" max="480" step="5">
+      </div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
     <div class="strategy-name">系统策略</div>
     <div class="grid3">
       <div>
@@ -3743,6 +3787,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <option value="kol_snapshot">Agent-KOL认知快照</option>
         <option value="system">系统自动</option>
         <option value="manual">手动</option>
+        <option value="agent_short">Agent-做空版</option>
       </select>
     </div>
     <div>
@@ -3803,6 +3848,9 @@ async function loadSettings() {
     document.getElementById('trade-strategy-kol-snapshot').value = s.strategy_initial_kol_snapshot ?? 1000;
     document.getElementById('trade-nl-switch').value = s.nl_agent_enabled ?? true;
     document.getElementById('trade-heat-lessons-switch').value = s.heat_agent_lessons_enabled ?? true;
+    document.getElementById('trade-short-switch').value = s.agent_short_enabled ?? true;
+    document.getElementById('trade-short-interval').value = s.agent_short_interval_minutes ?? 16;
+    document.getElementById('trade-strategy-short').value = s.strategy_initial_agent_short ?? 1000;
     document.getElementById('trade-kol-min-conf').value = s.kol_agent_min_confidence ?? 70;
     document.getElementById('trade-kol-cooldown').value = s.kol_token_cooldown_minutes ?? 30;
     document.getElementById('trade-daily-limit-switch').value = s.trading_daily_limit_enabled ?? true;
@@ -3846,6 +3894,9 @@ async function saveTradingSettings() {
     kol_snapshot_enabled: document.getElementById('trade-kol-snapshot-switch').value === 'true',
     nl_agent_enabled: document.getElementById('trade-nl-switch').value === 'true',
     heat_agent_lessons_enabled: document.getElementById('trade-heat-lessons-switch').value === 'true',
+    agent_short_enabled: document.getElementById('trade-short-switch').value === 'true',
+    strategy_initial_agent_short: Number(document.getElementById('trade-strategy-short').value),
+    agent_short_interval_minutes: Number(document.getElementById('trade-short-interval').value),
     kol_agent_min_confidence: parseInt(document.getElementById('trade-kol-min-conf').value) || 70,
     kol_token_cooldown_minutes: parseInt(document.getElementById('trade-kol-cooldown').value) || 30,
     trading_daily_limit_enabled: document.getElementById('trade-daily-limit-switch').value === 'true',
@@ -4152,6 +4203,7 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
       <a href="/heat-agent">Agent-热度榜单</a>
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
+                <a href="/agent-short">Agent-做空</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
               <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
           </div>
@@ -4419,6 +4471,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
       <a href="/heat-agent">Agent-热度榜单</a>
     <a href="/agent-heat-lessons">Agent-热度有教训</a>
     <a href="/agent-nl">Agent-无教训</a>
+                <a href="/agent-short">Agent-做空</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
               <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
               </div>
@@ -4455,6 +4508,7 @@ async function load() {
       kol_agent: '<span class="strategy-badge" style="background:#1a2a4a;color:#58a6ff">🧠 KOL策略</span>',
       heat_agent_lessons: '<span class="strategy-badge" style="background:#3a2a1a;color:#f0a040">🔥 热度有教训</span>',
       agent_no_lessons: '<span class="strategy-badge" style="background:#2a2a1a;color:#d29922">📋 无教训对照</span>',
+        agent_short: '<span class="strategy-badge" style="background:#4a1a1a;color:#f85149">🔻 做空Agent</span>',
     };
     let html = '';
     for (const s of strategies) {
@@ -4597,11 +4651,11 @@ async function loadLLMLogs(){
     const r=await fetch("/api/kol/llm-logs?limit=30&strategy=" + _strategy);
     const logs=await r.json();
     if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
-    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th><th>LLM反馈缺失</th></tr>";
+    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th></tr>";
     for(const l of logs){
       let t="";if(l.created_at){const d=new Date(l.created_at+"Z");d.setHours(d.getHours()+8);t=d.toISOString().replace("T"," ").substring(5,16);}
       const ok=l.success?"<span class=green>OK("+l.analyses_count+"条)</span>":"<span class=red>FAIL</span>";
-      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td><td class=muted>"+(l.missing_data||"").substring(0,120)+"</td></tr>";
+      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td></tr>";
     }
     document.getElementById("llm-logs").innerHTML=h+"</table>";
   }catch(e){}
@@ -4666,11 +4720,11 @@ async function loadLLMLogs(){
     const r=await fetch("/api/kol/llm-logs?limit=30&strategy=" + _strategy);
     const logs=await r.json();
     if(!Array.isArray(logs)||!logs.length){document.getElementById("llm-logs").innerHTML="<div class=empty>暂无</div>";return;}
-    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th><th>说明</th><th>LLM反馈缺失</th></tr>";
+    let h="<table><tr><th>时间</th><th>提供商</th><th>候选</th><th>耗时</th><th>状态</th></tr>";
     for(const l of logs){
       let t="";if(l.created_at){const d=new Date(l.created_at+"Z");d.setHours(d.getHours()+8);t=d.toISOString().replace("T"," ").substring(5,16);}
       const ok=l.success?"<span class=green>OK("+l.analyses_count+"条)</span>":"<span class=red>FAIL</span>";
-      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td><td class=muted>"+(l.error||"").substring(0,80)+"</td><td class=muted>"+(l.missing_data||"").substring(0,120)+"</td></tr>";
+      h+="<tr><td class=muted>"+t+"</td><td>"+(l.provider||"")+"</td><td>"+l.candidate_count+"</td><td>"+(l.duration_ms/1000).toFixed(1)+"s</td><td>"+ok+"</td></tr>";
     }
     document.getElementById("llm-logs").innerHTML=h+"</table>";
   }catch(e){}
@@ -4694,6 +4748,14 @@ def heat_agent_page():
 def agent_nl_page():
     return HTMLResponse(
         content=NL_AGENT_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@app.get("/agent-short", response_class=HTMLResponse)
+def agent_short_page():
+    return HTMLResponse(
+        content=AGENT_SHORT_HTML,
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -4803,6 +4865,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       <a href="/heat-agent">Agent-热度榜单</a>
       <a href="/agent-heat-lessons">Agent-热度有教训</a>
       <a href="/agent-nl">Agent-无教训</a>
+                <a href="/agent-short">Agent-做空</a>
       <a href="/agent-kol">Agent-KOL 监控</a>
               <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
     </div>

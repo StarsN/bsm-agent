@@ -26,7 +26,7 @@ _kol_snapshot_token_last_sent: dict[str, float] = {}
 # ------------------------------------------------------------
 
 def _load_kol_files(kol_dir: str) -> list[dict]:
-    """扫描 kol_dir/TradeSnapshot/ 下的 _hermes_short_v1.md 文件。
+    """扫描 kol_dir/TradeSnapshot/ 下的 _hermes_short_v3.md 文件。
     返回 [{name, framework}, ...]
     """
     d = Path(kol_dir) / "TradeSnapshot"
@@ -34,8 +34,8 @@ def _load_kol_files(kol_dir: str) -> list[dict]:
         return []
 
     kols = []
-    for fpath in sorted(d.glob("*_hermes_short_v1.md")):
-        name = fpath.stem.replace("_hermes_short_v1", "").strip()
+    for fpath in sorted(d.glob("*_hermes_short_v3.md")):
+        name = fpath.stem.replace("__TradeFramework_hermes_short_v3", "").strip()
         if not name:
             continue
         text = fpath.read_text(encoding="utf-8").strip()
@@ -307,7 +307,7 @@ def _fmt_price(v):
 
 
 def _fmt_holders(hd: dict) -> str | None:
-    """持仓分布 → 简洁文本，如 TOP1: whale 12.3% | TOP2: Binance 8.1%"""
+    """持仓分布 → 简洁文本，含成本盈利，如 TOP1: whale 12.5% 成本$0.034 盈$1.2M"""
     top = hd.get("top10", [])
     if not top:
         return None
@@ -315,7 +315,15 @@ def _fmt_holders(hd: dict) -> str | None:
     for h in top:
         tag = h.get("tag") or h.get("address_short", "?")
         pct = h.get("pct", 0)
-        parts.append(f"#{h['rank']} {tag} {pct:.1f}%")
+        s = f"#{h.get('rank', '?')} {tag} {pct:.1f}%"
+        if h.get("cost") is not None:
+            s += f" 成本${h['cost']:.4f}"
+        if h.get("profit") is not None:
+            s += f" 盈${_fmt_usd(h['profit'])}"
+        if h.get("netflow") is not None:
+            direction = "流入" if h["netflow"] > 0 else "流出"
+            s += f" {direction}${_fmt_usd(abs(h['netflow']))}"
+        parts.append(s)
     return " | ".join(parts)
 
 
@@ -384,6 +392,60 @@ def _build_kline_summary(klines, label: str = "", limit: int = 0):
         return None
 
 
+def _enrich_with_onchain_data(candidates: list[dict]) -> None:
+    """在请求 KOL LLM 前，为候选币获取链上/持仓/聪明钱数据
+
+    从 worker.py refresh_market_snapshots 迁移至此：
+    - CoinGecko: chain, contract_address, fdv_usd（链/合约/FDV，GMGN 前置依赖）
+    - GMGN: holder_distribution, gmgn_smart_wallets 等
+    - Ave.ai: CG/GMGN 不可用时的自动兜底
+    注意：market_cap_usd + sm_* 已在 worker.py 通过 OKX 注入快照，不在此重复获取
+    """
+    tokens = [c.get("token", "") for c in candidates if c.get("token")]
+    if not tokens:
+        return
+
+    # --- CoinGecko：链 + 合约地址 + FDV（market_cap 走 OKX，不在此获取）---
+    cg_metrics = {}
+    try:
+        from market import get_coingecko_metrics
+        cg_metrics = get_coingecko_metrics(tokens)
+    except Exception:
+        pass
+
+    for c in candidates:
+        token = c.get("token", "")
+
+        # 注入 CG 字段（chain + contract 是 GMGN 的前置条件）
+        if token in cg_metrics:
+            for k in ("chain", "contract_address", "fdv_usd"):
+                if k in cg_metrics[token]:
+                    c[k] = cg_metrics[token][k]
+            # market_cap 兜底：OKX 没返回时用 CG 的
+            if cg_metrics[token].get("market_cap_usd") and c.get("market_cap_usd") is None:
+                c["market_cap_usd"] = cg_metrics[token]["market_cap_usd"]
+
+        # --- GMGN 持仓分布 + 链上聪明钱 ---
+        if c.get("contract_address") and c.get("chain"):
+            try:
+                from market import get_gmgn_holders, get_gmgn_token_info
+                holders = get_gmgn_holders(c["chain"], c["contract_address"])
+                if holders:
+                    c["holder_distribution"] = holders
+                info = get_gmgn_token_info(c["chain"], c["contract_address"])
+                if info:
+                    for k, v in info.items():
+                        if v is not None:
+                            c[k] = v
+            except Exception:
+                pass
+
+        # OI/市值兜底：worker 侧 OKX 失败但 CG 兜底拿到了市值
+        if c.get("market_cap_usd") and c.get("oi_usd") and c["market_cap_usd"] > 0:
+            if c.get("oi_marketcap") is None:
+                c["oi_marketcap"] = c["oi_usd"] / c["market_cap_usd"] * 100
+
+
 def build_user_prompt(candidates: list[dict]) -> str:
     """把候选币数据格式化为 user prompt"""
     lines = ["## 候选币市场数据\n"]
@@ -413,6 +475,7 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("24h成交额", _fmt_usd(c.get("vol_24h"))),
             ("OI(USD)", _fmt_usd(c.get("oi_usd"))),
             ("上币时长", c.get("age")),
+            ("社交热度(广场提及次数)", f"{c.get('mentions',0)}次（{'高' if (c.get('mentions') or 0) >= 10 else '中' if (c.get('mentions') or 0) >= 3 else '低'}）" if c.get("mentions") else None),
             # 全景字段
             ("vol/OI", f"{c.get('vol_oi'):.2f}" if c.get("vol_oi") is not None else None),
             ("上线天数", f"{c.get('listing_days'):.0f}d" if c.get("listing_days") is not None else None),
@@ -426,7 +489,7 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("市值排名", f"#{int(c.get('market_cap_rank'))}" if c.get("market_cap_rank") else None),
             ("MA20乖离(5h)", _fmt_pct(c.get("ma20_deviation"))),
             ("聪明钱多头占比", _fmt_pct(c.get("sm_long_ratio"))),
-            ("聪明钱净头寸(USD)", _fmt_usd(c.get("sm_net_notional_usdt")) if c.get("sm_net_notional_usdt") else None),
+            ("聪明钱净头寸(USD)", _fmt_usd(c.get("sm_net_notional_usdt")) if c.get("sm_net_notional_usdt") is not None else None),
             ("聪明钱多头胜率", _fmt_pct(c.get("sm_avg_long_win_rate"))),
             ("聪明钱关注人数", c.get("sm_traders_with_position")),
             ("聪明钱多头均价", _fmt_price(c.get("sm_long_avg_entry")) if c.get("sm_long_avg_entry") else None),
@@ -435,19 +498,21 @@ def build_user_prompt(candidates: list[dict]) -> str:
             ("OI/市值", _fmt_pct(c.get("oi_marketcap"))),
             # 链上数据 (CoinGecko + GMGN)
             ("FDV", _fmt_usd(c.get("fdv_usd")) if c.get("fdv_usd") else None),
-            ("持币地址总数", f"{int(c['gmgn_holder_count']):,}" if c.get("gmgn_holder_count") else None),
+            ("持币地址总数", f"{int(c['gmgn_holder_count']):,}" if c.get("gmgn_holder_count") is not None else None),
             ("前10持仓占比", _fmt_pct(c.get("gmgn_top_10_holder_rate")) if c.get("gmgn_top_10_holder_rate") is not None else None),
             ("团队持币占比", _fmt_pct(c.get("gmgn_dev_hold_rate")) if c.get("gmgn_dev_hold_rate") is not None else None),
             ("狙击手持币占比", _fmt_pct(c.get("gmgn_sniper_hold_rate")) if c.get("gmgn_sniper_hold_rate") is not None else None),
-            ("持仓分布(前10合计)", _fmt_pct(c.get("holder_distribution", {}).get("top10_pct")) if c.get("holder_distribution") else None),
-            ("持仓TOP5", _fmt_holders(c.get("holder_distribution")) if c.get("holder_distribution") else None),
-            ("链上聪明钱", f"{c['gmgn_smart_wallets']}个" if c.get("gmgn_smart_wallets") else None),
-            ("链上巨鲸", f"{c['gmgn_whale_wallets']}个" if c.get("gmgn_whale_wallets") else None),
-            ("链上KOL", f"{c['gmgn_renowned_wallets']}个" if c.get("gmgn_renowned_wallets") else None),
-            ("链上狙击手", f"{c['gmgn_sniper_wallets']}个" if c.get("gmgn_sniper_wallets") else None),
-            ("链上新钱包", f"{c['gmgn_fresh_wallets']}个" if c.get("gmgn_fresh_wallets") else None),
-            ("链上捆绑包", f"{c['gmgn_bundler_wallets']}个" if c.get("gmgn_bundler_wallets") else None),
-            ("链上老鼠仓", f"{c['gmgn_rat_trader_wallets']}个" if c.get("gmgn_rat_trader_wallets") else None),
+            ("持仓分布(前10合计)", _fmt_pct((c.get("holder_distribution") or {}).get("top10_pct")) if c.get("holder_distribution") else None),
+            ("前10盈亏", f"{(c.get('holder_distribution') or {}).get('top10_in_profit',0)}/10盈利" if c.get("holder_distribution") else None),
+            ("前10均价", _fmt_price((c.get("holder_distribution") or {}).get("top10_avg_cost")) if (c.get("holder_distribution") or {}).get("top10_avg_cost") else None),
+            ("持仓TOP10", _fmt_holders(c.get("holder_distribution")) if c.get("holder_distribution") else None),
+            ("链上聪明钱", f"{c['gmgn_smart_wallets']}个" if c.get("gmgn_smart_wallets") is not None else None),
+            ("链上巨鲸", f"{c['gmgn_whale_wallets']}个" if c.get("gmgn_whale_wallets") is not None else None),
+            ("链上KOL", f"{c['gmgn_renowned_wallets']}个" if c.get("gmgn_renowned_wallets") is not None else None),
+            ("链上狙击手", f"{c['gmgn_sniper_wallets']}个" if c.get("gmgn_sniper_wallets") is not None else None),
+            ("链上新钱包", f"{c['gmgn_fresh_wallets']}个" if c.get("gmgn_fresh_wallets") is not None else None),
+            ("链上捆绑包", f"{c['gmgn_bundler_wallets']}个" if c.get("gmgn_bundler_wallets") is not None else None),
+            ("链上老鼠仓", f"{c['gmgn_rat_trader_wallets']}个" if c.get("gmgn_rat_trader_wallets") is not None else None),
             # K线结构
             ("1h结构", _build_kline_summary(c.get("klines_1h"), limit=6)),
             ("1H K线(开/高/低/收/成交量/成交额)", _fmt_klines(c.get("klines_1h"), 6)),
@@ -758,6 +823,9 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
     except Exception:
         pass
 
+    # 为候选币拉链上数据（CG/GMGN/Ave/OKX，替代原来每轮全量快照注入）
+    _enrich_with_onchain_data(candidates)
+
     system = build_snapshot_system_prompt(kol_data)
     panorama = _build_panorama_context()
 
@@ -799,7 +867,7 @@ def analyze_candidates_snapshot(conn: sqlite3.Connection) -> list[dict]:
         for future in as_completed(future_map):
             i, key, batch, user, t0 = future_map[future]
             try:
-                raw = future.result()
+                raw = future.result(timeout=getattr(config, "KOL_LLM_TIMEOUT", 310))
                 _elapsed = int((_time.time() - t0) * 1000)
             except Exception as e:
                 raw = None
@@ -902,6 +970,9 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
     except Exception:
         pass
 
+    # 为候选币拉链上数据（CG/GMGN/Ave/OKX，替代原来每轮全量快照注入）
+    _enrich_with_onchain_data(candidates)
+
     # 拼接 prompt（全景 header 共用，候选币按批次拆分）
     system = build_system_prompt(kol_data)
     panorama = _build_panorama_context()
@@ -943,7 +1014,7 @@ def analyze_candidates(conn: sqlite3.Connection) -> list[dict]:
         for future in as_completed(future_map):
             i, key, batch, user, t0 = future_map[future]
             try:
-                raw = future.result()
+                raw = future.result(timeout=getattr(config, "KOL_LLM_TIMEOUT", 310))
                 _elapsed = int((_time.time() - t0) * 1000)
             except Exception as e:
                 raw = None
