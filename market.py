@@ -406,7 +406,7 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
         "klines_4h": None,              # 4H K线近6根
     }
 
-    # 1) 标记价 + 资金费率
+    # 1) 标记价 + 资金费率 + 基差
     prem = _http_get(f"{FAPI_BASE}/fapi/v1/premiumIndex", {"symbol": symbol})
     if prem:
         try:
@@ -414,6 +414,9 @@ def get_market_snapshot(token: str, heavy: bool = True) -> Optional[dict]:
             fr = float(prem.get("lastFundingRate"))
             snap["funding_rate"] = fr
             snap["funding_rate_pct"] = fr * 100
+            idx = float(prem.get("indexPrice", 0))
+            if idx > 0:
+                snap["basis_pct"] = round((snap["mark_price"] - idx) / idx * 100, 4)
         except (TypeError, ValueError):
             pass
 
@@ -607,31 +610,24 @@ def _coingecko_search(token: str) -> str | None:
     """代币名 → CoinGecko coin_id"""
     from urllib.parse import quote
     url = f"https://api.coingecko.com/api/v3/search?query={quote(token)}"
-    for attempt in range(3):
-        try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            coins = data.get("coins", [])
-            if not coins:
-                return None
-            token_u = token.upper()
-            for c in coins:
-                if c.get("symbol", "").upper() == token_u:
-                    return c["id"]
-            return None  # 无精确匹配
-        except HTTPError as e:
-            if e.code == 429:
-                print(f"  [CG] 搜索限流(429): {token} (attempt {attempt+1}/3)")
-            elif e.code >= 500 and attempt < 2:
-                _backoff_sleep(attempt + 1)
-                continue
-            if attempt < 2:
-                _backoff_sleep(attempt + 1)
-        except Exception:
-            if attempt < 2:
-                _backoff_sleep(attempt + 1)
-    return None
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        coins = data.get("coins", [])
+        if not coins:
+            return None
+        token_u = token.upper()
+        for c in coins:
+            if c.get("symbol", "").upper() == token_u:
+                return c["id"]
+        return None  # 无精确匹配
+    except HTTPError as e:
+        if e.code == 429:
+            print(f"  [CG] 搜索限流(429): {token}")
+        return None
+    except Exception:
+        return None
 
 
 def _coingecko_meta(coin_id: str) -> dict | None:
@@ -641,24 +637,15 @@ def _coingecko_meta(coin_id: str) -> dict | None:
         "?localization=false&tickers=false&community_data=false"
         "&developer_data=false&sparkline=false"
     )
-    for attempt in range(3):
-        try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            break
-        except HTTPError as e:
-            if e.code == 429:
-                print(f"  [CG] meta限流(429): {coin_id} (attempt {attempt+1}/3)")
-            elif e.code >= 500 and attempt < 2:
-                _backoff_sleep(attempt + 1)
-                continue
-            if attempt < 2:
-                _backoff_sleep(attempt + 1)
-        except Exception:
-            if attempt < 2:
-                _backoff_sleep(attempt + 1)
-    else:
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        if e.code == 429:
+            print(f"  [CG] meta限流(429): {coin_id}")
+        return None
+    except Exception:
         return None
 
     result = {}
@@ -694,6 +681,45 @@ def _coingecko_meta(coin_id: str) -> dict | None:
     return result if result else None  # 至少要有市值或链信息
 
 
+def _ave_token_info(token: str) -> dict | None:
+    """Ave.ai 搜索 → {chain, contract_address, market_cap_usd, fdv_usd}"""
+    try:
+        api_key = os.environ.get("AVE_API_KEY", getattr(config, "AVE_API_KEY", ""))
+        if not api_key:
+            return None
+        from urllib.parse import quote
+        url = f"https://prod.ave-api.com/v2/tokens?keyword={quote(token)}&limit=10"
+        req = Request(url, headers={"X-API-KEY": api_key})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") != 1:
+            return None
+        tokens = data.get("data", [])
+        if not tokens:
+            return None
+        # 精确匹配 symbol
+        token_u = token.upper()
+        for t in tokens:
+            if t.get("symbol", "").upper() == token_u:
+                result = {}
+                mcap = t.get("market_cap")
+                if mcap:
+                    result["market_cap_usd"] = float(mcap)
+                fdv = t.get("fdv")
+                if fdv:
+                    result["fdv_usd"] = float(fdv)
+                chain_name = t.get("chain")
+                contract_addr = t.get("token")
+                if chain_name and contract_addr:
+                    # 映射到 CG 链名格式，确保跟现有链名一致
+                    result["chain"] = chain_name
+                    result["contract_address"] = contract_addr
+                return result if result else None
+        return None
+    except Exception:
+        return None
+
+
 def get_coingecko_metrics(tokens: list[str]) -> dict[str, dict]:
     """批量获取 CoinGecko 数据，内置缓存"""
     global _cg_cache
@@ -715,15 +741,12 @@ def get_coingecko_metrics(tokens: list[str]) -> dict[str, dict]:
 
     for token in to_fetch:
         coin_id = _coingecko_search(token)
-        if not coin_id:
-            # 搜索失败不缓存，下一轮重试（避免因限流/超时导致 1h 无数据）
-            continue
-        meta = _coingecko_meta(coin_id)
+        meta = _coingecko_meta(coin_id) if coin_id else None
+        if not meta:
+            meta = _ave_token_info(token)  # CG 失败，Ave 兜底
         if meta:
             _cg_cache[token.lower()] = {"data": meta, "ts": now}
             result[token] = meta
-        # meta=None 也不缓存：可能是 CG 搜索匹配到错误代币（无合约地址），
-        # 下一轮 CG 搜索结果可能不同（如 "PUMP" 等泛称代币）
 
     return result
 
@@ -731,6 +754,9 @@ def get_coingecko_metrics(tokens: list[str]) -> dict[str, dict]:
 # ==========================================================================
 # GMGN 持仓分布 — 合约地址 → 前10持仓占比
 # ==========================================================================
+
+_gmgn_cache: dict = {}       # {(chain, address): {holders, info, ts}}
+_GMGN_CACHE_TTL = 1800        # 缓存 30 分钟
 
 _CG_TO_GMGN_CHAIN = {
     "solana": "sol", "ethereum": "eth", "binance-smart-chain": "bsc",
@@ -750,10 +776,15 @@ def _gmgn_chain(chain: str) -> str | None:
 def get_gmgn_holders(chain: str, address: str) -> dict | None:
     """GMGN CLI → {top10_pct, top10: [{rank, address_short, tag, pct}, ...]}"""
     import subprocess
+    cache_key = (chain, address)
+    cached = _gmgn_cache.get(cache_key)
+    if cached and time.time() - cached.get("holders_ts", 0) < _GMGN_CACHE_TTL and cached.get("holders"):
+        return cached.get("holders")
+    orig_chain = chain
     try:
         chain = _gmgn_chain(chain)
         if chain is None:
-            return None
+            raise ValueError("unsupported chain")
         npm_bin = os.environ.get("APPDATA", "") + r"\npm\gmgn-cli.cmd"
         if os.path.exists(npm_bin):
             npx_cmd = [npm_bin]
@@ -773,29 +804,141 @@ def get_gmgn_holders(chain: str, address: str) -> dict | None:
             err = (proc.stderr or "").strip()
             if "429" in err or "rate" in err.lower():
                 print(f"  [GMGN] holders限流: {address[:10]}...")
-            return None
+            raise RuntimeError("GMGN CLI failed")
         data = json.loads(proc.stdout)
         holders = data.get("list", [])
         if not holders:
-            return None
+            raise RuntimeError("GMGN returned empty holders")
+        top10 = holders[:10]
         top10_pct = sum(
-            h.get("amount_percentage", 0) * 100 for h in holders[:10]
+            h.get("amount_percentage", 0) * 100 for h in top10
             if h.get("amount_percentage")
         )
         top = []
-        for i, h in enumerate(holders[:10]):
+        total_profit = 0.0
+        total_cost = 0.0
+        in_profit = 0
+        for i, h in enumerate(top10):
             tag = h.get("wallet_tag_v2") or h.get("name") or ""
             pct = (h.get("amount_percentage") or 0) * 100
             addr_short = h.get("address", "")[:6] if h.get("address") else ""
-            top.append({"rank": i + 1, "address_short": addr_short, "tag": tag, "pct": pct})
-        return {"top10_pct": top10_pct, "top10": top}
+            cost = _safe_float(h.get("avg_cost"))
+            profit = _safe_float(h.get("total_profit") or h.get("profit")) or 0
+            realized = _safe_float(h.get("realized_profit")) or 0
+            unrealized = _safe_float(h.get("unrealized_profit")) or 0
+            bought = _safe_float(h.get("history_bought_cost")) or 0
+            sold = _safe_float(h.get("history_sold_income")) or 0
+            netflow = (bought or 0) - (sold or 0)
+            total_profit += profit
+            if cost:
+                total_cost += cost * (pct / 100 if top10_pct > 0 else 0)
+            if profit > 0:
+                in_profit += 1
+            top.append({
+                "rank": i + 1, "address_short": addr_short, "tag": tag, "pct": pct,
+                "cost": cost, "profit": profit,
+                "realized": realized, "unrealized": unrealized,
+                "bought": bought, "sold": sold, "netflow": netflow,
+            })
+        # 加权均价 = Σ(cost × pct/100) / Σ(pct/100)
+        weight_sum = top10_pct / 100 if top10_pct > 0 else 0
+        avg_cost = total_cost / weight_sum if total_cost > 0 and weight_sum > 0 else None
+        result = {
+            "top10_pct": top10_pct, "top10": top,
+            "top10_total_profit": total_profit,
+            "top10_in_profit": in_profit,
+            "top10_avg_cost": avg_cost,
+        }
+        entry = _gmgn_cache.get(cache_key, {})
+        entry["holders"], entry["holders_ts"] = result, time.time()
+        _gmgn_cache[cache_key] = entry
+        return result
     except Exception:
+        pass
+
+    # GMGN 失败，Ave.ai 兜底
+    print(f"  [GMGN] holders失败, Ave兜底: {address[:10]}...")
+    return get_ave_holders(orig_chain, address)
+
+
+def get_ave_holders(chain: str, address: str) -> dict | None:
+    """Ave.ai → 与 get_gmgn_holders 相同格式的持仓数据"""
+    cache_key = (chain, address)
+    cached = _gmgn_cache.get(cache_key)
+    if cached and time.time() - cached.get("holders_ts", 0) < _GMGN_CACHE_TTL and cached.get("holders"):
+        return cached.get("holders")
+    try:
+        mapped_chain = _gmgn_chain(chain)
+        if mapped_chain is None:
+            return None
+        api_key = os.environ.get("AVE_API_KEY", getattr(config, "AVE_API_KEY", ""))
+        if not api_key:
+            return None
+        url = f"https://prod.ave-api.com/v2/tokens/top100/{address}-{mapped_chain}?limit=10"
+        req = Request(url, headers={"X-API-KEY": api_key})
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") != 1:
+            return None
+        holders = data.get("data", [])
+        if not holders:
+            return None
+        top10 = holders[:10]
+        top10_pct = sum(
+            (h.get("balance_ratio") or 0) * 100 for h in top10
+        )
+        top = []
+        total_profit = 0.0
+        total_cost = 0.0
+        in_profit = 0
+        for i, h in enumerate(top10):
+            tag = h.get("new_tags") or ""
+            pct = (h.get("balance_ratio") or 0) * 100
+            holder_addr = h.get("holder") or h.get("address", "")
+            addr_short = holder_addr[:6] if holder_addr else ""
+            cost = _safe_float(h.get("avg_purchase_price"))
+            profit = _safe_float(h.get("total_profit")) or 0
+            realized = _safe_float(h.get("realized_profit")) or 0
+            unrealized = _safe_float(h.get("unrealized_profit")) or 0
+            bought = _safe_float(h.get("buy_volume_cur")) or 0
+            sold = _safe_float(h.get("sell_volume_cur")) or 0
+            netflow = (bought or 0) - (sold or 0)
+            total_profit += profit
+            if cost:
+                total_cost += cost * (pct / 100 if top10_pct > 0 else 0)
+            if profit > 0:
+                in_profit += 1
+            top.append({
+                "rank": i + 1, "address_short": addr_short, "tag": tag, "pct": pct,
+                "cost": cost, "profit": profit,
+                "realized": realized, "unrealized": unrealized,
+                "bought": bought, "sold": sold, "netflow": netflow,
+            })
+        weight_sum = top10_pct / 100 if top10_pct > 0 else 0
+        avg_cost = total_cost / weight_sum if total_cost > 0 and weight_sum > 0 else None
+        result = {
+            "top10_pct": top10_pct, "top10": top,
+            "top10_total_profit": total_profit,
+            "top10_in_profit": in_profit,
+            "top10_avg_cost": avg_cost,
+        }
+        entry = _gmgn_cache.get(cache_key, {})
+        entry["holders"], entry["holders_ts"] = result, time.time()
+        _gmgn_cache[cache_key] = entry
+        print(f"  [Ave] holders成功: {address[:10]}... ({len(top10)}个)")
+        return result
+    except Exception:
+        print(f"  [Ave] holders失败: {address[:10]}...")
         return None
 
 
 def get_gmgn_token_info(chain: str, address: str) -> dict | None:
     """GMGN token info → 聪明钱统计 + 持仓安全指标"""
     import subprocess
+    cache_key = (chain, address)
+    cached = _gmgn_cache.get(cache_key)
+    if cached and time.time() - cached.get("info_ts", 0) < _GMGN_CACHE_TTL and cached.get("info"):
+        return cached.get("info")
     try:
         chain = _gmgn_chain(chain)
         if chain is None:
@@ -822,7 +965,7 @@ def get_gmgn_token_info(chain: str, address: str) -> dict | None:
         data = json.loads(proc.stdout)
         wts = data.get("wallet_tags_stat", {})
         stat = data.get("stat", {})
-        return {
+        result = {
             "gmgn_smart_wallets": wts.get("smart_wallets", 0),
             "gmgn_whale_wallets": wts.get("whale_wallets", 0),
             "gmgn_renowned_wallets": wts.get("renowned_wallets", 0),
@@ -830,12 +973,15 @@ def get_gmgn_token_info(chain: str, address: str) -> dict | None:
             "gmgn_fresh_wallets": wts.get("fresh_wallets", 0),
             "gmgn_bundler_wallets": wts.get("bundler_wallets", 0),
             "gmgn_rat_trader_wallets": wts.get("rat_trader_wallets", 0),
-            # rate 字段 GMGN 返回小数（0.084=8.4%），统一乘 100 转为百分比
             "gmgn_top_10_holder_rate": _pct(stat.get("top_10_holder_rate")),
             "gmgn_dev_hold_rate": _pct(stat.get("dev_team_hold_rate")),
             "gmgn_sniper_hold_rate": _pct(stat.get("top70_sniper_hold_rate")),
             "gmgn_holder_count": stat.get("holder_count", 0),
         }
+        entry = _gmgn_cache.get(cache_key, {})
+        entry["info"], entry["info_ts"] = result, time.time()
+        _gmgn_cache[cache_key] = entry
+        return result
     except Exception:
         return None
 

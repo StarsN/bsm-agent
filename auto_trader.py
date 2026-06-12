@@ -40,8 +40,9 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 
-def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") -> dict:
+def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent", side: str = "LONG") -> dict:
     """执行 Agent 的开仓决策 —— 经过 risk.py 兜底检查"""
+    is_short = side == "SHORT"
     token = decision["token"]
 
     # 防重复
@@ -69,7 +70,7 @@ def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") 
             account.equity = live_balance
             account.available_balance = max(live_balance - locked, 0)
 
-    risk_decision = risk.check_account_risk(account, token)
+    risk_decision = risk.check_account_risk(account, token, side=side)
     if not risk_decision.allowed:
         return {"ok": False, "reason": f"风控拒绝: {risk_decision.reason}"}
 
@@ -86,18 +87,23 @@ def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") 
     from market import get_klines_1h
     klines = get_klines_1h(token, limit=30)
     stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
-    entry = price * (1 + config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
-    sl = entry * (1 + stop_pct / 100)
-
-    # 系统计算止盈
-    risk_per_unit = entry - sl
-    tp1 = entry + risk_per_unit * config.TRADING_TP1_R
-    tp2 = entry + risk_per_unit * config.TRADING_TP2_R
+    if is_short:
+        entry = price * (1 - config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
+        sl = entry * (1 - stop_pct / 100)
+        risk_per_unit = sl - entry
+        tp1 = entry - risk_per_unit * config.TRADING_TP1_R
+        tp2 = entry - risk_per_unit * config.TRADING_TP2_R
+    else:
+        entry = price * (1 + config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
+        sl = entry * (1 + stop_pct / 100)
+        risk_per_unit = entry - sl
+        tp1 = entry + risk_per_unit * config.TRADING_TP1_R
+        tp2 = entry + risk_per_unit * config.TRADING_TP2_R
 
     # 仓位 sizing
     tier = decision.get("tier", "full")
     leverage = float(settings.get("leverage") or config.TRADING_LEVERAGE)
-    sizing = risk.compute_position_size(account, entry, sl, leverage, tier)
+    sizing = risk.compute_position_size(account, entry, sl, leverage, tier, side=side)
 
     if sizing.get("quantity", 0) <= 0:
         return {"ok": False, "reason": f"仓位计算: {sizing.get('note')}"}
@@ -109,6 +115,8 @@ def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") 
     exchange_tp2_id = None
 
     if mode == "live":
+        if is_short:
+            return {"ok": False, "reason": "市价做空实盘暂未支持，请用限价单"}
         import exchange
         sym = f"{token}USDT"
         qty = round(sizing["quantity"], 6)
@@ -160,7 +168,7 @@ def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") 
     position = {
         "token": token,
         "symbol": f"{token}USDT",
-        "side": "LONG",
+        "side": side,
         "status": "OPEN",
         "mode": mode,
         "margin_amount": sizing["margin"],
@@ -173,10 +181,11 @@ def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") 
         "stop_loss_price": sl,
         "tp1_price": tp1,
         "tp2_price": tp2,
-        "highest_price": price,
+        "highest_price": None if is_short else price,
+        "lowest_price": price if is_short else None,
         "trailing_stop_price": None,
         "signal_snapshot": json.dumps({
-            "source": "agent",
+            "source": strategy,
             "agent_decision": decision,
             "risk_meta": {
                 "tier": tier,
@@ -191,7 +200,7 @@ def execute_open(conn, decision: dict, settings: dict, strategy: str = "agent") 
                 "tp2_order_id": exchange_tp2_id,
             },
         }, ensure_ascii=False),
-        "open_reason": f"Agent决策 tier={tier} | {decision.get('reason', '')}",
+        "open_reason": f"Agent决策 side={side} tier={tier} | {decision.get('reason', '')}",
         "advice": decision.get("reason", ""),
         "exchange_order_id": json.dumps({
             "open": exchange_order_id,
@@ -368,7 +377,7 @@ def one_scan():
             "LIMIT 5"
         ).fetchall()
 
-    source_map = {"agent_candidates": "agent", "token_heat_history": "heat_agent", "token_heat_history_lessons": "heat_agent_lessons", "nl_candidates": "agent_no_lessons", "kol_agent": "kol_agent", "kol_snapshot": "kol_snapshot"}
+    source_map = {"agent_candidates": "agent", "token_heat_history": "heat_agent", "token_heat_history_lessons": "heat_agent_lessons", "nl_candidates": "agent_no_lessons", "kol_agent": "kol_agent", "kol_snapshot": "kol_snapshot", "agent_candidates_short": "agent_short"}
     executed = 0
     for dec in pending:
         dec = dict(dec)
@@ -386,7 +395,7 @@ def one_scan():
                 elif dec["action"] == "open_long":
                     result = execute_open(conn, dec, settings, strategy)
                 elif dec["action"] == "open_short":
-                    result = {"ok": False, "reason": "做空仅支持限价单（需要 entry_price），市价做空未实现"}
+                    result = execute_open(conn, dec, settings, strategy, side="SHORT")
                 elif dec["action"] == "close":
                     result = execute_close(conn, dec)
                 else:

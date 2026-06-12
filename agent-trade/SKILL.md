@@ -101,6 +101,8 @@ python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/extract_market_data.
 python3 /root/binance-monitor/bsm-agent/agent-trade/scripts/write_decisions.py --decisions /tmp/agent_decisions.json --source agent_candidates
 ```
 
+> ⚠️ **DB 锁冲突**：worker 进程（`market_realtime.py`）运行时持有 `binance_square.db` 写锁，`write_decisions.py` 可能报 `sqlite3.OperationalError: database is locked`。这不是 bug——worker 每轮 scrape 完成后释放锁。遇到此错误时按递增间隔重试：首次 `sleep 10 &&` 重试，仍失败则 `sleep 20 &&`，再失败 `sleep 30 &&`。实测 `sleep 10` 不够时 `sleep 20` 通常可解。不要连续快速重试（会持续撞锁），也不要放弃（锁是暂时的）。
+
 验证输出中的 `status=`：`pending` 表示通过，`rejected` 表示被拒需修正。
 
 如果没有值得开仓的机会，空决策。不做比做错强。

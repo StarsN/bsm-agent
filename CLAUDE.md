@@ -26,7 +26,7 @@ Deployment path: `/root/binance-monitor/bsm-agent/` on a Linux server with Japan
 
 ## Critical files
 
-- `web.py` — FastAPI server (~3000 lines, includes inline HTML/CSS/JS for three pages: `/`, `/agent`, `/settings`). Settings page uses `trading_settings` DB table. Collector thread starts at module load.
+- `web.py` — FastAPI server (~5000 lines, includes inline HTML/CSS/JS for ~10 pages). Settings page uses `trading_settings` DB table. Collector thread starts at module load.
 - `worker.py` — Scraping main loop. After 300s scrape, bulk-inserts posts, computes heat, refreshes market snapshots. May trigger Agent in `token_heat_history` mode.
 - `storage.py` — All SQLite DDL and CRUD. `trading_settings` is key-value with `allowed` whitelist for writes.
 - `trade_logic.py` — Position lifecycle: `evaluate_candidate()`, `open_paper_position()`, `update_paper_positions()`, `_build_close_snap()`. Close snapshots use Chinese flat format matching open dimension_data.
@@ -72,4 +72,12 @@ The trading SKILL's decision JSON must use envelope format `{"market_read": "...
 
 - `/` — Market monitoring (worker status, heat leaderboard, trading positions, watchlist)
 - `/agent` — Agent panel (account, timeline, lessons)
-- `/settings` — Trading parameters, Agent data source, save/reset/restart buttons
+- `/agent-heat` — Heat Agent panel
+- `/agent-heat-lessons` — Heat Agent with lessons panel
+- `/agent-nl` — No-lessons Agent panel
+- `/agent-kol` — KOL Agent monitor
+- `/agent-kol-snapshot` — KOL cognitive snapshot monitor
+- `/agent-short` — Short Agent panel
+- `/strategies` — Multi-strategy overview
+- `/dashboard` — Market panorama dashboard
+- `/settings` — Trading parameters, Agent switches, intervals

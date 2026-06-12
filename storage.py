@@ -661,12 +661,29 @@ CREATE TABLE IF NOT EXISTS nl_candidates (
 CREATE INDEX IF NOT EXISTS idx_nl_candidates_token ON nl_candidates(token);
 """
 
+_AGENT_SHORT_DDL = """\
+CREATE TABLE IF NOT EXISTS agent_short_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number    INTEGER NOT NULL,
+    token           TEXT    NOT NULL,
+    data            TEXT,
+    tier            TEXT,
+    passed          INTEGER DEFAULT 0,
+    hard_blocks     TEXT,
+    pass_count      INTEGER DEFAULT 0,
+    signal_key      TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_agent_short_candidates_token ON agent_short_candidates(token);
+"""
+
 
 def init_agent_dbs():
     _init_one_agent_db(config.AGENT_MAIN_DB, _AGENT_MAIN_DDL)
     _init_one_agent_db(config.KOL_DB, _KOL_DDL)
     _init_one_agent_db(config.SNAPSHOT_DB, _KOL_DDL)
     _init_one_agent_db(config.NL_DB, _NL_DDL)
+    _init_one_agent_db(config.AGENT_SHORT_DB, _AGENT_SHORT_DDL)
 
 
 def upsert_author(conn, author: dict):
@@ -943,6 +960,55 @@ def agent_candidates_purge_old(conn, keep_last_rounds: int = 20):
     """, (keep_last_rounds,))
 
 
+# === Agent 做空版候选币池 ===
+
+def agent_short_candidates_insert_batch(conn, round_number: int, items: list[dict]):
+    import time as _t
+    for item in items:
+        for attempt in range(5):
+            try:
+                conn.execute("""
+                    INSERT INTO agent_short_candidates
+                        (round_number, token, data, tier, passed, hard_blocks, pass_count, signal_key)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (
+                    round_number, item["token"], item["data"], item.get("tier"),
+                    item.get("passed", 0), item.get("hard_blocks", "[]"),
+                    item.get("pass_count", 0), item.get("signal_key"),
+                ))
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < 4:
+                    _t.sleep(1 + attempt * 0.5)
+                else:
+                    raise
+
+
+def agent_short_candidates_get_latest(conn, rounds: int = 2) -> list[dict]:
+    cur = conn.execute("""
+        SELECT a.* FROM agent_short_candidates a
+        INNER JOIN (
+            SELECT token, MAX(id) AS max_id
+            FROM agent_short_candidates
+            WHERE round_number > (
+                SELECT COALESCE(MAX(round_number), 0) - ? FROM agent_short_candidates
+            )
+            GROUP BY token
+        ) b ON a.id = b.max_id
+        ORDER BY a.id
+    """, (rounds - 1,))
+    return [dict(r) for r in cur.fetchall()]
+
+
+def agent_short_candidates_purge_old(conn, keep_last_rounds: int = 20):
+    conn.execute("""
+        DELETE FROM agent_short_candidates
+        WHERE round_number <= (
+            SELECT COALESCE(MAX(round_number), 0) - ? FROM agent_short_candidates
+        )
+    """, (keep_last_rounds,))
+
+
 # === 收藏锚定 ===
 
 def entry_get(conn, token: str) -> dict | None:
@@ -1104,9 +1170,12 @@ def trading_settings_defaults() -> dict:
         "kol_snapshot_llm_provider": getattr(config, "KOL_SNAPSHOT_LLM_PROVIDER", "nvidia"),
         "nl_agent_enabled": getattr(config, "NL_AGENT_ENABLED", True),
         "heat_agent_lessons_enabled": getattr(config, "HEAT_AGENT_LESSONS_ENABLED", True),
+        "agent_short_enabled": getattr(config, "AGENT_SHORT_ENABLED", True),
         "trading_daily_limit_enabled": getattr(config, "TRADING_DAILY_LIMIT_ENABLED", True),
         "limit_order_timeout_seconds": getattr(config, "LIMIT_ORDER_TIMEOUT_SECONDS", 600),
         "system_auto_trade_enabled": getattr(config, "SYSTEM_AUTO_TRADE_ENABLED", True),
+        "strategy_initial_agent_short": getattr(config, "STRATEGY_INITIAL_AGENT_SHORT", 1000),
+        "agent_short_interval_minutes": getattr(config, "AGENT_SHORT_INTERVAL_MINUTES", 16),
     }
 
 
@@ -1115,7 +1184,7 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
         elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence"}:
             try:
@@ -1132,7 +1201,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -1393,6 +1462,8 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
         candidates_deleted += ac.execute("DELETE FROM agent_candidates").rowcount or 0
     with get_conn(config.NL_DB) as ac:
         candidates_deleted += ac.execute("DELETE FROM nl_candidates").rowcount or 0
+    with get_conn(config.AGENT_SHORT_DB) as ac:
+        candidates_deleted += ac.execute("DELETE FROM agent_short_candidates").rowcount or 0
     with get_conn(config.KOL_DB) as ac:
         candidates_deleted += ac.execute("DELETE FROM kol_candidates").rowcount or 0
         ac.execute("DELETE FROM kol_analyses")
@@ -1443,6 +1514,7 @@ def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None 
         "agent_no_lessons": "nl_candidates",
         "kol_agent": "kol_agent",
         "kol_snapshot": "kol_snapshot",
+        "agent_short": "agent_candidates_short",
     }
 
     # 更新策略初始金额
@@ -1476,6 +1548,9 @@ def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None 
     elif strategy == "agent_no_lessons":
         with get_conn(config.NL_DB) as ac:
             cand_del = ac.execute("DELETE FROM nl_candidates").rowcount or 0
+    elif strategy == "agent_short":
+        with get_conn(config.AGENT_SHORT_DB) as ac:
+            cand_del = ac.execute("DELETE FROM agent_short_candidates").rowcount or 0
     elif strategy == "kol_agent":
         with get_conn(config.KOL_DB) as ac:
             cand_del = ac.execute("DELETE FROM kol_candidates").rowcount or 0
