@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 import config
 import storage
 import risk
-from analyzer import compute_short_scores, compute_composite_scores
+from analyzer import compute_short_scores, compute_composite_scores, get_current_heat_scores
 from market import get_mark_price, get_klines_1h, get_market_snapshot
 from signals import analyze as analyze_signals
 
@@ -280,7 +280,7 @@ def build_trade_candidates_from_leaderboard(
 
 
 def build_trade_candidates(conn, limit: int = 20, passed_only: bool = False) -> list[dict]:
-    raw_scores = compute_short_scores(conn)
+    raw_scores = get_current_heat_scores(conn)
     scores = compute_composite_scores(conn, raw_scores, config.COMPOSITE_HISTORY_WINDOW)
     signal_key = storage.leaderboard_signal_key(conn)
     sortable = []

@@ -219,3 +219,54 @@ def heat_history_recent_for_token(conn, token: str, limit: int = 20) -> list[dic
         LIMIT ?
     """, (token, limit))
     return [dict(r) for r in cur.fetchall()]
+
+
+# ============================================================
+# 统一热度入口：根据数据源路由到币安或 OKX
+# ============================================================
+
+def get_current_heat_scores(conn) -> list[dict]:
+    """统一入口：根据 trading_settings 的 okx_data_source_enabled 返回当轮热度榜
+    格式与 compute_short_scores 完全一致，下游无感
+    """
+    row = conn.execute(
+        "SELECT data_source FROM worker_status WHERE key='worker'"
+    ).fetchone()
+    okx_enabled = (row and row[0] == "okx")
+    if okx_enabled:
+        return _load_scores_from_heat_history(conn)
+    return compute_short_scores(conn)
+
+
+def _load_scores_from_heat_history(conn) -> list[dict]:
+    """OKX 模式：从 token_heat_history 最新轮读取热度榜
+    返回格式与 compute_short_scores 一致
+    """
+    latest = conn.execute(
+        "SELECT COALESCE(MAX(round_number), 0) FROM token_heat_history"
+    ).fetchone()[0]
+    if latest == 0:
+        return []
+    rows = conn.execute("""
+        SELECT token, score, mentions, unique_posts,
+               total_likes, total_comments, total_shares
+        FROM token_heat_history
+        WHERE round_number = ?
+        ORDER BY score DESC
+    """, (latest,)).fetchall()
+    return [
+        {
+            "token": r["token"],
+            "score": r["score"],
+            "mentions": r["mentions"],
+            "unique_posts": r["unique_posts"],
+            "total_likes": r["total_likes"],
+            "total_comments": r["total_comments"],
+            "total_shares": r["total_shares"],
+            "unique_authors": 0,
+            "raw_score": r["score"],
+            "author_capped_posts": 0,
+            "similar_posts": 0,
+        }
+        for r in rows
+    ]

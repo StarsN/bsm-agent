@@ -19,7 +19,7 @@ import uvicorn
 import config
 import storage
 import trade_logic
-from analyzer import compute_short_scores, compute_composite_scores
+from analyzer import compute_composite_scores, get_current_heat_scores
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
 from signals import analyze as analyze_signals
 import kol_agent
@@ -628,6 +628,7 @@ class TradingSettingsBody(BaseModel):
     strategy_initial_kol_snapshot: float | None = None
     kol_snapshot_min_confidence: int | None = None
     kol_snapshot_llm_provider: str | None = None
+    okx_data_source_enabled: bool | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -672,7 +673,7 @@ def _refresh_watchlist_tokens(tokens: list[str]) -> dict:
         return {"refreshed": 0, "skipped_no_contract": 0, "tokens": []}
 
     with storage.get_conn() as conn:
-        short_scores = compute_short_scores(conn)
+        short_scores = get_current_heat_scores(conn)
         social_map = {s["token"]: s["score"] for s in short_scores}
 
     futures_set = get_futures_symbols()
@@ -736,7 +737,7 @@ def _verdict_rank(verdict: str) -> int:
 
 
 def _build_leaderboard_items(conn) -> tuple[list[dict], int]:
-    raw_scores = compute_short_scores(conn)
+    raw_scores = get_current_heat_scores(conn)
     # 综合热度增强：加 composite_score, trend, prev_score 等
     scored = compute_composite_scores(conn, raw_scores, config.COMPOSITE_HISTORY_WINDOW)
 
@@ -842,7 +843,7 @@ def api_watchlist():
         _refresh_watchlist_tokens(stale_tokens)
 
     with storage.get_conn() as conn:
-        scores = compute_short_scores(conn)
+        scores = get_current_heat_scores(conn)
         score_map = {s["token"]: s for s in scores}
 
         items = []
@@ -946,7 +947,7 @@ def api_watchlist_refresh():
     """
     with storage.get_conn() as conn:
         tokens = storage.watchlist_get_all(conn)
-        short_scores = compute_short_scores(conn)
+        short_scores = get_current_heat_scores(conn)
         social_map = {s["token"]: s["score"] for s in short_scores}
 
     if not tokens:
@@ -1130,13 +1131,13 @@ def api_limit_order_cancel(order_id: int):
 
 @app.post("/api/system/restart")
 def api_system_restart():
-    """重启所有进程（kill -9 + 等 60s + start）"""
+    """重启所有进程（kill -9 + 等 10min + start）"""
     manage = Path(__file__).resolve().parent / "manage_processes.py"
     subprocess.Popen(
         [sys.executable, str(manage), "restart", "--no-browser"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    return {"ok": True, "msg": "系统将在 3 分钟后自动重启"}
+    return {"ok": True, "msg": "系统将在 11 分钟后自动重启"}
 
 
 # === Agent 监控 API ===
@@ -2475,7 +2476,7 @@ function toggleDataSourceOpts() {
 }
 
 async function restartSystem() {
-  if (!confirm('确定要重启系统吗？\\n\\n所有进程将被强制终止（kill -9），等待 3 分钟后自动重启。\\n\\n重启期间约 4 分钟不可用。')) return;
+  if (!confirm('确定要重启系统吗？\\n\\n所有进程将被强制终止（kill -9），等待 11 分钟后自动重启。\\n\\n重启期间约 12 分钟不可用。')) return;
   try {
     showToast('正在重启系统...', 'ok');
     const resp = await fetch('/api/system/restart', {method:'POST'});
@@ -2598,12 +2599,13 @@ function renderWorkerPanel(s) {
   const stageLabels = {
     scraping: '抓取中', saving: '入库中', market: '查询合约',
     idle: '空闲（准备下一轮）', unknown: '未知',
+    okx_fetch: '获取OKX数据', resting: '轮间休息',
   };
   stageEl.textContent = stageLabels[stage] || stage;
 
   detailEl.textContent = s.detail || '—';
 
-  // 进度条：抓取阶段按 round_start 算，其他阶段满格
+  // 进度条：OKX 模式无抓取阶段，始终满格；币安模式抓取阶段按时间算
   let pct = 100;
   if (stage === 'scraping' && s.round_start && s.round_duration_seconds) {
     try {
@@ -2611,10 +2613,6 @@ function renderWorkerPanel(s) {
       const elapsed = (Date.now() - startMs) / 1000;
       pct = Math.min(100, (elapsed / s.round_duration_seconds) * 100);
     } catch (e) { pct = 50; }
-  } else if (stage === 'idle') {
-    pct = 100;
-  } else if (stage === 'saving') {
-    pct = 100;
   }
   fillEl.style.width = pct.toFixed(0) + '%';
 
@@ -2628,14 +2626,21 @@ function renderWorkerPanel(s) {
 
   // 统计
   const stats = [];
-  if (s.posts_this_round !== undefined)
-    stats.push(`<span>本轮抓到 <strong>${s.posts_this_round}</strong> 条</span>`);
-  if (s.saved_this_round !== undefined)
-    stats.push(`<span>入库 <strong>${s.saved_this_round}</strong> 条</span>`);
-  if (s.total_posts !== undefined)
-    stats.push(`<span>累计帖子 <strong>${s.total_posts}</strong></span>`);
-  if (s.total_authors !== undefined)
-    stats.push(`<span>累计作者 <strong>${s.total_authors}</strong></span>`);
+  if (s.data_source === 'okx') {
+    if (s.okx_tokens_count !== undefined && s.okx_tokens_count > 0)
+      stats.push(`<span>OKX 数据源 · <strong>${s.okx_tokens_count}</strong> 个代币</span>`);
+    if (s.okx_last_round)
+      stats.push(`<span>Pipeline 轮次: <strong>${s.okx_last_round}</strong></span>`);
+  } else {
+    if (s.posts_this_round !== undefined)
+      stats.push(`<span>本轮抓到 <strong>${s.posts_this_round}</strong> 条</span>`);
+    if (s.saved_this_round !== undefined)
+      stats.push(`<span>入库 <strong>${s.saved_this_round}</strong> 条</span>`);
+    if (s.total_posts !== undefined)
+      stats.push(`<span>累计帖子 <strong>${s.total_posts}</strong></span>`);
+    if (s.total_authors !== undefined)
+      stats.push(`<span>累计作者 <strong>${s.total_authors}</strong></span>`);
+  }
   statsEl.innerHTML = stats.join('');
 }
 
@@ -3569,6 +3574,20 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 </div>
 
 <div class="panel">
+  <h2>数据源</h2>
+  <div class="grid3">
+    <div>
+      <label>数据来源</label>
+      <select id="trade-data-source">
+        <option value="false">币安广场</option>
+        <option value="true">OKX</option>
+      </select>
+    </div>
+  </div>
+  <div style="color:var(--muted);font-size:11px;margin-top:4px">切换数据源后需重启系统生效</div>
+</div>
+
+<div class="panel">
   <h2>策略配置</h2>
 
   <div class="strategy-block">
@@ -3805,7 +3824,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   <div style="color:var(--muted);font-size:11px;margin-top:12px;text-align:center;line-height:1.5">
     策略重置：只清该策略的持仓/决策/候选池，保留教训和日志<br>
     全部重置：清除所有策略数据<br>
-    重启系统：强制终止所有进程，等 3 分钟后自动重启
+    重启系统：强制终止所有进程，等 11 分钟后自动重启
   </div>
 </div>
 
@@ -3855,6 +3874,8 @@ async function loadSettings() {
     document.getElementById('trade-kol-cooldown').value = s.kol_token_cooldown_minutes ?? 30;
     document.getElementById('trade-daily-limit-switch').value = s.trading_daily_limit_enabled ?? true;
     document.getElementById('trade-system-auto-switch').value = s.system_auto_trade_enabled ?? true;
+    document.getElementById('trade-data-source').value = s.okx_data_source_enabled ?? false;
+    document.getElementById('trade-data-source').setAttribute('data-original', (s.okx_data_source_enabled ?? false) ? 'true' : 'false');
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
@@ -3901,11 +3922,25 @@ async function saveTradingSettings() {
     kol_token_cooldown_minutes: parseInt(document.getElementById('trade-kol-cooldown').value) || 30,
     trading_daily_limit_enabled: document.getElementById('trade-daily-limit-switch').value === 'true',
     system_auto_trade_enabled: document.getElementById('trade-system-auto-switch').value === 'true',
+    okx_data_source_enabled: document.getElementById('trade-data-source').value === 'true',
   };
+  const oldSource = document.getElementById('trade-data-source').getAttribute('data-original') || '';
+  const newSource = body.okx_data_source_enabled ? 'true' : 'false';
   try {
     const resp = await fetch('/api/trading/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     if (!resp.ok) { const err = await resp.text(); throw new Error(err); }
     showToast('设置已保存', 'ok');
+    // 数据源变了 → 提示重启
+    if (oldSource && newSource !== oldSource) {
+      if (confirm('数据源已切换，需要重启系统生效。是否立即重启？')) {
+        await fetch('/api/system/restart', {method:'POST'});
+        showToast('系统重启中，约 11 分钟后恢复...', 'ok', 5000);
+      } else {
+        showToast('设置已保存，手动重启后生效', 'ok');
+      }
+    }
+    // 更新标记，下次保存用新值对比
+    document.getElementById('trade-data-source').setAttribute('data-original', newSource);
   } catch(e) { showToast('保存失败：'+e.message, 'err'); }
 }
 async function resetStrategyAccount() {

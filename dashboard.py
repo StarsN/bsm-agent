@@ -3,6 +3,7 @@
 全部使用 OKX CLI，零币安调用
 """
 from __future__ import annotations
+import os
 
 import json
 import os
@@ -19,8 +20,12 @@ def _okx(args: list[str], live: bool = False) -> dict | list | None:
     if live:
         cmd += ["--profile", "live"]
     cmd += args + ["--json"]
+    # 去掉 OnchainOS 的环境变量，防止 OKX CLI 误用导致 401
+    env = os.environ.copy()
+    for k in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"):
+        env.pop(k, None)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env)
         if r.returncode != 0:
             return None
         out = r.stdout.strip()

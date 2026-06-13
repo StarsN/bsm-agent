@@ -67,7 +67,10 @@ CREATE TABLE IF NOT EXISTS worker_status (
     posts_this_round      INTEGER DEFAULT 0,
     saved_this_round      INTEGER DEFAULT 0,
     total_posts           INTEGER DEFAULT 0,
-    total_authors         INTEGER DEFAULT 0
+    total_authors         INTEGER DEFAULT 0,
+    data_source           TEXT,           -- "binance" / "okx"
+    okx_tokens_count      INTEGER DEFAULT 0,
+    okx_last_round        INTEGER
 );
 
 -- 代币热度历史：每轮给每个上榜代币记一条
@@ -549,6 +552,12 @@ def _migrate(conn):
     conn.execute("DELETE FROM round_candidates")
     # token_heat_history round_number 索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_heat_round ON token_heat_history(round_number)")
+    # worker_status OKX 数据源列
+    ws_cols = [r[1] for r in conn.execute("PRAGMA table_info(worker_status)").fetchall()]
+    for col, typ in [("data_source", "TEXT"), ("okx_tokens_count", "INTEGER"),
+                     ("okx_last_round", "INTEGER")]:
+        if col not in ws_cols:
+            conn.execute(f"ALTER TABLE worker_status ADD COLUMN {col} {typ}")
 
 
 def init_db():
@@ -1172,6 +1181,7 @@ def trading_settings_defaults() -> dict:
         "heat_agent_lessons_enabled": getattr(config, "HEAT_AGENT_LESSONS_ENABLED", True),
         "agent_short_enabled": getattr(config, "AGENT_SHORT_ENABLED", True),
         "trading_daily_limit_enabled": getattr(config, "TRADING_DAILY_LIMIT_ENABLED", True),
+        "okx_data_source_enabled": getattr(config, "OKX_DATA_SOURCE_ENABLED", False),
         "limit_order_timeout_seconds": getattr(config, "LIMIT_ORDER_TIMEOUT_SECONDS", 600),
         "system_auto_trade_enabled": getattr(config, "SYSTEM_AUTO_TRADE_ENABLED", True),
         "strategy_initial_agent_short": getattr(config, "STRATEGY_INITIAL_AGENT_SHORT", 1000),
@@ -1184,7 +1194,7 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
         elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence"}:
             try:
@@ -1201,7 +1211,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled"}
     rows = []
     for key, value in fields.items():
         if key in allowed:

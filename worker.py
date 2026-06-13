@@ -21,11 +21,14 @@ from rich.console import Console
 import config
 import storage
 from scraper import SquareScraper
-from analyzer import extract_tokens_from_text, compute_short_scores
+from analyzer import extract_tokens_from_text, compute_short_scores, get_current_heat_scores
 from filters import is_likely_human, post_passes_quality
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
 from signals import analyze as analyze_signals
 
+# 数据源模式：main() 启动时写入，one_round() 和前端通过 worker_status 读取
+# 切换后必须重启才生效，避免运行中状态不一致
+_OKX_MODE = False
 
 console = Console()
 _running = True
@@ -69,7 +72,7 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
 
     # Step 1：一次性读好需要的基础数据（短事务）
     with storage.get_conn() as conn:
-        short_scores = compute_short_scores(conn)
+        short_scores = get_current_heat_scores(conn)
         social_map = {s["token"]: s["score"] for s in short_scores}
 
     # Step 2：批量拉 OKX 衍生数据（市值 + 聪明钱，一次调用覆盖所有候选币）
@@ -166,8 +169,138 @@ def _write_status(**fields):
 _ROUND_NUMBER = 0
 
 
-async def one_round(scraper: SquareScraper):
-    """一轮：持续抓取 + 存库 + 刷新榜单和观察列表的合约数据"""
+async def _one_round_okx():
+    """OKX 数据源模式：跳过币安抓取，直接跑 OKX pipeline + Binance 快照"""
+    global _ROUND_NUMBER
+    _ROUND_NUMBER += 1
+    round_start = time.time()
+    pipeline_interval = getattr(config, "OKX_PIPELINE_INTERVAL_ROUNDS", 3)
+    do_pipeline = (_ROUND_NUMBER == 1) or (_ROUND_NUMBER % pipeline_interval == 0)
+
+    console.print(f"[blue]=> OKX 轮 #{_ROUND_NUMBER}... {datetime.now():%H:%M:%S}"
+                  + (" [Pipeline]" if do_pipeline else " [仅快照]") + f"[/blue]")
+
+    # ---------- Step 1: OKX pipeline (每 N 轮一次) ----------
+    okx_count = 0
+    if do_pipeline:
+        _write_status(
+            stage="okx_fetch", data_source="okx",
+            detail="获取 OKX 数据: 成交量 Top50 + 社交情绪...",
+            round_start=datetime.now().isoformat(timespec="seconds"),
+            round_number=_ROUND_NUMBER,
+        )
+        try:
+            import okx_source
+            scores = okx_source.fetch_okx_heat_scores()
+            if scores:
+                with storage.get_conn() as conn:
+                    storage.heat_history_add(conn, _ROUND_NUMBER, scores)
+                okx_count = len(scores)
+                console.print(f"   OKX 热度榜: {okx_count} 个代币")
+                for i, s in enumerate(scores[:10], 1):
+                    console.print(f"     {i}. {s['token']}  热度={s['score']:.1f}"
+                                  f"  提及={s['mentions']}")
+        except Exception as e:
+            console.print(f"[red]   OKX pipeline 失败: {e}[/red]")
+            import traceback; traceback.print_exc()
+
+    # ---------- Step 2: 读 token_heat_history 最新轮 + 维护 ----------
+    with storage.get_conn() as conn:
+        watchlist = storage.watchlist_get_all(conn)
+        latest = conn.execute(
+            "SELECT COALESCE(MAX(round_number), 0) FROM token_heat_history"
+        ).fetchone()[0]
+        top_tokens = []
+        if latest > 0:
+            rows = conn.execute(
+                "SELECT token FROM token_heat_history "
+                "WHERE round_number = ? ORDER BY score DESC LIMIT ?",
+                (latest, getattr(config, "MARKET_ANALYSIS_MAX", 30)),
+            ).fetchall()
+            top_tokens = [r["token"] for r in rows]
+
+        if _ROUND_NUMBER % 50 == 0:
+            storage.watchlist_followups_purge_old(conn, days=3)
+        if _ROUND_NUMBER % 100 == 0:
+            storage.heat_history_purge_old(conn, keep_last_rounds=200)
+
+    console.print(f"   榜单 {len(top_tokens)} + 观察 {len(watchlist)} = "
+                  f"{len(set(top_tokens) | set(watchlist))} 去重")
+
+    # ---------- Step 3: 合约快照 (Binance API, 不变) ----------
+    if config.ENABLE_MARKET_ANALYSIS:
+        combined = list(dict.fromkeys(top_tokens + watchlist))
+        _write_status(
+            stage="market", data_source="okx",
+            detail=f"查询合约数据（{len(combined)} 代币）",
+            okx_tokens_count=okx_count,
+            okx_last_round=_ROUND_NUMBER if do_pipeline else None,
+        )
+        console.print(f"[blue]=> 刷新合约数据（{len(combined)} 去重）...[/blue]")
+        heavy = (_ROUND_NUMBER % config.MARKET_HEAVY_INTERVAL_ROUNDS == 0
+                 or _ROUND_NUMBER == 1)
+        updated = refresh_market_snapshots(combined, watchlist=watchlist,
+                                           heavy=heavy)
+        console.print(f"   已更新 {updated} 个代币的快照"
+                      + (" (全量)" if heavy else " (轻量)"))
+
+    # ---------- Step 4: Agent 触发 (不变) ----------
+    trigger_interval = getattr(config, "HEAT_AGENT_TRIGGER_INTERVAL", 3)
+    ts_heat = {}
+    try:
+        with storage.get_conn() as conn:
+            ts_heat = storage.trading_settings_get(conn)
+        trigger_interval = int(ts_heat.get("agent_trigger_interval", trigger_interval))
+    except Exception:
+        pass
+    if _ROUND_NUMBER % trigger_interval == 0:
+        try:
+            import subprocess
+            heat_enabled = ts_heat.get("heat_agent_enabled", True)
+            heat_job_id = getattr(config, "HEAT_AGENT_HERMES_JOB_ID", "")
+            if heat_enabled and heat_job_id:
+                subprocess.run(
+                    ["hermes", "cron", "run", heat_job_id],
+                    timeout=10, capture_output=True, text=True,
+                )
+                console.print(f"[dim]已触发热度 Agent (round {_ROUND_NUMBER})[/dim]")
+        except Exception as e:
+            console.print(f"[dim]热度 Agent 触发失败: {e}[/dim]")
+
+    lessons_trigger = int(ts_heat.get("heat_agent_lessons_trigger_interval",
+                          getattr(config, "HEAT_AGENT_LESSONS_TRIGGER_INTERVAL", 3)))
+    if (_ROUND_NUMBER + 1) % lessons_trigger == 0:
+        try:
+            import subprocess
+            lessons_enabled = ts_heat.get("heat_agent_lessons_enabled", True)
+            lessons_job_id = getattr(config, "HEAT_AGENT_LESSONS_HERMES_JOB_ID", "")
+            if lessons_enabled and lessons_job_id:
+                subprocess.run(
+                    ["hermes", "cron", "run", lessons_job_id],
+                    timeout=10, capture_output=True, text=True,
+                )
+                console.print(f"[dim]已触发热度有教训 Agent (round {_ROUND_NUMBER})[/dim]")
+        except Exception as e:
+            console.print(f"[dim]热度有教训 Agent 触发失败: {e}[/dim]")
+
+    # ---------- Step 5: 收尾 ----------
+    elapsed = time.time() - round_start
+    console.print(f"[green]OKX 轮 #{_ROUND_NUMBER} 耗时 {elapsed:.0f}s[/green]\n")
+    _write_status(
+        stage="idle", data_source="okx",
+        detail=f"OKX 轮完成（{okx_count} 代币 · {elapsed:.0f}s）",
+        okx_tokens_count=okx_count,
+        okx_last_round=_ROUND_NUMBER if do_pipeline else None,
+    )
+
+
+async def one_round(scraper: SquareScraper = None):
+    """一轮：持续抓取 + 存库 + 刷新榜单和观察列表的合约数据
+    OKX 模式下 scraper 为 None，跳过抓取环节
+    """
+    if _OKX_MODE:
+        return await _one_round_okx()
+
     global _ROUND_NUMBER
     _ROUND_NUMBER += 1
     round_start = time.time()
@@ -307,7 +440,7 @@ async def one_round(scraper: SquareScraper):
     # 事务 5：算热度榜 + 写历史（读多写少）
     # ============================================================
     with storage.get_conn() as conn:
-        short_scores = compute_short_scores(conn)
+        short_scores = get_current_heat_scores(conn)
         if short_scores:
             storage.heat_history_add(conn, _ROUND_NUMBER, short_scores)
 
@@ -412,21 +545,37 @@ def _resume_round_number():
 
 
 async def main():
+    global _OKX_MODE
     storage.init_db()
-    scraper = SquareScraper()
     _resume_round_number()
+    with storage.get_conn() as conn:
+        ts = storage.trading_settings_get(conn)
+    _OKX_MODE = ts.get("okx_data_source_enabled", False)
+    # 写入 worker_status，前端和 analyzer 通过此表读取数据源
+    with storage.get_conn() as conn:
+        storage.status_update(conn, data_source="okx" if _OKX_MODE else "binance")
 
-    console.print("[green]=== 币安广场监控 Worker 启动 ===[/green]")
-    console.print(f"   续上次轮次：从第 {_ROUND_NUMBER + 1} 轮开始")
-    console.print(f"   每轮持续抓取：{config.SCRAPE_ROUND_SECONDS}s")
-    console.print(f"   15 分钟榜单窗口：{config.SHORT_WINDOW_MINUTES} 分钟")
-    console.print(f"   粉丝阈值：{config.MIN_FOLLOWERS}")
-    console.print(f"   Web 仪表盘：请另开一个终端运行 python web.py")
+    if _OKX_MODE:
+        scraper = None
+        round_timeout = 180  # OKX 轮无抓取，2 分钟足够
+        console.print("[green]=== OKX 数据源 Worker 启动 ===[/green]")
+        console.print(f"   续上次轮次：从第 {_ROUND_NUMBER + 1} 轮开始")
+        console.print(f"   Pipeline 间隔: 每 {getattr(config, 'OKX_PIPELINE_INTERVAL_ROUNDS', 3)} 轮")
+        console.print(f"   快照: Binance API (不变)")
+        console.print(f"   Web 仪表盘：请另开一个终端运行 python web.py")
+    else:
+        scraper = SquareScraper()
+        round_timeout = config.SCRAPE_ROUND_SECONDS + 120
+        console.print("[green]=== 币安广场监控 Worker 启动 ===[/green]")
+        console.print(f"   续上次轮次：从第 {_ROUND_NUMBER + 1} 轮开始")
+        console.print(f"   每轮持续抓取：{config.SCRAPE_ROUND_SECONDS}s")
+        console.print(f"   15 分钟榜单窗口：{config.SHORT_WINDOW_MINUTES} 分钟")
+        console.print(f"   粉丝阈值：{config.MIN_FOLLOWERS}")
+        console.print(f"   Web 仪表盘：请另开一个终端运行 python web.py")
     console.print()
 
     while _running:
         try:
-            round_timeout = config.SCRAPE_ROUND_SECONDS + 120
             await asyncio.wait_for(one_round(scraper), timeout=round_timeout)
         except asyncio.TimeoutError:
             console.print(f"[red]本轮超时（>{round_timeout}s），跳过[/red]")
@@ -434,20 +583,20 @@ async def main():
             console.print(f"[red]本轮出错：{e}[/red]")
             import traceback
             traceback.print_exc()
-            # 出错等 30 秒再试
             for _ in range(30):
                 if not _running:
                     break
                 await asyncio.sleep(1)
 
-        # 每轮结束后清理 Chromium 僵尸进程，防止内存累积
-        try:
-            os.system("pkill -f chromium 2>/dev/null")
-        except Exception:
-            pass
+        # Chromium 清理（仅币安模式）
+        if not _OKX_MODE:
+            try:
+                os.system("pkill -f chromium 2>/dev/null")
+            except Exception:
+                pass
 
         if _running:
-            rest_sec = random.randint(45, 75)
+            rest_sec = random.randint(30, 60)
             console.print(f"[dim]轮间休息 {rest_sec}s...[/dim]")
             _write_status(stage="resting", detail=f"轮间休息 {rest_sec}s...")
             for _ in range(rest_sec):

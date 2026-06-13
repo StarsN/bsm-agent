@@ -300,10 +300,7 @@ class SquareScraper:
             except Exception as e:
                 print(f"[scraper] 出错：{e}")
             finally:
-                try:
-                    await asyncio.wait_for(context.close(), timeout=10)
-                except Exception:
-                    pass
+                await context.close()
 
         # 去重
         seen = set()

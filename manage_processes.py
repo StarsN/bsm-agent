@@ -176,7 +176,7 @@ def status():
 
 
 def restart(open_browser: bool = True):
-    """强制杀所有进程，等 3 分钟让端口释放，重启"""
+    """强制杀所有进程，等 10 分钟让端口释放，清僵尸，再等 1 分钟，重启"""
     state = _load_state()
     for name, _script in reversed(PROGRAMS):
         info = state.get(name) or {}
@@ -195,6 +195,10 @@ def restart(open_browser: bool = True):
             print(f"{name}: killed pid={pid}")
     if PID_FILE.exists():
         PID_FILE.unlink()
+
+    print("等待 10 分钟让端口释放...")
+    time.sleep(600)
+
     # 清理浏览器僵尸进程（Chromium/Chrome 残留）
     zombie_names = ("chrome", "chromium", "chromedriver", "playwright")
     for name in zombie_names:
@@ -211,8 +215,9 @@ def restart(open_browser: bool = True):
                 )
         except Exception:
             pass
-    print("等待 3 分钟后重启...")
-    time.sleep(180)
+
+    print("等待 1 分钟后重启...")
+    time.sleep(60)
     start(open_browser=open_browser)
 
 
