@@ -1036,32 +1036,33 @@ def update_paper_positions(conn):
                 from market import get_klines_1h
                 klines = get_klines_1h(pos["token"], limit=30)
                 stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
+                actual_entry = round(min(limit_price, price) if side == "LONG" else max(limit_price, price), 8)
                 if is_short:
-                    sl = limit_price * (1 - stop_pct / 100)
-                    risk_unit = sl - limit_price
-                    tp1 = limit_price - risk_unit * config.TRADING_TP1_R
-                    tp2 = limit_price - risk_unit * config.TRADING_TP2_R
+                    sl = actual_entry * (1 - stop_pct / 100)
+                    risk_unit = sl - actual_entry
+                    tp1 = actual_entry - risk_unit * config.TRADING_TP1_R
+                    tp2 = actual_entry - risk_unit * config.TRADING_TP2_R
                     fields.update({
                         "lowest_price": price,
                         "highest_price": price,
                     })
                 else:
-                    sl = limit_price * (1 + stop_pct / 100)
-                    risk_unit = limit_price - sl
-                    tp1 = limit_price + risk_unit * config.TRADING_TP1_R
-                    tp2 = limit_price + risk_unit * config.TRADING_TP2_R
+                    sl = actual_entry * (1 + stop_pct / 100)
+                    risk_unit = actual_entry - sl
+                    tp1 = actual_entry + risk_unit * config.TRADING_TP1_R
+                    tp2 = actual_entry + risk_unit * config.TRADING_TP2_R
                     fields.update({
                         "highest_price": price,
                         "lowest_price": price,
                     })
                 fields.update({
                     "status": "OPEN",
-                    "entry_price": limit_price,
+                    "entry_price": actual_entry,
                     "stop_loss_price": round(sl, 8),
                     "tp1_price": round(tp1, 8),
                     "tp2_price": round(tp2, 8),
                     "current_price": price,
-                    "advice": f"挂单触发 @ ${limit_price:.6g}，止盈+{config.TRADING_TP1_R}R/+{config.TRADING_TP2_R}R 止损{stop_pct:+.2f}%",
+                    "advice": f"挂单触发 @ ${actual_entry:.6g}，止盈+{config.TRADING_TP1_R}R/+{config.TRADING_TP2_R}R 止损{stop_pct:+.2f}%",
                 })
             elif expired:
                 fields.update({
@@ -1085,17 +1086,17 @@ def update_paper_positions(conn):
                 _m = __import__("re").search(r"tier=(\w+)", _reason)
                 _tier = _m.group(1) if _m else "half"
                 _snap = __import__("json").dumps({
-                    "price": limit_price, "stop_loss": round(sl, 8),
+                    "price": actual_entry, "stop_loss": round(sl, 8),
                     "tp1": round(tp1, 8), "tp2": round(tp2, 8),
                     "margin": pos.get("margin_amount", 0),
                     "notional": pos.get("notional", 0),
                     "leverage": pos.get("leverage", 0),
                 }, ensure_ascii=False)
                 storage.journal_add_open(
-                    conn, position_id=pos["id"], token=pos["token"], price=limit_price,
+                    conn, position_id=pos["id"], token=pos["token"], price=actual_entry,
                     tier=_tier, stop_loss=round(sl, 8),
                     tp1_price=round(tp1, 8), tp2_price=round(tp2, 8),
-                    reason=f"挂单触发 {pos.get('side', 'LONG')} @ ${limit_price:.6g}",
+                    reason=f"挂单触发 {pos.get('side', 'LONG')} @ ${actual_entry:.6g}",
                     dimension_data=_snap,
                     pending_decision_id=pd_id,
                 )

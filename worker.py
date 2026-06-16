@@ -8,6 +8,7 @@
 运行：python worker.py
 """
 import asyncio
+import threading
 import json
 import os
 import random
@@ -574,6 +575,16 @@ async def main():
         console.print(f"   Web 仪表盘：请另开一个终端运行 python web.py")
     console.print()
 
+    # 启动链上监控扫描器（独立后台线程）
+    if getattr(config, "ONCHAIN_SCAN_ENABLED", True):
+        storage.init_onchain_db()
+        from onchain_scanner import scanner_loop
+        onchain_thread = threading.Thread(target=scanner_loop, daemon=True)
+        onchain_thread.start()
+        console.print("[green]=== 链上监控扫描器已启动 ===[/green]")
+        console.print(f"   扫描间隔: {getattr(config, 'ONCHAIN_SCAN_INTERVAL_HOURS', 4)}h")
+        console.print()
+
     while _running:
         try:
             await asyncio.wait_for(one_round(scraper), timeout=round_timeout)
@@ -596,7 +607,12 @@ async def main():
                 pass
 
         if _running:
-            rest_sec = random.randint(30, 60)
+            if _OKX_MODE:
+                rest_sec = random.randint(
+                    getattr(config, "OKX_REST_MIN", 330),
+                    getattr(config, "OKX_REST_MAX", 390))
+            else:
+                rest_sec = random.randint(30, 60)
             console.print(f"[dim]轮间休息 {rest_sec}s...[/dim]")
             _write_status(stage="resting", detail=f"轮间休息 {rest_sec}s...")
             for _ in range(rest_sec):

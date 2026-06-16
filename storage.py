@@ -385,6 +385,79 @@ CREATE TABLE IF NOT EXISTS kol_llm_logs (
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_kol_llm_logs_created ON kol_llm_logs(created_at);
+
+-- 链上监控 — 扫描器状态
+CREATE TABLE IF NOT EXISTS onchain_scanner_status (
+    key              TEXT PRIMARY KEY,
+    stage            TEXT,
+    detail           TEXT,
+    round_number     INTEGER DEFAULT 0,
+    tokens_scanned   INTEGER DEFAULT 0,
+    candidates_found INTEGER DEFAULT 0,
+    pool_size        INTEGER DEFAULT 0,
+    actionable_size  INTEGER DEFAULT 0,
+    last_scan_start  TIMESTAMP,
+    last_scan_end    TIMESTAMP,
+    last_heartbeat   TIMESTAMP
+);
+
+-- 链上监控 — 每轮快照（时序核心）
+CREATE TABLE IF NOT EXISTS onchain_snapshots (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number            INTEGER NOT NULL,
+    token                   TEXT NOT NULL,
+    token_address           TEXT NOT NULL,
+    chain                   TEXT DEFAULT 'bsc',
+    hot_rank                INTEGER,
+    top10_hold_pct          REAL,
+    holders_count           INTEGER,
+    market_cap_usd          REAL,
+    cluster_concentration   TEXT,
+    top100_holdings_pct     REAL,
+    holder_same_fund_pct    REAL,
+    holder_new_addr_pct     REAL,
+    holder_same_creation_pct REAL,
+    rug_pull_pct            REAL,
+    effective_concentration REAL,
+    divergence_score        REAL,
+    snapshot_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_onchain_snap_token ON onchain_snapshots(token, round_number);
+CREATE INDEX IF NOT EXISTS idx_onchain_snap_round ON onchain_snapshots(round_number);
+
+-- 链上监控 — LP 储备快照
+CREATE TABLE IF NOT EXISTS onchain_lp_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token           TEXT NOT NULL,
+    token_address   TEXT NOT NULL,
+    chain           TEXT DEFAULT 'bsc',
+    round_number    INTEGER NOT NULL,
+    token_amount    REAL,
+    snapshot_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_onchain_lp_token ON onchain_lp_snapshots(token, round_number);
+
+-- 链上监控 — 观察池 / 建仓池
+CREATE TABLE IF NOT EXISTS onchain_pool (
+    token                   TEXT PRIMARY KEY,
+    token_address           TEXT NOT NULL,
+    chain                   TEXT DEFAULT 'bsc',
+    pool_stage              TEXT DEFAULT 'observation',
+    surface_top10_pct       REAL,
+    effective_concentration REAL,
+    fund_source_same_pct    REAL,
+    divergence_detected     INTEGER DEFAULT 0,
+    days_in_pool            INTEGER DEFAULT 0,
+    lp_reserve_trend        TEXT,
+    lp_trend_score          REAL,
+    gas_seeding_signal      INTEGER DEFAULT 0,
+    cex_staging_signal      INTEGER DEFAULT 0,
+    confidence_score        REAL DEFAULT 0,
+    first_seen_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    rounds_in_pool          INTEGER DEFAULT 0,
+    backtest_winrate        REAL
+);
 """
 
 
@@ -405,6 +478,14 @@ def get_conn(db_path: str = None):
         conn.commit()
     finally:
         conn.close()
+
+
+def _ensure_columns(conn, table: str, columns: list[tuple[str, str]]):
+    """批量添加不存在的列（幂等）"""
+    existing = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    for col_name, col_type in columns:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
 
 
 def _migrate(conn):
@@ -558,6 +639,101 @@ def _migrate(conn):
                      ("okx_last_round", "INTEGER")]:
         if col not in ws_cols:
             conn.execute(f"ALTER TABLE worker_status ADD COLUMN {col} {typ}")
+
+    # onchain pool: 后续新增列的迁移占位
+    _ensure_columns(conn, "onchain_pool", [
+        ("backtest_winrate", "REAL"),
+        ("confidence_score", "REAL DEFAULT 0"),
+        ("prev_new_addr_pct", "REAL"),
+    ])
+    _ensure_columns(conn, "onchain_snapshots", [
+        ("divergence_score", "REAL"),
+        ("effective_concentration", "REAL"),
+    ])
+    _ensure_columns(conn, "onchain_scanner_status", [
+        ("actionable_size", "INTEGER DEFAULT 0"),
+    ])
+
+
+_ONCHAIN_DDL = """\
+CREATE TABLE IF NOT EXISTS onchain_scanner_status (
+    key              TEXT PRIMARY KEY,
+    stage            TEXT,
+    detail           TEXT,
+    round_number     INTEGER DEFAULT 0,
+    tokens_scanned   INTEGER DEFAULT 0,
+    candidates_found INTEGER DEFAULT 0,
+    pool_size        INTEGER DEFAULT 0,
+    actionable_size  INTEGER DEFAULT 0,
+    last_scan_start  TIMESTAMP,
+    last_scan_end    TIMESTAMP,
+    last_heartbeat   TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS onchain_snapshots (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number            INTEGER NOT NULL,
+    token                   TEXT NOT NULL,
+    token_address           TEXT NOT NULL,
+    chain                   TEXT DEFAULT 'bsc',
+    hot_rank                INTEGER,
+    top10_hold_pct          REAL,
+    holders_count           INTEGER,
+    market_cap_usd          REAL,
+    cluster_concentration   TEXT,
+    top100_holdings_pct     REAL,
+    holder_same_fund_pct    REAL,
+    holder_new_addr_pct     REAL,
+    holder_same_creation_pct REAL,
+    rug_pull_pct            REAL,
+    effective_concentration REAL,
+    divergence_score        REAL,
+    snapshot_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_onchain_snap_token ON onchain_snapshots(token, round_number);
+CREATE INDEX IF NOT EXISTS idx_onchain_snap_round ON onchain_snapshots(round_number);
+
+CREATE TABLE IF NOT EXISTS onchain_lp_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token           TEXT NOT NULL,
+    token_address   TEXT NOT NULL,
+    chain           TEXT DEFAULT 'bsc',
+    round_number    INTEGER NOT NULL,
+    token_amount    REAL,
+    snapshot_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_onchain_lp_token ON onchain_lp_snapshots(token, round_number);
+
+CREATE TABLE IF NOT EXISTS onchain_pool (
+    token                   TEXT PRIMARY KEY,
+    token_address           TEXT NOT NULL,
+    chain                   TEXT DEFAULT 'bsc',
+    pool_stage              TEXT DEFAULT 'observation',
+    surface_top10_pct       REAL,
+    effective_concentration REAL,
+    fund_source_same_pct    REAL,
+    divergence_detected     INTEGER DEFAULT 0,
+    days_in_pool            INTEGER DEFAULT 0,
+    lp_reserve_trend        TEXT,
+    lp_trend_score          REAL,
+    gas_seeding_signal      INTEGER DEFAULT 0,
+    cex_staging_signal      INTEGER DEFAULT 0,
+    confidence_score        REAL DEFAULT 0,
+    prev_new_addr_pct       REAL,
+    backtest_winrate        REAL,
+    first_seen_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    rounds_in_pool          INTEGER DEFAULT 0
+);
+"""
+
+
+def init_onchain_db():
+    """初始化链上监控独立 DB"""
+    with get_conn(config.ONCHAIN_DB) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(_ONCHAIN_DDL)
 
 
 def init_db():
@@ -1186,6 +1362,13 @@ def trading_settings_defaults() -> dict:
         "system_auto_trade_enabled": getattr(config, "SYSTEM_AUTO_TRADE_ENABLED", True),
         "strategy_initial_agent_short": getattr(config, "STRATEGY_INITIAL_AGENT_SHORT", 1000),
         "agent_short_interval_minutes": getattr(config, "AGENT_SHORT_INTERVAL_MINUTES", 16),
+        "onchain_strategy_enabled": getattr(config, "ONCHAIN_STRATEGY_ENABLED", True),
+        "strategy_initial_onchain": getattr(config, "STRATEGY_INITIAL_ONCHAIN", 1000),
+        # 链上监控阈值
+        "onchain_scan_interval_hours": getattr(config, "ONCHAIN_SCAN_INTERVAL_HOURS", 4),
+        "onchain_divergence_fund_source_min": getattr(config, "ONCHAIN_DIVERGENCE_FUND_SOURCE_MIN", 30.0),
+        "onchain_surface_top10_max": getattr(config, "ONCHAIN_SURFACE_TOP10_MAX", 40.0),
+        "onchain_observation_max_days": getattr(config, "ONCHAIN_OBSERVATION_MAX_DAYS", 7),
     }
 
 
@@ -1194,9 +1377,9 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
-        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence"}:
+        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain"}:
             try:
                 settings[row["key"]] = float(raw)
             except (TypeError, ValueError):
@@ -1211,7 +1394,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -1997,3 +2180,111 @@ def nl_candidates_purge_old(conn, keep_last_rounds: int = 30):
     ).fetchone()
     if row:
         conn.execute("DELETE FROM nl_candidates WHERE round_number <= ?", (row[0],))
+
+
+# ============================================================
+# 链上监控 (On-Chain Monitor) — CRUD
+# ============================================================
+
+def onchain_status_update(conn, **fields):
+    """写入/更新扫描器状态（单行 upsert）"""
+    keys = list(fields.keys())
+    placeholders = ", ".join(["?"] * len(keys))
+    set_cols = ", ".join(f"{k}=excluded.{k}" for k in keys if k != "key")
+    conn.execute(
+        f"INSERT INTO onchain_scanner_status ({', '.join(keys)}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT(key) DO UPDATE SET {set_cols}",
+        list(fields.values()),
+    )
+
+
+def onchain_status_get(conn) -> dict | None:
+    row = conn.execute("SELECT * FROM onchain_scanner_status WHERE key='scanner'").fetchone()
+    return dict(row) if row else None
+
+
+def onchain_snapshot_insert_batch(conn, round_number: int, snapshots: list[dict]):
+    for s in snapshots:
+        conn.execute(
+            """INSERT INTO onchain_snapshots
+               (round_number, token, token_address, chain,
+                hot_rank, top10_hold_pct, holders_count, market_cap_usd,
+                cluster_concentration, top100_holdings_pct,
+                holder_same_fund_pct, holder_new_addr_pct,
+                holder_same_creation_pct, rug_pull_pct,
+                effective_concentration, divergence_score)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (round_number, s["token"], s["token_address"], s.get("chain", "bsc"),
+             s.get("hot_rank"), s.get("top10_hold_pct"), s.get("holders_count"),
+             s.get("market_cap_usd"), s.get("cluster_concentration"),
+             s.get("top100_holdings_pct"), s.get("holder_same_fund_pct"),
+             s.get("holder_new_addr_pct"), s.get("holder_same_creation_pct"),
+             s.get("rug_pull_pct"), s.get("effective_concentration"),
+             s.get("divergence_score")),
+        )
+
+
+def onchain_snapshots_for_token(conn, token: str, limit: int = 10) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM onchain_snapshots WHERE token=? ORDER BY round_number DESC LIMIT ?",
+        (token, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_snapshots_purge_old(conn, keep_last_rounds: int = 50):
+    row = conn.execute(
+        "SELECT DISTINCT round_number FROM onchain_snapshots ORDER BY round_number DESC LIMIT 1 OFFSET ?",
+        (keep_last_rounds,),
+    ).fetchone()
+    if row:
+        conn.execute("DELETE FROM onchain_snapshots WHERE round_number <= ?", (row[0],))
+
+
+def onchain_pool_upsert(conn, entry: dict):
+    keys = list(entry.keys())
+    placeholders = ", ".join("?" for _ in keys)
+    set_cols = ", ".join(f"{k}=excluded.{k}" for k in keys if k != "token")
+    conn.execute(
+        f"INSERT INTO onchain_pool ({', '.join(keys)}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT(token) DO UPDATE SET {set_cols}",
+        list(entry.values()),
+    )
+
+
+def onchain_pool_get_all(conn, stage: str = None) -> list[dict]:
+    if stage:
+        rows = conn.execute(
+            "SELECT * FROM onchain_pool WHERE pool_stage=? ORDER BY last_updated_at DESC",
+            (stage,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM onchain_pool ORDER BY last_updated_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_pool_remove(conn, token: str):
+    conn.execute("DELETE FROM onchain_pool WHERE token=?", (token,))
+
+
+def onchain_lp_snapshot_insert_batch(conn, snapshots: list[dict]):
+    for s in snapshots:
+        conn.execute(
+            """INSERT INTO onchain_lp_snapshots
+               (token, token_address, chain, round_number, token_amount)
+               VALUES (?,?,?,?,?)""",
+            (s["token"], s["token_address"], s.get("chain", "bsc"),
+             s["round_number"], s.get("token_amount")),
+        )
+
+
+def onchain_lp_snapshots_for_token(conn, token: str, limit: int = 5) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM onchain_lp_snapshots WHERE token=? ORDER BY round_number DESC LIMIT ?",
+        (token, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]

@@ -180,11 +180,11 @@ def _scan_short_candidates():
 
 
 def _scan_candidates_kol():
-    """KOL 专用 — 返回所有有行情数据的代币（不过滤 passed）"""
+    """KOL 专用 — 从做多建议中获取 passed=True 的候选"""
     with storage.get_conn() as conn:
         items, skipped = _build_leaderboard_items(conn)
         return trade_logic.build_trade_candidates_from_leaderboard(
-            conn, items, passed_only=False)
+            conn, items, passed_only=True)
 
 
 def _scan_kol_display():
@@ -384,13 +384,11 @@ def _collect_loop():
                                 "signal_key": sc.get("signal_key", ""),
                             }
 
-            # === KOL Agent：独立数据源，异常度筛选 ===
+            # === KOL Agent：直接从做多建议采集 ===
             if ts_settings.get("kol_agent_enabled", True) or ts_settings.get("kol_snapshot_enabled", True):
                 kol_candidates = _cached("kol_candidates_scan", cache_ttl, _scan_candidates_kol)
                 if ts_settings.get("kol_agent_enabled", True):
                     for c in kol_candidates:
-                        if not kol_agent.kol_is_interesting(c)[0]:
-                            continue
                         _kol_collected[c["token"]] = {
                             "token": c["token"],
                             "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
@@ -402,8 +400,6 @@ def _collect_loop():
                         }
                 if ts_settings.get("kol_snapshot_enabled", True):
                     for c in kol_candidates:
-                        if not kol_agent.kol_is_interesting(c)[0]:
-                            continue
                         _kol_snapshot_collected[c["token"]] = {
                             "token": c["token"],
                             "data": json.dumps(_build_kol_data_blob(c), default=str, ensure_ascii=False),
@@ -629,6 +625,12 @@ class TradingSettingsBody(BaseModel):
     kol_snapshot_min_confidence: int | None = None
     kol_snapshot_llm_provider: str | None = None
     okx_data_source_enabled: bool | None = None
+    onchain_strategy_enabled: bool | None = None
+    strategy_initial_onchain: float | None = None
+    onchain_scan_interval_hours: float | None = None
+    onchain_divergence_fund_source_min: float | None = None
+    onchain_surface_top10_max: float | None = None
+    onchain_observation_max_days: float | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -820,7 +822,7 @@ def api_leaderboard():
         with storage.get_conn() as conn:
             result, skipped_no_contract = _build_leaderboard_items(conn)
         return {
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
             "items": result,
             "skipped_no_contract": skipped_no_contract,
         }
@@ -1029,7 +1031,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1067,6 +1069,60 @@ def api_trading_reset(body: TradingResetBody):
     return {"ok": True, **result}
 
 
+# ---- 链上监控 API ----
+
+@app.get("/api/onchain/status")
+def api_onchain_status():
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        st = storage.onchain_status_get(conn)
+    if not st:
+        return {"stage": "idle", "round_number": 0, "tokens_scanned": 0,
+                "candidates_found": 0, "pool_size": 0, "actionable_size": 0,
+                "detail": "等待首次扫描"}
+    return {k: (str(v) if isinstance(v, datetime) else v) for k, v in (st or {}).items()}
+
+
+@app.get("/api/onchain/pool")
+def api_onchain_pool(stage: str = None):
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        rows = storage.onchain_pool_get_all(conn, stage)
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        for k, v in r.items():
+            if isinstance(v, datetime):
+                r[k] = str(v)
+        # 从 first_seen_at 实时计算 days_in_pool
+        first_seen = r.get("first_seen_at")
+        if first_seen:
+            try:
+                if isinstance(first_seen, str):
+                    first_seen = datetime.fromisoformat(first_seen)
+                r["days_in_pool"] = round((now - first_seen).total_seconds() / 86400, 1)
+            except (ValueError, TypeError):
+                pass
+        try:
+            with storage.get_conn(config.ONCHAIN_DB) as conn:
+                snaps = storage.onchain_snapshots_for_token(conn, r["token"], limit=6)
+                snaps.reverse()
+                r["sparkline"] = [s.get("effective_concentration") for s in snaps]
+        except Exception:
+            r["sparkline"] = []
+    return rows
+
+
+@app.get("/api/onchain/snapshots")
+def api_onchain_snapshots(token: str = "", limit: int = 10):
+    if not token:
+        return []
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        rows = storage.onchain_snapshots_for_token(conn, token, limit)
+    for r in rows:
+        for k, v in r.items():
+            if isinstance(v, datetime):
+                r[k] = str(v)
+    return rows
+
+
 @app.post("/api/trading/reset-strategy")
 def api_trading_reset_strategy(body: TradingResetStrategyBody):
     """按策略重置交易数据"""
@@ -1074,7 +1130,7 @@ def api_trading_reset_strategy(body: TradingResetStrategyBody):
         raise HTTPException(400, "需要 confirm=true 以确认重置")
     strategy = body.strategy.strip().lower()
     valid = {"agent", "heat_agent", "heat_agent_lessons", "agent_no_lessons",
-             "kol_agent", "kol_snapshot", "system", "manual", "agent_short"}
+             "kol_agent", "kol_snapshot", "system", "manual", "agent_short", "onchain"}
     if strategy not in valid:
         raise HTTPException(400, f"无效策略: {body.strategy}")
     with storage.get_conn() as conn:
@@ -1273,6 +1329,54 @@ def api_agent_overview(strategy: str = "agent"):
     return _cached(f"agent_overview_{strategy}", 15.0, compute)
 
 
+@app.get("/api/agent/daily-pnl")
+def api_agent_daily_pnl(strategy: str = "agent", days: int = 30):
+    """每日账户变化：权益线 + 日收益柱。从 trade_positions 实时聚合，无需快照表"""
+    with storage.get_conn() as conn:
+        settings = storage.trading_settings_get(conn)
+        init_key = f"strategy_initial_{strategy}"
+        initial = float(settings.get(init_key, 1000))
+        # 按天聚合已实现盈亏
+        rows = conn.execute(
+            f"SELECT date(closed_at, '+8 hours') as day,"
+            f"  COALESCE(SUM(realized_pnl),0) as day_rpnl,"
+            f"  COUNT(*) as trades,"
+            f"  SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins"
+            f" FROM trade_positions"
+            f" WHERE strategy=? AND status='CLOSED' AND closed_at IS NOT NULL"
+            f"  AND closed_at >= datetime('now', ?)"
+            f" GROUP BY day ORDER BY day ASC",
+            (strategy, f"-{days} days"),
+        ).fetchall()
+        # 逐日累加 → 每日权益
+        daily = []
+        running = float(initial)
+        for r in rows:
+            running += float(r["day_rpnl"])
+            daily.append({
+                "date": r["day"],
+                "equity": round(running, 2),
+                "day_pnl": round(float(r["day_rpnl"]), 2),
+                "trades": r["trades"],
+                "wins": r["wins"],
+            })
+        # 最新权益 = 最后权益 + 当前浮动盈亏
+        unrealized = conn.execute(
+            f"SELECT COALESCE(SUM(unrealized_pnl),0) FROM trade_positions"
+            f" WHERE status IN ('OPEN','PARTIAL') AND strategy=?",
+            (strategy,),
+        ).fetchone()[0]
+        current_equity = round(running + float(unrealized or 0), 2)
+        period_change = round(current_equity - daily[0]["equity"], 2) if daily else 0
+    return {
+        "strategy": strategy, "initial": initial,
+        "current_equity": current_equity,
+        "period_change": period_change,
+        "unrealized": round(float(unrealized or 0), 2),
+        "days": days, "daily": daily,
+    }
+
+
 @app.get("/api/agent/journal")
 def api_agent_journal(strategy: str = "agent", limit: int = 5, offset: int = 0):
     """操作日志：策略隔离，按时间倒排，分页"""
@@ -1305,7 +1409,8 @@ def api_agent_timeline(strategy: str = "agent", limit: int = 30, offset: int = 0
                   "agent_no_lessons": "nl_candidates", "heat_agent_lessons": "token_heat_history_lessons",
                   "kol_agent": "kol_agent",
                        "kol_snapshot": "kol_snapshot",
-                       "agent_short": "agent_candidates_short"}
+                       "agent_short": "agent_candidates_short",
+                       "onchain": "onchain"}
     src = source_map.get(strategy, "agent_candidates")
     with storage.get_conn() as conn:
         journal_total = conn.execute(
@@ -1762,11 +1867,12 @@ tr.flash { animation: row-flash 1.5s ease-out; }
           </div>
 </div>
   <a href="/dashboard">📊 市场全景</a>
+  <a href="/onchain">🔍 链上监控</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
 <div style="display:flex;align-items:center;gap:16px;margin-bottom:4px;">
-<h1 style="margin:0">🔥 币安广场热度监控</h1>
+<h1 style="margin:0">🔥 热度监控</h1>
 </div>
 <div class="updated" id="updated">加载中...</div>
 
@@ -2302,7 +2408,7 @@ async function refreshAll(opts = {}) {
 
 // 把 loadLeaderboard 拆成两步：fetch 由 refreshAll 做，渲染单独提出来
 function renderLeaderboard(data) {
-  let ut='';if(data.updated_at){const d=new Date(data.updated_at+"Z");d.setHours(d.getHours()+8);ut=d.toISOString().replace("T"," ").substring(5,16);}
+  let ut='';if(data.updated_at){const d=new Date(data.updated_at+'Z');ut=d.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/\//g,'-');}
   document.getElementById('updated').textContent = '最后刷新: ' + ut;
   const tbody = document.getElementById('leaderboard');
   const noteEl = document.getElementById('leaderboard-note');
@@ -2616,10 +2722,11 @@ function renderWorkerPanel(s) {
   }
   fillEl.style.width = pct.toFixed(0) + '%';
 
-  // 轮次
+  // 轮次（前面加数据源标识）
   if (s.round_number) {
-    roundEl.textContent = `第 ${s.round_number} 轮`
-      + (s.heartbeat_age_seconds !== undefined ? ` · ${s.heartbeat_age_seconds}s 前更新` : '');
+    const srcLabel = s.data_source === 'okx' ? 'OKX' : '币安';
+    roundEl.textContent = srcLabel + ' · 第 ' + s.round_number + ' 轮'
+      + (s.heartbeat_age_seconds !== undefined ? ' · ' + s.heartbeat_age_seconds + 's 前更新' : '');
   } else {
     roundEl.textContent = '—';
   }
@@ -2674,6 +2781,7 @@ AGENT_HTML = """
 <meta charset="UTF-8">
 <title>Agent-合约扫描</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root {
   --bg: #0f1419; --panel: #1a1f2e; --border: #2a3142;
@@ -2809,6 +2917,7 @@ tr:hover { background: #1f2536; }
               </div>
   </div>
   <a href="/dashboard">📊 市场全景</a>
+  <a href="/onchain">🔍 链上监控</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -2821,6 +2930,11 @@ tr:hover { background: #1f2536; }
 </div>
 </div>
 
+
+<!-- 每日账户总额变化卡片 -->
+<div id="daily-card" class="panel" style="padding:16px 20px;margin-bottom:12px">
+  <div id="daily-content" style="color:var(--muted);text-align:center;padding:10px">加载中...</div>
+</div>
 
 <!-- 顶部：账户概览 + 持仓 -->
 <div class="grid-top">
@@ -2931,6 +3045,113 @@ function truncText(text, max) {
 }
 
 // 账户概览
+async function loadDailyCard() {
+  try {
+    const r = await fetch('/api/agent/daily-pnl?strategy='+AGENT_STRATEGY+'&days=30');
+    const d = await r.json();
+    if (!d.daily || !d.daily.length) {
+      $('#daily-content').innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px">暂无历史交易数据</div>';
+      return;
+    }
+    const days = d.daily;
+    const labels = days.map(dd=>dd.date.slice(5));
+    labels.push('当前');
+    const equityData = days.map(dd=>dd.equity);
+    equityData.push(d.current_equity);
+    const pnlData = days.map(dd=>dd.day_pnl);
+
+    // 表格行
+    let rows = '';
+    for (let i = days.length-1; i >= Math.max(0, days.length-5); i--) {
+      const dd = days[i];
+      const wr = dd.trades > 0 ? Math.round(dd.wins/dd.trades*100) : 0;
+      rows += '<tr>'+
+        '<td>'+dd.date+'</td>'+
+        '<td class="right">$'+dd.equity.toFixed(2)+'</td>'+
+        '<td class="right '+(dd.day_pnl>=0?'green':'red')+'">'+(dd.day_pnl>=0?'+':'')+dd.day_pnl.toFixed(2)+'</td>'+
+        '<td class="right '+(dd.day_pnl>=0?'green':'red')+'">'+(dd.day_pnl>=0?'+':'')+dd.day_pnl.toFixed(2)+'</td>'+
+        '<td class="right">'+dd.trades+' / '+wr+'%</td>'+
+        '<td class="right" style="color:var(--muted)">真实</td>'+
+      '</tr>';
+    }
+
+    const chg = d.period_change;
+    const chgCls = chg >= 0 ? 'green' : 'red';
+    const chgSign = chg >= 0 ? '+' : '';
+
+    $('#daily-content').innerHTML =
+      '<div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;margin-bottom:12px">'+
+        '<div>'+
+          '<div style="font-size:26px;font-weight:700;font-family:JetBrains Mono,monospace">$'+d.current_equity.toFixed(2)+'</div>'+
+          '<div style="font-size:13px;margin-top:2px"><span class="'+chgCls+'">'+chgSign+chg.toFixed(2)+' USDT</span><span style="color:var(--muted);font-size:11px;margin-left:8px">近 '+d.daily.length+' 天</span></div>'+
+        '</div>'+
+      '</div>'+
+      '<div style="display:flex;gap:16px;flex-wrap:wrap">'+
+        '<div style="flex:1;min-width:320px;height:200px"><canvas id="daily-equity-chart"></canvas></div>'+
+        '<div style="flex:1;min-width:320px;height:200px"><canvas id="daily-pnl-chart"></canvas></div>'+
+      '</div>'+
+      '<table style="margin-top:12px;font-size:12px;width:100%"><thead><tr>'+
+        '<th>日期</th><th class="right">权益</th><th class="right">日变化</th><th class="right">净盈亏</th><th class="right">交易</th><th class="right">数据</th>'+
+      '</tr></thead><tbody>'+rows+'</tbody></table>';
+
+    // Chart.js 渲染（需等 DOM 就绪）
+    setTimeout(() => {
+      const ctx1 = document.getElementById('daily-equity-chart');
+      const ctx2 = document.getElementById('daily-pnl-chart');
+      if (!ctx1 || !ctx2) return;
+
+      // 销毁旧实例
+      if (ctx1._chart) ctx1._chart.destroy();
+      if (ctx2._chart) ctx2._chart.destroy();
+
+      ctx1._chart = new Chart(ctx1, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: '权益',
+            data: equityData,
+            borderColor: '#0ECB81',
+            backgroundColor: 'rgba(14,203,129,0.06)',
+            fill: true,
+            tension: 0.2,
+            pointRadius: 1,
+            borderWidth: 1.5,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 8 }, grid: { color: '#21262d' } },
+            y: { ticks: { color: '#8b949e', font: { size: 10 }, callback: v => '$'+v }, grid: { color: '#21262d' } },
+          },
+        },
+      });
+
+      ctx2._chart = new Chart(ctx2, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [{
+            data: pnlData,
+            backgroundColor: ctx => ctx.raw >= 0 ? 'rgba(14,203,129,0.7)' : 'rgba(248,81,73,0.7)',
+            borderRadius: 2,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 8 }, grid: { display: false } },
+            y: { ticks: { color: '#8b949e', font: { size: 10 }, callback: v => (v>=0?'+':'')+'$'+v }, grid: { color: '#21262d' } },
+          },
+        },
+      });
+    }, 50);
+  } catch(e) { console.error('daily', e); }
+}
+
 async function loadOverview() {
   try {
     const r = await fetch('/api/agent/overview');
@@ -3333,12 +3554,13 @@ async function loadJournal(reset = false) {
 }
 
 async function refreshAll() {
-  await Promise.all([loadOverview(), loadPositions(), loadPending(), loadLessons(true), loadTimeline(true), loadJournal(true)]);
+  await Promise.all([loadDailyCard(), loadOverview(), loadPositions(), loadPending(), loadLessons(true), loadTimeline(true), loadJournal(true)]);
 }
 
 updateClock();
 setInterval(updateClock, 1000);
 refreshAll();
+setInterval(loadDailyCard, 300000);
 setInterval(loadOverview, 15000);
 setInterval(loadPositions, 5000);
 setInterval(loadPending, 30000);
@@ -3527,6 +3749,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   </div>
 </div>
   <a href="/dashboard">📊 市场全景</a>
+  <a href="/onchain">🔍 链上监控</a>
   <a href="/settings" class="active">⚙ 系统设置</a>
 </div>
 
@@ -3585,6 +3808,29 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     </div>
   </div>
   <div style="color:var(--muted);font-size:11px;margin-top:4px">切换数据源后需重启系统生效</div>
+</div>
+
+<div class="panel">
+  <h2>链上监控</h2>
+  <div class="grid3">
+    <div>
+      <label>扫描间隔（小时）</label>
+      <input id="trade-onchain-interval" type="number" min="1" max="24" step="1">
+    </div>
+    <div>
+      <label>背离阈值（资金同源%）</label>
+      <input id="trade-onchain-fund-min" type="number" min="10" max="80" step="5">
+    </div>
+    <div>
+      <label>表层集中度上限（%）</label>
+      <input id="trade-onchain-top10-max" type="number" min="10" max="80" step="5">
+    </div>
+    <div>
+      <label>观察池最长天数</label>
+      <input id="trade-onchain-max-days" type="number" min="3" max="30" step="1">
+    </div>
+  </div>
+  <div style="color:var(--muted);font-size:11px;margin-top:4px">修改后点击「保存设置」立即生效，无需重启</div>
 </div>
 
 <div class="panel">
@@ -3762,6 +4008,24 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   </div>
 
   <div class="strategy-block">
+    <div class="strategy-name">链上监控策略</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-onchain-strategy-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-onchain" type="number" min="1" step="1">
+      </div>
+      <div></div>
+    </div>
+  </div>
+
+  <div class="strategy-block">
     <div class="strategy-name">系统策略</div>
     <div class="grid3">
       <div>
@@ -3807,6 +4071,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <option value="system">系统自动</option>
         <option value="manual">手动</option>
         <option value="agent_short">Agent-做空版</option>
+        <option value="onchain">链上监控</option>
       </select>
     </div>
     <div>
@@ -3870,12 +4135,18 @@ async function loadSettings() {
     document.getElementById('trade-short-switch').value = s.agent_short_enabled ?? true;
     document.getElementById('trade-short-interval').value = s.agent_short_interval_minutes ?? 16;
     document.getElementById('trade-strategy-short').value = s.strategy_initial_agent_short ?? 1000;
+    document.getElementById('trade-onchain-strategy-switch').value = s.onchain_strategy_enabled ?? true;
+    document.getElementById('trade-strategy-onchain').value = s.strategy_initial_onchain ?? 1000;
     document.getElementById('trade-kol-min-conf').value = s.kol_agent_min_confidence ?? 70;
     document.getElementById('trade-kol-cooldown').value = s.kol_token_cooldown_minutes ?? 30;
     document.getElementById('trade-daily-limit-switch').value = s.trading_daily_limit_enabled ?? true;
     document.getElementById('trade-system-auto-switch').value = s.system_auto_trade_enabled ?? true;
     document.getElementById('trade-data-source').value = s.okx_data_source_enabled ?? false;
     document.getElementById('trade-data-source').setAttribute('data-original', (s.okx_data_source_enabled ?? false) ? 'true' : 'false');
+    document.getElementById('trade-onchain-interval').value = s.onchain_scan_interval_hours ?? 4;
+    document.getElementById('trade-onchain-fund-min').value = s.onchain_divergence_fund_source_min ?? 30;
+    document.getElementById('trade-onchain-top10-max').value = s.onchain_surface_top10_max ?? 40;
+    document.getElementById('trade-onchain-max-days').value = s.onchain_observation_max_days ?? 7;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
@@ -3918,11 +4189,17 @@ async function saveTradingSettings() {
     agent_short_enabled: document.getElementById('trade-short-switch').value === 'true',
     strategy_initial_agent_short: Number(document.getElementById('trade-strategy-short').value),
     agent_short_interval_minutes: Number(document.getElementById('trade-short-interval').value),
+    onchain_strategy_enabled: document.getElementById('trade-onchain-strategy-switch').value === 'true',
+    strategy_initial_onchain: Number(document.getElementById('trade-strategy-onchain').value),
     kol_agent_min_confidence: parseInt(document.getElementById('trade-kol-min-conf').value) || 70,
     kol_token_cooldown_minutes: parseInt(document.getElementById('trade-kol-cooldown').value) || 30,
     trading_daily_limit_enabled: document.getElementById('trade-daily-limit-switch').value === 'true',
     system_auto_trade_enabled: document.getElementById('trade-system-auto-switch').value === 'true',
     okx_data_source_enabled: document.getElementById('trade-data-source').value === 'true',
+    onchain_scan_interval_hours: Number(document.getElementById('trade-onchain-interval').value),
+    onchain_divergence_fund_source_min: Number(document.getElementById('trade-onchain-fund-min').value),
+    onchain_surface_top10_max: Number(document.getElementById('trade-onchain-top10-max').value),
+    onchain_observation_max_days: Number(document.getElementById('trade-onchain-max-days').value),
   };
   const oldSource = document.getElementById('trade-data-source').getAttribute('data-original') || '';
   const newSource = body.okx_data_source_enabled ? 'true' : 'false';
@@ -4069,6 +4346,21 @@ def api_strategy_stats():
             st = s["strategy"]
             s["open_positions"] = [p for p in positions if p["strategy"] == st and p["status"] in ("OPEN","PARTIAL")]
             s["closed_positions"] = [p for p in positions if p["strategy"] == st and p["status"] == "CLOSED"][:10]
+        # 各策略运行状态（从 trading_settings 读取开关）
+        ts = storage.trading_settings_get(conn)
+        enabled_map = {
+            "agent": ts.get("agent_trade_enabled", True),
+            "heat_agent": ts.get("heat_agent_enabled", True),
+            "heat_agent_lessons": ts.get("heat_agent_lessons_enabled", True),
+            "agent_no_lessons": ts.get("nl_agent_enabled", True),
+            "agent_short": ts.get("agent_short_enabled", True),
+            "kol_agent": ts.get("kol_agent_enabled", True),
+            "kol_snapshot": ts.get("kol_snapshot_enabled", True),
+            "system": ts.get("system_auto_trade_enabled", True),
+            "onchain": ts.get("onchain_strategy_enabled", True),
+        }
+        for s in strategies:
+            s["running"] = enabled_map.get(s["strategy"], True)
     return {"strategies": strategies}
 
 
@@ -4244,6 +4536,7 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
           </div>
   </div>
   <a href="/dashboard">📊 市场全景</a>
+  <a href="/onchain">🔍 链上监控</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -4512,6 +4805,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
               </div>
   </div>
   <a href="/dashboard">📊 市场全景</a>
+  <a href="/onchain">🔍 链上监控</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -4544,6 +4838,7 @@ async function load() {
       heat_agent_lessons: '<span class="strategy-badge" style="background:#3a2a1a;color:#f0a040">🔥 热度有教训</span>',
       agent_no_lessons: '<span class="strategy-badge" style="background:#2a2a1a;color:#d29922">📋 无教训对照</span>',
         agent_short: '<span class="strategy-badge" style="background:#4a1a1a;color:#f85149">🔻 做空Agent</span>',
+        onchain: '<span class="strategy-badge" style="background:#1a3a2a;color:#0ECB81">🔗 链上监控</span>',
     };
     let html = '';
     for (const s of strategies) {
@@ -4554,7 +4849,10 @@ async function load() {
       html += `<div class="panel">
         <div class="strategy-header">
           <div>${badge[s.strategy] || s.strategy}</div>
-          <div style="color:var(--muted);font-size:12px">共 ${s.total} 笔</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            ${s.running ? '<span style="font-size:11px;background:rgba(63,185,80,0.15);color:#3fb950;padding:2px 8px;border-radius:10px">● 运行中</span>' : '<span style="font-size:11px;background:rgba(139,148,158,0.15);color:#8b949e;padding:2px 8px;border-radius:10px">○ 已暂停</span>'}
+            <span style="color:var(--muted);font-size:12px">共 ${s.total} 笔</span>
+          </div>
         </div>
         <div class="summary" style="grid-template-columns:repeat(6,1fr);margin-bottom:6px">
           <div class="metric"><div class="label">初始金额</div><div class="value">${fmtUsd(acc.initial_balance)}</div></div>
@@ -4906,6 +5204,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
     </div>
   </div>
   <a href="/dashboard" class="active">📊 市场全景</a>
+  <a href="/onchain">🔍 链上监控</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -5023,6 +5322,270 @@ async function loadAll(){
 }
 loadAll();setInterval(loadAll,15000);
 </script></body></html>"""
+
+
+ONCHAIN_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>链上监控</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
+  --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
+  --yellow: #d2991d; --orange: #db6d28; --purple: #a371f7;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; padding: 20px; max-width: 1400px; margin: 0 auto; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin-bottom: 20px; }
+h2 { font-size: 16px; margin-bottom: 12px; color: var(--accent); }
+.nav-bar { display: flex; justify-content: center; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap; }
+.nav-bar a { padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
+.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown-content { display: none; position: absolute; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 200px; z-index: 100; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; }
+.nav-dropdown-content a:hover { color: var(--accent); background: rgba(88,166,255,0.06); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+tr:hover { background: rgba(88,166,255,0.04); }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.status-dot.running { background: var(--green); }
+.status-dot.idle { background: var(--yellow); }
+.status-dot.error { background: var(--red); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+.badge-green { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge-yellow { background: rgba(210,153,29,0.15); color: var(--yellow); }
+.badge-red { background: rgba(248,81,73,0.15); color: var(--red); }
+.badge-blue { background: rgba(88,166,255,0.15); color: var(--accent); }
+.badge-purple { background: rgba(163,113,247,0.15); color: var(--purple); }
+.stat-row { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 12px; }
+.stat-item { display: flex; gap: 6px; align-items: baseline; }
+.stat-label { color: var(--muted); font-size: 12px; }
+.stat-value { font-size: 16px; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+.empty { text-align: center; color: var(--muted); padding: 30px; font-size: 14px; }
+.trend-up { color: var(--green); }
+.trend-down { color: var(--red); }
+.trend-flat { color: var(--yellow); }
+.signal-strong { color: var(--green); font-weight: 600; }
+.signal-weak { color: var(--yellow); }
+.signal-none { color: var(--muted); }
+.card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+.card:hover { border-color: var(--accent); }
+.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.card-token { font-size: 16px; font-weight: 700; }
+.card-meta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+.card-kline { width: 100%; height: 160px; border: 0; border-radius: 4px; margin-bottom: 8px; }
+.card-metrics { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-bottom: 4px; }
+.card-metrics .metric { display: flex; flex-direction: column; }
+.card-metrics .metric .label { color: var(--muted); font-size: 10px; }
+.card-metrics .metric .value { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+.card-stage2 { border-top: 1px solid var(--border); padding-top: 6px; margin-top: 6px; font-size: 11px; display: flex; gap: 12px; }
+.pagination { display: flex; justify-content: center; gap: 8px; margin-top: 12px; align-items: center; }
+.pagination button { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.pagination button:hover { background: var(--accent); color: #fff; }
+.pagination button:disabled { opacity: 0.3; cursor: default; }
+.pagination span { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/strategies">📈 运行策略</a>
+  <div class="nav-dropdown">
+    <a href="#">🤖 Agent 面板 ▾</a>
+    <div class="nav-dropdown-content">
+      <a href="/agent">Agent-合约扫描</a>
+      <a href="/heat-agent">Agent-热度榜单</a>
+      <a href="/agent-heat-lessons">Agent-热度有教训</a>
+      <a href="/agent-nl">Agent-无教训</a>
+      <a href="/agent-short">Agent-做空</a>
+      <a href="/agent-kol">Agent-KOL 监控</a>
+      <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
+    </div>
+  </div>
+  <a href="/dashboard">📊 市场全景</a>
+  <a href="/onchain" class="active">🔍 链上监控</a>
+  <a href="/settings">⚙ 系统设置</a>
+</div>
+
+<h1>链上监控 — Stage 1 吸筹 & Stage 2 启动准备</h1>
+
+<!-- Panel 1: Scanner Status -->
+<div class="panel" id="status-panel">
+  <h2>扫描状态</h2>
+  <div class="stat-row">
+    <div class="stat-item"><span class="stat-label">状态</span><span class="stat-value" id="st-stage">--</span></div>
+    <div class="stat-item"><span class="stat-label">轮次</span><span class="stat-value" id="st-round">--</span></div>
+    <div class="stat-item"><span class="stat-label">已扫描</span><span class="stat-value" id="st-scanned">--</span></div>
+    <div class="stat-item"><span class="stat-label">观察池</span><span class="stat-value" id="st-pool">--</span></div>
+    <div class="stat-item"><span class="stat-label">可建仓</span><span class="stat-value" id="st-action">--</span></div>
+  </div>
+  <div style="color:var(--muted);font-size:12px" id="st-detail">--</div>
+</div>
+
+<!-- Panel 2: Observation Pool -->
+<div class="panel">
+  <h2>观察池 (Stage 1 — 吸筹检测)</h2>
+  <div id="obs-grid"><div class="empty">加载中...</div></div>
+  <div class="pagination" id="obs-pager"></div>
+</div>
+
+<!-- Panel 3: Actionable -->
+<div class="panel">
+  <h2>可建仓 (Stage 2 — 启动准备)</h2>
+  <div id="act-grid"><div class="empty">加载中...</div></div>
+  <div class="pagination" id="act-pager"></div>
+</div>
+
+<script>
+async function loadOnchain() {
+  try {
+    const [stResp, obsResp, actResp] = await Promise.all([
+      fetch('/api/onchain/status'),
+      fetch('/api/onchain/pool?stage=observation'),
+      fetch('/api/onchain/pool?stage=actionable')
+    ]);
+    const st = await stResp.json();
+    const obs = await obsResp.json();
+    const act = await actResp.json();
+    renderStatus(st);
+    renderPool('obs-grid', 'obs-pager', obs, 'observation');
+    renderPool('act-grid', 'act-pager', act, 'actionable');
+  } catch(e) {
+    console.error('loadOnchain:', e);
+  }
+}
+
+function renderStatus(st) {
+  if (!st) return;
+  const stageEl = document.getElementById('st-stage');
+  stageEl.textContent = st.stage || '--';
+  const dot = (st.stage === 'idle') ? 'idle' : (st.stage === 'error' ? 'error' : 'running');
+  stageEl.innerHTML = '<span class="status-dot '+dot+'"></span>' + stageEl.textContent;
+  document.getElementById('st-round').textContent = '#' + (st.round_number || 0);
+  document.getElementById('st-scanned').textContent = st.tokens_scanned || 0;
+  document.getElementById('st-pool').textContent = st.pool_size || 0;
+  document.getElementById('st-action').textContent = st.actionable_size || 0;
+  document.getElementById('st-detail').textContent = st.detail || '';
+}
+
+function renderPool(gridId, pagerId, data, stage) {
+  const grid = document.getElementById(gridId);
+  const pager = document.getElementById(pagerId);
+  if (!data || !data.length) {
+    grid.innerHTML = '<div class="empty">暂无' + (stage === 'observation' ? '观察池' : '可建仓') + '候选</div>';
+    pager.innerHTML = '';
+    return;
+  }
+
+  const perPage = 4;
+  const totalPages = Math.ceil(data.length / perPage);
+  let page = parseInt(grid.getAttribute('data-page') || '0');
+  if (page >= totalPages) page = 0;
+  grid.setAttribute('data-page', page);
+
+  const items = data.slice(page * perPage, page * perPage + perPage);
+  const parts = ['<div class="card-grid">'];
+  for (const p of items) {
+    const sym = 'BINANCE:' + p.token + 'USDT';
+    const eff = p.effective_concentration ? p.effective_concentration.toFixed(1) : '--';
+    const top10 = p.surface_top10_pct ? p.surface_top10_pct.toFixed(1) : '--';
+    const fund = p.fund_source_same_pct ? p.fund_source_same_pct.toFixed(1) : '--';
+    const days = p.days_in_pool ? p.days_in_pool.toFixed(1) : '0.0';
+    const spark = sparklineSVG(p.sparkline || []);
+
+    let stageRow = '';
+    if (stage === 'actionable') {
+      const lp = p.lp_reserve_trend || '--';
+      const gas = p.gas_seeding_signal >= 2 ? '<span class="signal-strong">强</span>' : (p.gas_seeding_signal >= 1 ? '<span class="signal-weak">弱</span>' : '<span class="signal-none">--</span>');
+      const cex = p.cex_staging_signal >= 2 ? '<span class="signal-strong">强</span>' : (p.cex_staging_signal >= 1 ? '<span class="signal-weak">弱</span>' : '<span class="signal-none">--</span>');
+      const conf = p.confidence_score ? p.confidence_score.toFixed(0) + '%' : '--';
+      stageRow = '<div class="card-stage2"><span>LP: ' + lp + '</span><span>Gas: ' + gas + '</span><span>CEX: ' + cex + '</span><span>置信度: <b>' + conf + '</b></span></div>';
+    }
+
+    const badge = stage === 'actionable'
+      ? '<span class="badge badge-purple">🎯可建仓</span>'
+      : (p.divergence_detected ? '<span class="badge badge-green">●观察</span>' : '<span class="badge badge-yellow">--</span>');
+
+    parts.push('<div class="card">' +
+      '<div class="card-header">' +
+        '<span class="card-token">' + esc(p.token) + '</span>' +
+        '<div class="card-meta">' + esc(p.chain) + ' ' + badge + ' ' + days + 'd</div>' +
+      '</div>' +
+      '<iframe class="card-kline" src="https://s.tradingview.com/widgetembed/?symbol=' + sym + '&interval=60&theme=dark&style=1&width=100%25&height=100%25&hide_side_toolbar=1&withdateranges=0&save_image=0&studies="></iframe>' +
+      '<div class="card-metrics">' +
+        '<div class="metric"><div class="label">表层Top10</div><div class="value">' + top10 + '%</div></div>' +
+        '<div class="metric"><div class="label">资金同源</div><div class="value">' + fund + '%</div></div>' +
+        '<div class="metric"><div class="label">有效集中度</div><div class="value">' + eff + '%</div></div>' +
+        '<div class="metric"><div class="label">趋势</div><div class="value">' + spark + '</div></div>' +
+      '</div>' +
+      stageRow +
+    '</div>');
+  }
+  // Fill empty slots to maintain grid
+  for (let i = items.length; i < perPage; i++) {
+    parts.push('<div class="card" style="visibility:hidden"></div>');
+  }
+  parts.push('</div>');
+  grid.innerHTML = parts.join('');
+
+  // Pagination
+  let pHtml = '';
+  pHtml += '<button ' + (page === 0 ? 'disabled' : '') + ' onclick="goPage(' + "'" + gridId + "','" + pagerId + "','" + stage + "'," + (page - 1) + ')">◀</button>';
+  pHtml += '<span>' + (page + 1) + ' / ' + totalPages + '</span>';
+  pHtml += '<button ' + (page >= totalPages - 1 ? 'disabled' : '') + ' onclick="goPage(' + "'" + gridId + "','" + pagerId + "','" + stage + "'," + (page + 1) + ')">▶</button>';
+  pager.innerHTML = pHtml;
+}
+
+function goPage(gridId, pagerId, stage, page) {
+  document.getElementById(gridId).setAttribute('data-page', page);
+  loadOnchain();
+}
+
+function sparklineSVG(values) {
+  if (!values || values.length < 2) return '--';
+  const valid = values.filter(v => v != null);
+  if (valid.length < 2) return '--';
+  const min = Math.min(...valid);
+  const max = Math.max(...valid);
+  const range = max - min || 1;
+  const h = 20, w = valid.length * 8;
+  let points = '';
+  for (let i = 0; i < valid.length; i++) {
+    const x = (i / (valid.length - 1)) * w;
+    const y = h - ((valid[i] - min) / range) * h;
+    points += x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+  }
+  const trend = valid[valid.length-1] > valid[0] ? '↑' : (valid[valid.length-1] < valid[0] ? '↓' : '→');
+  const color = trend === '↑' ? '#3fb950' : (trend === '↓' ? '#f85149' : '#d2991d');
+  return '<svg width="' + w + '" height="' + h + '" style="vertical-align:middle"><polyline points="' + points.trim() + '" fill="none" stroke="' + color + '" stroke-width="1.5"/></svg> ' + trend + ' ' + valid[valid.length-1].toFixed(1) + '%';
+}
+
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+loadOnchain();
+setInterval(loadOnchain, 60000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/onchain", response_class=HTMLResponse)
+def onchain_page():
+    return HTMLResponse(
+        content=ONCHAIN_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
 
 
 @app.get("/strategies", response_class=HTMLResponse)

@@ -165,8 +165,11 @@ def build_heat_scores(
     sent_w = getattr(config, "OKX_SENTIMENT_WEIGHT", 0.6)
 
     scores = []
+    excluded = getattr(config, "EXCLUDED_TOKENS", set())
     for v in vol_data:
         token = v["token"]
+        if token in excluded:
+            continue
         sent = sentiment_data.get(token, {})
 
         vol_rank = int(v.get("vol_rank", 50))
@@ -221,6 +224,175 @@ def fetch_okx_heat_scores(top_n: int = None) -> list[dict]:
               f"mentions={s['mentions']:5d}  posts={s['unique_posts']:4d}  "
               f"likes={s['total_likes']:5d}", flush=True)
     return scores
+
+
+# ============================================================
+# 链上监控 — OnchainOS CLI Wrappers
+# ============================================================
+
+def fetch_hot_tokens(chain: str = None, mc_min: float = 500000,
+                     limit: int = 50, price_min: float = None,
+                     price_max: float = None) -> list[dict]:
+    """Stage 1 Step A: 扫描横盘代币。chain=None=全链"""
+    args = [
+        _ONCHAINOS_CMD, "token", "hot-tokens",
+        "--rank-by", "5",
+        "--time-frame", "4",
+        "--limit", str(limit),
+        "--market-cap-min", str(int(mc_min)),
+        "--risk-filter", "true",
+    ]
+    if chain:
+        args += ["--chain", chain]
+    if price_min is not None:
+        args += ["--price-change-min", str(int(price_min))]
+    if price_max is not None:
+        args += ["--price-change-max", str(int(price_max))]
+    data = _run_okx(args, timeout=30)
+    if not data or not data.get("ok"):
+        return []
+    result = []
+    for t in data.get("data", []):
+        try:
+            result.append({
+                "token": (t.get("tokenSymbol") or "").upper(),
+                "token_address": t.get("tokenContractAddress", ""),
+                "token_name": t.get("tokenName", ""),
+                "chain": _chain_name(t.get("chainIndex", "")),
+                "hot_rank": t.get("cursor"),
+                "top10_hold_pct": float(t.get("top10HoldPercent") or 0),
+                "holders_count": int(t.get("holders") or 0),
+                "market_cap_usd": float(t.get("marketCap") or 0),
+            })
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+def fetch_cluster_overview(token_address: str, chain: str = "bsc") -> dict | None:
+    """返回聚类概览：clusterConcentration, holderSameFundSourcePercent 等"""
+    data = _run_okx([
+        _ONCHAINOS_CMD, "token", "cluster-overview",
+        "--address", token_address,
+        "--chain", chain,
+    ], timeout=20)
+    if not data or not data.get("ok"):
+        return None
+    d = data.get("data", {})
+    # OnchainOS cluster-overview 返回小数 (0-1)，统一转为百分比 (0-100)
+    return {
+        "cluster_concentration": d.get("clusterConcentration", ""),
+        "top100_holdings_pct": _pct(d.get("top100HoldingsPercent")),
+        "holder_same_fund_pct": _pct(d.get("holderSameFundSourcePercent")),
+        "holder_new_addr_pct": _pct(d.get("holderNewAddressPercent")),
+        "holder_same_creation_pct": _pct(d.get("holderSameCreationTimePercent")),
+        "rug_pull_pct": _pct(d.get("rugPullPercent")),
+    }
+
+
+def fetch_cluster_list(token_address: str, chain: str = "bsc") -> list[dict] | None:
+    """返回所有聚类详情，包含 per-address isExchange/isContract/isKol"""
+    data = _run_okx([
+        _ONCHAINOS_CMD, "token", "cluster-list",
+        "--address", token_address,
+        "--chain", chain,
+    ], timeout=20)
+    if not data or not data.get("ok"):
+        return None
+    clusters = data.get("data", {}).get("clusterList", [])
+    result = []
+    for c in clusters:
+        addrs = []
+        for a in c.get("clusterAddressList", []):
+            addrs.append({
+                "address": a.get("address", ""),
+                "address_rank": a.get("addressRank"),
+                "holding_percent": _safe_float(a.get("holdingPercent")),
+                "is_exchange": a.get("isExchange", False),
+                "is_contract": a.get("isContract", False),
+                "is_kol": a.get("isKol", False),
+            })
+        result.append({
+            "holding_percent": _safe_float(c.get("holdingPercent")),
+            "trend_type": c.get("trendType", []),
+            "pnl_percent": _safe_float(c.get("pnlPercent")),
+            "addresses": addrs,
+        })
+    return result
+
+
+def fetch_advanced_info(token_address: str, chain: str = "bsc") -> dict | None:
+    """返回代币详细信息：top10HoldPercent, riskControlLevel, tokenTags 等"""
+    data = _run_okx([
+        _ONCHAINOS_CMD, "token", "advanced-info",
+        "--address", token_address,
+        "--chain", chain,
+    ], timeout=20)
+    if not data or not data.get("ok"):
+        return None
+    d = data.get("data", {})
+    return {
+        "top10_hold_pct": _safe_float(d.get("top10HoldPercent")),
+        "dev_hold_pct": _safe_float(d.get("devHoldingPercent")),
+        "bundle_hold_pct": _safe_float(d.get("bundleHoldingPercent")),
+        "risk_level": d.get("riskControlLevel", ""),
+        "token_tags": d.get("tokenTags", []),
+    }
+
+
+def fetch_liquidity(token_address: str, chain: str = "bsc", token_symbol: str = None) -> dict | None:
+    """返回 LP 流动性池详情（用于跟踪储备变化），可选过滤目标代币"""
+    data = _run_okx([
+        _ONCHAINOS_CMD, "token", "liquidity",
+        "--address", token_address,
+        "--chain", chain,
+    ], timeout=20)
+    if not data or not data.get("ok"):
+        return None
+    pools = data.get("data", [])
+    total_token_amount = 0.0
+    for p in pools:
+        for amt in p.get("liquidityAmount", []):
+            # 若指定了 symbol，只累加匹配的 token 数量（避免 WBNB/USDT 混入）
+            if token_symbol and amt.get("tokenSymbol", "").upper() != token_symbol.upper():
+                continue
+            total_token_amount += _safe_float(amt.get("tokenAmount")) or 0.0
+    return {
+        "total_token_amount": total_token_amount,
+        "pool_count": len(pools),
+        "raw_pools": pools,
+    }
+
+
+def _chain_name(idx) -> str:
+    """chainIndex 数字 → 链名"""
+    return {
+        "1": "ethereum", "56": "bsc", "137": "polygon",
+        "42161": "arbitrum", "10": "optimism", "8453": "base",
+        "501": "solana", "196": "xlayer", "324": "zksync",
+        "43114": "avalanche", "100": "gnosis", "1101": "polygon_zkevm",
+        "5000": "mantle", "59144": "linea", "204": "opbnb",
+        "81457": "blast", "1088": "metis", "534352": "scroll",
+        "17000": "holesky", "11155111": "sepolia",
+    }.get(str(idx), str(idx))
+
+
+def _safe_float(val) -> float | None:
+    """安全转 float，遇空值和 '--' 返回 None"""
+    if val is None or val == "" or val == "--":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _pct(val) -> float | None:
+    """安全转百分比：小数 (0-1) → 百分比 (0-100)"""
+    v = _safe_float(val)
+    if v is None:
+        return None
+    return round(v * 100, 2)
 
 
 if __name__ == "__main__":
