@@ -269,6 +269,32 @@ def fetch_hot_tokens(chain: str = None, mc_min: float = 500000,
     return result
 
 
+def search_token_address(symbol: str, chain: str = "bsc") -> dict | None:
+    """Alpha 集群查询：根据 Token 符号查合约地址"""
+    data = _run_okx([
+        _ONCHAINOS_CMD, "token", "hot-tokens",
+        "--chain", chain,
+        "--limit", "100",
+        "--market-cap-min", "100000",
+        "--price-change-min", "-99",
+        "--price-change-max", "99999",
+    ], timeout=30)
+    if not data or not data.get("ok"):
+        return None
+    for t in data.get("data", []):
+        if (t.get("tokenSymbol") or "").upper() == symbol.upper():
+            return {
+                "token": symbol.upper(),
+                "token_address": t.get("tokenContractAddress", ""),
+                "token_name": t.get("tokenName", ""),
+                "chain": _chain_name(t.get("chainIndex", "")),
+                "top10_hold_pct": float(t.get("top10HoldPercent") or 0),
+                "holders_count": int(t.get("holders") or 0),
+                "market_cap_usd": float(t.get("marketCap") or 0),
+            }
+    return None
+
+
 def fetch_cluster_overview(token_address: str, chain: str = "bsc") -> dict | None:
     """返回聚类概览：clusterConcentration, holderSameFundSourcePercent 等"""
     data = _run_okx([
@@ -290,15 +316,17 @@ def fetch_cluster_overview(token_address: str, chain: str = "bsc") -> dict | Non
     }
 
 
-def fetch_cluster_list(token_address: str, chain: str = "bsc") -> list[dict] | None:
-    """返回所有聚类详情，包含 per-address isExchange/isContract/isKol"""
+def fetch_cluster_list(token_address: str, chain: str = "bsc") -> tuple[list[dict] | None, str | None]:
+    """返回所有聚类详情，包含 per-address isExchange/isContract/isKol。
+    Returns (parsed_list, raw_json_string) — raw_json 保留原始返回的全部字段。"""
     data = _run_okx([
         _ONCHAINOS_CMD, "token", "cluster-list",
         "--address", token_address,
         "--chain", chain,
     ], timeout=20)
     if not data or not data.get("ok"):
-        return None
+        return None, None
+    raw_json = json.dumps(data, ensure_ascii=False)
     clusters = data.get("data", {}).get("clusterList", [])
     result = []
     for c in clusters:
@@ -318,7 +346,7 @@ def fetch_cluster_list(token_address: str, chain: str = "bsc") -> list[dict] | N
             "pnl_percent": _safe_float(c.get("pnlPercent")),
             "addresses": addrs,
         })
-    return result
+    return result, raw_json
 
 
 def fetch_advanced_info(token_address: str, chain: str = "bsc") -> dict | None:
@@ -393,6 +421,36 @@ def _pct(val) -> float | None:
     if v is None:
         return None
     return round(v * 100, 2)
+
+
+# ============================================================
+# 集群监控 Phase 2 — trades CLI wrappers
+# ============================================================
+
+def fetch_wallet_analysis(address: str, chain: str = "bsc") -> dict | None:
+    """workflow wallet-analysis — 持仓+7d/30d行为+交易明细"""
+    data = _run_okx([
+        _ONCHAINOS_CMD, "workflow", "wallet-analysis",
+        "--address", address, "--chain", chain,
+    ], timeout=25)
+    if not data or not data.get("ok"):
+        return None
+    return data.get("data", {})
+
+
+def fetch_token_trades(token_address: str, chain: str = "bsc",
+                       wallet_filter: list[str] = None) -> list[dict] | None:
+    """token trades — DEX 交易记录，可按地址过滤（最多 10 个地址）"""
+    args = [
+        _ONCHAINOS_CMD, "token", "trades",
+        "--address", token_address, "--chain", chain, "--limit", "100",
+    ]
+    if wallet_filter:
+        args += ["--wallet-filter", ",".join(wallet_filter[:10])]
+    data = _run_okx(args, timeout=25)
+    if not data or not data.get("ok"):
+        return None
+    return data.get("data", [])
 
 
 if __name__ == "__main__":

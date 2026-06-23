@@ -3,6 +3,7 @@
 后台 daemon 线程，每 N 小时全量扫描 BSC 代币
 """
 import time
+import json
 from datetime import datetime, timezone
 import config
 import storage
@@ -11,6 +12,8 @@ from okx_source import (
     fetch_cluster_overview,
     fetch_cluster_list,
     fetch_liquidity,
+    fetch_wallet_analysis,
+    fetch_token_trades,
 )
 from market import has_perpetual
 
@@ -65,22 +68,34 @@ def run_round():
         price_min=getattr(config, "ONCHAIN_PRICE_CHANGE_MIN", -5),
         price_max=getattr(config, "ONCHAIN_PRICE_CHANGE_MAX", 5),
     )
-    if not candidates:
-        print("[onchain] Step A: 无候选代币")
-        _write_status(stage="idle", detail="无候选代币",
-                      round_number=round_number, last_scan_end=_utcnow(),
-                      tokens_scanned=0, candidates_found=0)
-        return
 
-    print(f"[onchain] Step A: {len(candidates)} 个候选代币（横盘）")
+    # 排除已晋级的 token（不再重复检测）
+    if candidates:
+        try:
+            with storage.get_conn(config.ONCHAIN_DB) as conn:
+                actionable = {r["token"] for r in storage.onchain_pool_get_all(conn, "actionable")}
+            before = len(candidates)
+            candidates = [c for c in candidates if c["token"] not in actionable]
+            skipped = before - len(candidates)
+            if skipped:
+                print(f"[onchain] Step A: 跳过 {skipped} 个已在建仓池的 token")
+        except Exception:
+            pass
+
+    if not candidates:
+        print("[onchain] Step A: 无新候选代币，仅刷新观察池")
+
+    if candidates:
+        print(f"[onchain] Step A: {len(candidates)} 个候选代币（横盘）")
 
     _write_status(stage="analyzing",
-                  detail=f"Step B: 聚类分析 {len(candidates)} 个代币...",
+                  detail=f"Step B: 聚类分析 {len(candidates)} 个代币...+ 观察池刷新",
                   tokens_scanned=0, candidates_found=len(candidates))
 
     # ---- Step B: 逐币聚类分析 ----
     snapshots = []
     divergence_tokens = []
+    cluster_records = []
 
     for i, c in enumerate(candidates):
         token = c["token"]
@@ -99,7 +114,7 @@ def run_round():
         overview = fetch_cluster_overview(addr, chain=token_chain)
         time.sleep(0.3)
 
-        cluster_list = fetch_cluster_list(addr, chain=token_chain)
+        cluster_list, cluster_raw = fetch_cluster_list(addr, chain=token_chain)
         time.sleep(0.3)
 
         # 计算有效集中度：过滤交易所+合约后的集群持有量
@@ -111,6 +126,22 @@ def run_round():
                 has_contract = any(a["is_contract"] for a in cl["addresses"])
                 if not has_exchange and not has_contract:
                     effective_conc += cl["holding_percent"] or 0.0
+
+        # 存储集群详情（供集群监控页面使用）
+        if _load_setting("onchain_cluster_enabled", True) and cluster_list:
+            for ci, cl in enumerate(cluster_list):
+                has_ex = any(a["is_exchange"] for a in cl["addresses"])
+                has_ct = any(a["is_contract"] for a in cl["addresses"])
+                cluster_records.append({
+                    "token": token, "token_address": addr,
+                    "chain": token_chain, "cluster_index": ci,
+                    "holding_percent": round((cl["holding_percent"] or 0) * 100, 2),
+                    "trend_type": json.dumps(cl.get("trend_type", [])),
+                    "pnl_percent": cl.get("pnl_percent"),
+                    "address_count": len(cl["addresses"]),
+                    "is_real_cluster": 0 if (has_ex or has_ct) else 1,
+                    "addresses_json": json.dumps(cl["addresses"], ensure_ascii=False),
+                })
 
         fund_pct = (overview or {}).get("holder_same_fund_pct") or 0.0
         top10_pct = c.get("top10_hold_pct") or 0.0
@@ -139,6 +170,7 @@ def run_round():
             "rug_pull_pct": (overview or {}).get("rug_pull_pct"),
             "effective_concentration": round(effective_conc * 100, 2) if effective_conc else None,
             "divergence_score": divergence_score,
+            "cluster_raw_json": cluster_raw,
         }
         snapshots.append(snapshot)
 
@@ -146,21 +178,103 @@ def run_round():
             divergence_tokens.append(snapshot)
             print(f"    ⚡ 背离: fundSrc={fund_pct}% top10={top10_pct}% effConc={snapshot['effective_concentration']}%")
 
+    # ---- Step B2: 观察池 token 补充扫描 ----
+    scanned = {c["token"] for c in candidates}
+    pool_tokens = []
+    black_set = set()
+    try:
+        with storage.get_conn(config.ONCHAIN_DB) as conn:
+            pool_tokens = storage.onchain_pool_get_all(conn, "observation")
+            black_set = {r["token"] for r in storage.onchain_blacklist_get_all(conn)}
+    except Exception:
+        pool_tokens = []
+
+    for pt in pool_tokens:
+        token = pt["token"]
+        if token in scanned or token in black_set:
+            continue
+        addr = pt.get("token_address")
+        if not addr:
+            continue
+        token_chain = pt.get("chain", "bsc")
+        print(f"  [pool] {token} ({token_chain}) 刷新快照...", flush=True)
+
+        overview = fetch_cluster_overview(addr, chain=token_chain)
+        time.sleep(0.3)
+        cluster_list, cluster_raw = fetch_cluster_list(addr, chain=token_chain)
+        time.sleep(0.3)
+
+        effective_conc = 0.0
+        if cluster_list:
+            for cl in cluster_list:
+                has_exchange = any(a["is_exchange"] for a in cl["addresses"])
+                has_contract = any(a["is_contract"] for a in cl["addresses"])
+                if not has_exchange and not has_contract:
+                    effective_conc += cl["holding_percent"] or 0.0
+
+        if _load_setting("onchain_cluster_enabled", True) and cluster_list:
+            for ci, cl in enumerate(cluster_list):
+                has_ex = any(a["is_exchange"] for a in cl["addresses"])
+                has_ct = any(a["is_contract"] for a in cl["addresses"])
+                cluster_records.append({
+                    "token": token, "token_address": addr,
+                    "chain": token_chain, "cluster_index": ci,
+                    "holding_percent": round((cl["holding_percent"] or 0) * 100, 2),
+                    "trend_type": json.dumps(cl.get("trend_type", [])),
+                    "pnl_percent": cl.get("pnl_percent"),
+                    "address_count": len(cl["addresses"]),
+                    "is_real_cluster": 0 if (has_ex or has_ct) else 1,
+                    "addresses_json": json.dumps(cl["addresses"], ensure_ascii=False),
+                })
+
+        fund_pct = (overview or {}).get("holder_same_fund_pct") or 0.0
+
+        snapshot = {
+            "token": token,
+            "token_address": addr,
+            "chain": token_chain,
+            "hot_rank": None,
+            "top10_hold_pct": pt.get("surface_top10_pct") or 0.0,
+            "holders_count": None,
+            "market_cap_usd": None,
+            "cluster_concentration": (overview or {}).get("cluster_concentration", ""),
+            "top100_holdings_pct": (overview or {}).get("top100_holdings_pct"),
+            "holder_same_fund_pct": fund_pct,
+            "holder_new_addr_pct": (overview or {}).get("holder_new_addr_pct"),
+            "holder_same_creation_pct": (overview or {}).get("holder_same_creation_pct"),
+            "rug_pull_pct": (overview or {}).get("rug_pull_pct"),
+            "effective_concentration": round(effective_conc * 100, 2) if effective_conc else None,
+            "divergence_score": 0.0,
+            "cluster_raw_json": cluster_raw,
+        }
+        snapshots.append(snapshot)
+
     # 写快照
     with storage.get_conn(config.ONCHAIN_DB) as conn:
         storage.onchain_snapshot_insert_batch(conn, round_number, snapshots)
         storage.onchain_snapshots_purge_old(conn, keep_last_rounds=50)
+        if cluster_records:
+            storage.onchain_cluster_insert_batch(conn, round_number, cluster_records)
+        keep = _load_setting("onchain_cluster_keep_rounds", 1500)
+        storage._purge_by_round(conn, "onchain_clusters", keep)
+        storage._purge_by_round(conn, "onchain_address_portfolio", keep)
+        storage._purge_by_round(conn, "onchain_wallet_analysis", keep)
+        storage._purge_by_round(conn, "onchain_cluster_trades", keep)
+        storage._purge_by_round(conn, "onchain_cluster_tags", keep)
 
     # ---- Step C: 观察池更新 ----
     pool_updates = 0
     obs_count = act_count = 0
     with storage.get_conn(config.ONCHAIN_DB) as conn:
         existing_pool = {r["token"]: r for r in storage.onchain_pool_get_all(conn)}
+        blacklist = {r["token"] for r in storage.onchain_blacklist_get_all(conn)}
         scan_interval = float(_load_setting("onchain_scan_interval_hours",
                               getattr(config, "ONCHAIN_SCAN_INTERVAL_HOURS", 4)))
 
         for s in divergence_tokens:
             token = s["token"]
+            if token in blacklist:
+                continue
             existing = existing_pool.get(token)
             rounds_in_pool = (existing.get("rounds_in_pool") or 0) + 1 if existing else 1
             days_in_pool = round(rounds_in_pool * scan_interval / 24, 1)
@@ -182,6 +296,37 @@ def run_round():
                 "last_updated_at": _utcnow().isoformat(),
             }
             storage.onchain_pool_upsert(conn, entry)
+            pool_updates += 1
+
+        # ---- Step C2: 刷新已在池中但本轮未背离的 token 快照数据 ----
+        div_set = {s["token"] for s in divergence_tokens}
+        for s in snapshots:
+            token = s["token"]
+            if token not in existing_pool:
+                continue
+            if token in div_set:
+                continue
+
+            existing = existing_pool[token]
+            rounds_in_pool = (existing.get("rounds_in_pool") or 0) + 1
+            days_in_pool = round(rounds_in_pool * scan_interval / 24, 1)
+
+            fresh_top10 = s["top10_hold_pct"] or existing.get("surface_top10_pct") or 0.0
+
+            storage.onchain_pool_upsert(conn, {
+                "token": token,
+                "token_address": s["token_address"],
+                "chain": s.get("chain", "bsc"),
+                "pool_stage": existing.get("pool_stage") or "observation",
+                "surface_top10_pct": fresh_top10,
+                "effective_concentration": s["effective_concentration"],
+                "fund_source_same_pct": s["holder_same_fund_pct"],
+                "divergence_detected": existing.get("divergence_detected", 1),
+                "days_in_pool": days_in_pool,
+                "rounds_in_pool": rounds_in_pool,
+                "first_seen_at": existing.get("first_seen_at"),
+                "last_updated_at": _utcnow().isoformat(),
+            })
             pool_updates += 1
 
         # ---- Step D: 超期清理（基于首次入池时间，而非轮次计数）----
@@ -299,6 +444,14 @@ def run_round():
         except Exception:
             pass
 
+    # ---- Step F: Stage 3 集群标签分析（每 N 轮一次）----
+    if (_load_setting("onchain_cluster_enabled", True) and
+            _load_setting("onchain_cluster_analysis_enabled", True)):
+        interval = int(_load_setting("onchain_cluster_analysis_interval", 1))
+        if round_number % interval == 0:
+            print(f"[onchain] Stage 3: 集群标签分析（第 {round_number} 轮）...", flush=True)
+            _analyze_clusters(round_number)
+
 
 # ============================================================
 # Stage 2 检测函数
@@ -393,7 +546,7 @@ def _check_gas_seeding(addr: str, pool_entry: dict, chain: str = "bsc") -> tuple
 
 def _check_cex_staging(addr: str, pool_entry: dict, chain: str = "bsc") -> int:
     """检测 CEX 充值地址 staging。返回 0=无, 1=弱, 2=强（权重低）"""
-    clusters = fetch_cluster_list(addr, chain)
+    clusters, _ = fetch_cluster_list(addr, chain)
     if not clusters:
         return 0
 
@@ -504,3 +657,196 @@ def scanner_loop():
             print(f"[onchain scanner] 错误: {e}，5 分钟后重试", flush=True)
             _write_status(stage="error", detail=str(e)[:200])
             time.sleep(300)
+
+
+# ============================================================
+# Stage 3 集群标签分析
+# ============================================================
+
+def _insert_tag(round_number, token, cluster_index, tag_type, tag_label, tag_detail=None):
+    try:
+        with storage.get_conn(config.ONCHAIN_DB) as conn:
+            storage.onchain_cluster_tag_insert(conn, {
+                "round_number": round_number, "token": token,
+                "cluster_index": cluster_index, "tag_type": tag_type,
+                "tag_label": tag_label, "tag_detail": tag_detail,
+            })
+    except Exception:
+        pass
+
+
+def _analyze_clusters(round_number):
+    """Stage 3：对观察池/建仓池的每个 token，加载最新 cluster 数据，调 wallet-analysis+trades，计算标签"""
+    pool = []
+    try:
+        with storage.get_conn(config.ONCHAIN_DB) as conn:
+            pool = storage.onchain_pool_get_all(conn, "observation")
+    except Exception:
+        return
+    if not pool:
+        return
+
+    top_n = int(_load_setting("onchain_cluster_top_addresses", 5))
+
+    for pt in pool:
+        token = pt["token"]
+        addr = pt["token_address"]
+        chain = pt.get("chain", "bsc")
+        print(f"  [Stage3] {token}...", flush=True)
+
+        # 1. 读取最新 + 上一轮 cluster 数据
+        clusters_now = []
+        try:
+            with storage.get_conn(config.ONCHAIN_DB) as conn:
+                clusters_now = storage.onchain_clusters_for_token(conn, token, limit_rounds=1)
+                clusters_prev = storage.onchain_clusters_for_token(conn, token, limit_rounds=2)
+        except Exception:
+            continue
+        if not clusters_now:
+            continue
+
+        prev_map = {}
+        if len(clusters_prev) > len(clusters_now):
+            for c in clusters_prev:
+                if c["round_number"] != clusters_now[0]["round_number"]:
+                    prev_map[c["cluster_index"]] = c
+
+        for cl in clusters_now:
+            ci = cl["cluster_index"]
+            if not cl["is_real_cluster"]:
+                continue
+            if (cl["holding_percent"] or 0) < _load_setting("onchain_cluster_min_holding_pct", 1.0):
+                continue
+
+            # ---- 对比上轮变化 ----
+            prev = prev_map.get(ci, {})
+            if prev:
+                hp_now = cl["holding_percent"] or 0
+                hp_prev = prev.get("holding_percent") or 0
+                hp_change = round(hp_now - hp_prev, 2)
+                if hp_change > 0.5:
+                    _insert_tag(round_number, token, ci, "holding_change",
+                               f"增持 +{hp_change}%")
+                elif hp_change < -0.5:
+                    _insert_tag(round_number, token, ci, "holding_change",
+                               f"减持 {hp_change}%")
+                elif abs(hp_change) <= 0.5:
+                    _insert_tag(round_number, token, ci, "holding_change",
+                               "持仓稳定")
+
+            # ---- API 标签（trend_type / pnl）----
+            trend_raw = cl.get("trend_type") or ""
+            if "accumulating" in trend_raw:
+                _insert_tag(round_number, token, ci, "api", "吸筹中")
+            elif "distributing" in trend_raw:
+                _insert_tag(round_number, token, ci, "api", "派发中")
+            if cl.get("pnl_percent") is not None:
+                pnl = cl["pnl_percent"]
+                label = f"集群盈利 +{pnl:.1f}%" if pnl >= 0 else f"集群亏损 {abs(pnl):.1f}%"
+                _insert_tag(round_number, token, ci, "api", label)
+
+            # ---- 2. wallet-analysis（每个地址：存储 + 交叉持仓提取）----
+            addresses_json = cl.get("addresses_json") or "[]"
+            try:
+                addresses = json.loads(addresses_json)
+            except Exception:
+                continue
+            real_addrs = [a for a in addresses
+                         if not a.get("is_exchange") and not a.get("is_contract")]
+            real_addrs = real_addrs[:top_n]
+
+            # ---- 2. wallet-analysis（每个地址：存储 + 交叉持仓提取）----
+            wa_records = []
+            addr_holdings = {}
+            for a in real_addrs:
+                wa = fetch_wallet_analysis(a["address"], chain)
+                time.sleep(0.3)
+                if wa:
+                    trades = wa.get("activities", {}).get("trades", [])
+                    perf_30d = wa.get("performance", {}).get("30d", {})
+                    last_trade = trades[0].get("tradeTime") if trades else None
+                    if last_trade:
+                        try:
+                            last_trade = datetime.fromtimestamp(int(last_trade) / 1000, timezone.utc).isoformat()
+                        except Exception:
+                            last_trade = None
+                    buy_count = int(perf_30d.get("buyTxCount", 0))
+                    sell_count = int(perf_30d.get("sellTxCount", 0))
+                    tv_list = wa.get("totalValue") or []
+                    total_val = float(tv_list[0].get("totalValue", 0)) if tv_list else None
+                    wa_records.append({
+                        "round_number": round_number, "token": token,
+                        "cluster_index": ci, "address": a["address"],
+                        "total_value_usd": total_val,
+                        "buy_count_30d": buy_count,
+                        "sell_count_30d": sell_count,
+                        "buy_volume_30d": float(perf_30d.get("buyTxVolume", 0)),
+                        "sell_volume_30d": float(perf_30d.get("sellTxVolume", 0)),
+                        "avg_buy_value": float(perf_30d.get("avgBuyValueUsd", 0)),
+                        "avg_sell_value": round(float(perf_30d.get("sellTxVolume", 0)) / sell_count, 2) if sell_count > 0 else None,
+                        "realized_pnl": float(perf_30d.get("realizedPnlUsd", 0)),
+                        "win_rate": float(perf_30d.get("winRate", 0)),
+                        "last_trade_time": last_trade,
+                        "analysis_json": json.dumps(wa, ensure_ascii=False),
+                    })
+                    # 提取持仓列表（用于交叉对比）
+                    balances = wa.get("balances") or []
+                    if balances:
+                        tokens_held = set()
+                        for ta in balances[0].get("tokenAssets") or []:
+                            sym = (ta.get("symbol") or "").upper()
+                            if sym:
+                                tokens_held.add(sym)
+                        if tokens_held:
+                            addr_holdings[a["address"]] = tokens_held
+            if wa_records:
+                try:
+                    with storage.get_conn(config.ONCHAIN_DB) as conn:
+                        storage.onchain_wallet_analysis_insert_batch(conn, wa_records)
+                except Exception:
+                    pass
+
+            # ---- 3. 交叉持仓计算 ----
+            if len(addr_holdings) >= 2:
+                common = set.intersection(*addr_holdings.values())
+                common.discard(token.upper())
+                if len(common) >= 3:
+                    _insert_tag(round_number, token, ci, "common_holdings",
+                               f"共持 {len(common)} 个币",
+                               ", ".join(sorted(common)[:8]))
+
+            # ---- 4. trades（批量查集群地址）----
+            addr_list = [a["address"] for a in real_addrs]
+            if addr_list and addr:
+                trades_data = fetch_token_trades(addr, chain, wallet_filter=addr_list)
+                time.sleep(0.3)
+                if trades_data:
+                    try:
+                        with storage.get_conn(config.ONCHAIN_DB) as conn:
+                            storage.onchain_cluster_trades_insert(conn, {
+                                "round_number": round_number, "token": token,
+                                "cluster_index": ci,
+                                "addresses_batch": ",".join(addr_list),
+                                "trades_json": json.dumps(trades_data, ensure_ascii=False),
+                            })
+                    except Exception:
+                        pass
+
+                    sells = [t for t in trades_data
+                            if str(t.get("tradeType", "")) == "2"]
+                    buys = [t for t in trades_data
+                           if str(t.get("tradeType", "")) == "1"]
+                    if not sells:
+                        _insert_tag(round_number, token, ci, "trade_behavior",
+                                   "近期无卖出")
+                    elif len(sells) <= 2:
+                        _insert_tag(round_number, token, ci, "trade_behavior",
+                                   f"少量卖出 ({len(sells)}笔)")
+                    else:
+                        _insert_tag(round_number, token, ci, "trade_behavior",
+                                   f"活跃卖出 ({len(sells)}笔)")
+                    if buys:
+                        _insert_tag(round_number, token, ci, "trade_behavior",
+                                   f"近期买入 ({len(buys)}笔)")
+
+            time.sleep(0.2)

@@ -649,6 +649,7 @@ def _migrate(conn):
     _ensure_columns(conn, "onchain_snapshots", [
         ("divergence_score", "REAL"),
         ("effective_concentration", "REAL"),
+        ("cluster_raw_json", "TEXT"),
     ])
     _ensure_columns(conn, "onchain_scanner_status", [
         ("actionable_size", "INTEGER DEFAULT 0"),
@@ -725,7 +726,129 @@ CREATE TABLE IF NOT EXISTS onchain_pool (
     last_updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     rounds_in_pool          INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS onchain_clusters (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number     INTEGER NOT NULL,
+    token            TEXT NOT NULL,
+    token_address    TEXT NOT NULL,
+    chain            TEXT DEFAULT 'bsc',
+    cluster_index    INTEGER NOT NULL,
+    holding_percent  REAL,
+    trend_type       TEXT,
+    pnl_percent      REAL,
+    address_count    INTEGER,
+    is_real_cluster  INTEGER DEFAULT 1,
+    addresses_json   TEXT,
+    snapshot_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_oc_token_round ON onchain_clusters(token, round_number);
+
+CREATE TABLE IF NOT EXISTS onchain_address_portfolio (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number     INTEGER NOT NULL,
+    token            TEXT NOT NULL,
+    cluster_index    INTEGER NOT NULL,
+    address          TEXT NOT NULL,
+    portfolio_json   TEXT,
+    snapshot_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_oap_token_round ON onchain_address_portfolio(token, round_number);
+
+CREATE TABLE IF NOT EXISTS onchain_wallet_analysis (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number     INTEGER NOT NULL,
+    token            TEXT NOT NULL,
+    cluster_index    INTEGER NOT NULL,
+    address          TEXT NOT NULL,
+    total_value_usd  REAL,
+    buy_count_30d    INTEGER DEFAULT 0,
+    sell_count_30d   INTEGER DEFAULT 0,
+    buy_volume_30d   REAL,
+    sell_volume_30d  REAL,
+    avg_buy_value    REAL,
+    avg_sell_value   REAL,
+    realized_pnl     REAL,
+    win_rate         REAL,
+    last_trade_time  TIMESTAMP,
+    analysis_json    TEXT,
+    snapshot_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_owa_token_round ON onchain_wallet_analysis(token, round_number);
+
+CREATE TABLE IF NOT EXISTS onchain_cluster_trades (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number     INTEGER NOT NULL,
+    token            TEXT NOT NULL,
+    cluster_index    INTEGER NOT NULL,
+    addresses_batch  TEXT,
+    trades_json      TEXT,
+    snapshot_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_oct_token_round ON onchain_cluster_trades(token, round_number);
+
+CREATE TABLE IF NOT EXISTS onchain_cluster_tags (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_number     INTEGER NOT NULL,
+    token            TEXT NOT NULL,
+    cluster_index    INTEGER NOT NULL,
+    tag_type         TEXT NOT NULL,
+    tag_label        TEXT NOT NULL,
+    tag_detail       TEXT,
+    snapshot_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_octag_token ON onchain_cluster_tags(token, round_number);
+
+CREATE TABLE IF NOT EXISTS onchain_blacklist (
+    token       TEXT PRIMARY KEY,
+    added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS onchain_removed (
+    token       TEXT PRIMARY KEY,
+    reason      TEXT DEFAULT 'manual',
+    added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
+
+
+def _onchain_migrate(conn):
+    """onchain.db 增量迁移"""
+    _ensure_columns(conn, "onchain_snapshots", [
+        ("divergence_score", "REAL"),
+        ("effective_concentration", "REAL"),
+        ("cluster_raw_json", "TEXT"),
+    ])
+    _ensure_columns(conn, "onchain_scanner_status", [
+        ("actionable_size", "INTEGER DEFAULT 0"),
+    ])
+    _ensure_columns(conn, "onchain_pool", [
+        ("backtest_winrate", "REAL"),
+        ("confidence_score", "REAL DEFAULT 0"),
+        ("prev_new_addr_pct", "REAL"),
+    ])
+    # 确保黑名单表存在（增量迁移，不影响已有数据）
+    conn.execute("""\
+CREATE TABLE IF NOT EXISTS onchain_blacklist (
+    token       TEXT PRIMARY KEY,
+    added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)""")
+    conn.execute("""\
+CREATE TABLE IF NOT EXISTS onchain_removed (
+    token       TEXT PRIMARY KEY,
+    reason      TEXT DEFAULT 'manual',
+    added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)""")
+
+
+def _purge_by_round(conn, table: str, keep_last_rounds: int = 50):
+    """通用：按 round_number 保留最近 N 轮"""
+    row = conn.execute(
+        f"SELECT DISTINCT round_number FROM {table} ORDER BY round_number DESC LIMIT 1 OFFSET ?",
+        (keep_last_rounds,),
+    ).fetchone()
+    if row:
+        conn.execute(f"DELETE FROM {table} WHERE round_number <= ?", (row[0],))
 
 
 def init_onchain_db():
@@ -734,6 +857,22 @@ def init_onchain_db():
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(_ONCHAIN_DDL)
+        _onchain_migrate(conn)
+
+
+def init_alpha_db():
+    """初始化 Alpha 集群查询独立 DB（仅集群相关表）"""
+    with get_conn(config.ALPHA_CLUSTER_DB) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(_ONCHAIN_DDL)
+
+
+def alpha_clear_token(conn, token: str):
+    """删除 alpha DB 中指定 token 的旧集群数据"""
+    for table in ("onchain_clusters", "onchain_wallet_analysis",
+                  "onchain_cluster_trades", "onchain_cluster_tags"):
+        conn.execute(f"DELETE FROM {table} WHERE token=?", (token,))
 
 
 def init_db():
@@ -1369,6 +1508,13 @@ def trading_settings_defaults() -> dict:
         "onchain_divergence_fund_source_min": getattr(config, "ONCHAIN_DIVERGENCE_FUND_SOURCE_MIN", 30.0),
         "onchain_surface_top10_max": getattr(config, "ONCHAIN_SURFACE_TOP10_MAX", 40.0),
         "onchain_observation_max_days": getattr(config, "ONCHAIN_OBSERVATION_MAX_DAYS", 7),
+        # 集群监控
+        "onchain_cluster_enabled": getattr(config, "ONCHAIN_CLUSTER_ENABLED", True),
+        "onchain_cluster_analysis_enabled": getattr(config, "ONCHAIN_CLUSTER_ANALYSIS_ENABLED", True),
+        "onchain_cluster_analysis_interval": getattr(config, "ONCHAIN_CLUSTER_ANALYSIS_INTERVAL", 1),
+        "onchain_cluster_top_addresses": getattr(config, "ONCHAIN_CLUSTER_TOP_ADDRESSES", 5),
+        "onchain_cluster_min_holding_pct": getattr(config, "ONCHAIN_CLUSTER_MIN_HOLDING_PCT", 1.0),
+        "onchain_cluster_keep_rounds": getattr(config, "ONCHAIN_CLUSTER_KEEP_ROUNDS", 1500),
     }
 
 
@@ -1377,9 +1523,9 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
-        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain"}:
+        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds"}:
             try:
                 settings[row["key"]] = float(raw)
             except (TypeError, ValueError):
@@ -1394,7 +1540,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -2213,15 +2359,15 @@ def onchain_snapshot_insert_batch(conn, round_number: int, snapshots: list[dict]
                 cluster_concentration, top100_holdings_pct,
                 holder_same_fund_pct, holder_new_addr_pct,
                 holder_same_creation_pct, rug_pull_pct,
-                effective_concentration, divergence_score)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                effective_concentration, divergence_score, cluster_raw_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (round_number, s["token"], s["token_address"], s.get("chain", "bsc"),
              s.get("hot_rank"), s.get("top10_hold_pct"), s.get("holders_count"),
              s.get("market_cap_usd"), s.get("cluster_concentration"),
              s.get("top100_holdings_pct"), s.get("holder_same_fund_pct"),
              s.get("holder_new_addr_pct"), s.get("holder_same_creation_pct"),
              s.get("rug_pull_pct"), s.get("effective_concentration"),
-             s.get("divergence_score")),
+             s.get("divergence_score"), s.get("cluster_raw_json")),
         )
 
 
@@ -2288,3 +2434,178 @@ def onchain_lp_snapshots_for_token(conn, token: str, limit: int = 5) -> list[dic
         (token, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---- 集群监控 ----
+
+def onchain_cluster_insert_batch(conn, round_number: int, records: list[dict]):
+    for r in records:
+        conn.execute(
+            """INSERT INTO onchain_clusters
+               (round_number, token, token_address, chain, cluster_index,
+                holding_percent, trend_type, pnl_percent, address_count,
+                is_real_cluster, addresses_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (round_number, r["token"], r["token_address"], r.get("chain", "bsc"),
+             r["cluster_index"], r.get("holding_percent"), r.get("trend_type"),
+             r.get("pnl_percent"), r.get("address_count"),
+             r.get("is_real_cluster", 1), r.get("addresses_json")),
+        )
+
+
+def onchain_clusters_for_token(conn, token: str, limit_rounds: int = 1) -> list[dict]:
+    rows = conn.execute(
+        """SELECT * FROM onchain_clusters WHERE token=?
+           AND round_number IN (SELECT DISTINCT round_number FROM onchain_clusters
+               WHERE token=? ORDER BY round_number DESC LIMIT ?)
+           ORDER BY round_number DESC, cluster_index ASC""",
+        (token, token, limit_rounds),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_address_portfolio_insert_batch(conn, records: list[dict]):
+    for r in records:
+        conn.execute(
+            """INSERT INTO onchain_address_portfolio
+               (round_number, token, cluster_index, address, portfolio_json)
+               VALUES (?,?,?,?,?)""",
+            (r["round_number"], r["token"], r["cluster_index"],
+             r["address"], r.get("portfolio_json")),
+        )
+
+
+def onchain_address_portfolio_for_token(conn, token: str, round_number: int = None) -> list[dict]:
+    if round_number is None:
+        rn_row = conn.execute(
+            "SELECT MAX(round_number) FROM onchain_address_portfolio WHERE token=?",
+            (token,),
+        ).fetchone()
+        if not rn_row or rn_row[0] is None:
+            return []
+        round_number = rn_row[0]
+    rows = conn.execute(
+        "SELECT * FROM onchain_address_portfolio WHERE token=? AND round_number=?",
+        (token, round_number),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_cluster_trades_insert(conn, record: dict):
+    conn.execute(
+        """INSERT INTO onchain_cluster_trades
+           (round_number, token, cluster_index, addresses_batch, trades_json)
+           VALUES (?,?,?,?,?)""",
+        (record["round_number"], record["token"], record["cluster_index"],
+         record.get("addresses_batch"), record.get("trades_json")),
+    )
+
+
+def onchain_cluster_trades_for_token(conn, token: str, round_number: int = None) -> list[dict]:
+    if round_number is None:
+        rn_row = conn.execute(
+            "SELECT MAX(round_number) FROM onchain_cluster_trades WHERE token=?",
+            (token,),
+        ).fetchone()
+        if not rn_row or rn_row[0] is None:
+            return []
+        round_number = rn_row[0]
+    rows = conn.execute(
+        "SELECT * FROM onchain_cluster_trades WHERE token=? AND round_number=?",
+        (token, round_number),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_cluster_tag_insert(conn, tag: dict):
+    conn.execute(
+        """INSERT INTO onchain_cluster_tags
+           (round_number, token, cluster_index, tag_type, tag_label, tag_detail)
+           VALUES (?,?,?,?,?,?)""",
+        (tag["round_number"], tag["token"], tag["cluster_index"],
+         tag["tag_type"], tag["tag_label"], tag.get("tag_detail")),
+    )
+
+
+def onchain_cluster_tags_for_token(conn, token: str, limit_rounds: int = 1) -> list[dict]:
+    rows = conn.execute(
+        """SELECT * FROM onchain_cluster_tags WHERE token=?
+           AND round_number IN (SELECT DISTINCT round_number FROM onchain_cluster_tags
+               WHERE token=? ORDER BY round_number DESC LIMIT ?)
+           ORDER BY round_number DESC, cluster_index ASC""",
+        (token, token, limit_rounds),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_wallet_analysis_insert_batch(conn, records: list[dict]):
+    for r in records:
+        conn.execute(
+            """INSERT INTO onchain_wallet_analysis
+               (round_number, token, cluster_index, address,
+                total_value_usd, buy_count_30d, sell_count_30d,
+                buy_volume_30d, sell_volume_30d, avg_buy_value, avg_sell_value,
+                realized_pnl, win_rate, last_trade_time, analysis_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (r["round_number"], r["token"], r["cluster_index"], r["address"],
+             r.get("total_value_usd"), r.get("buy_count_30d", 0),
+             r.get("sell_count_30d", 0), r.get("buy_volume_30d"),
+             r.get("sell_volume_30d"), r.get("avg_buy_value"), r.get("avg_sell_value"),
+             r.get("realized_pnl"), r.get("win_rate"), r.get("last_trade_time"),
+             r.get("analysis_json")),
+        )
+
+
+def onchain_wallet_analysis_for_token(conn, token: str, round_number: int = None) -> list[dict]:
+    if round_number is None:
+        rn_row = conn.execute(
+            "SELECT MAX(round_number) FROM onchain_wallet_analysis WHERE token=?",
+            (token,),
+        ).fetchone()
+        if not rn_row or rn_row[0] is None:
+            return []
+        round_number = rn_row[0]
+    rows = conn.execute(
+        "SELECT * FROM onchain_wallet_analysis WHERE token=? AND round_number=?",
+        (token, round_number),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---- 黑名单 ----
+
+def onchain_blacklist_get_all(conn) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM onchain_blacklist ORDER BY added_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_blacklist_add(conn, token: str):
+    conn.execute(
+        "INSERT OR REPLACE INTO onchain_blacklist (token) VALUES (?)",
+        (token.upper(),),
+    )
+
+
+def onchain_blacklist_remove(conn, token: str):
+    conn.execute(
+        "DELETE FROM onchain_blacklist WHERE token=?",
+        (token.upper(),),
+    )
+
+
+# ---- 移除名单 ----
+
+def onchain_removed_get_all(conn) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM onchain_removed ORDER BY added_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def onchain_removed_add(conn, token: str, reason: str = "manual"):
+    conn.execute(
+        "INSERT OR REPLACE INTO onchain_removed (token, reason) VALUES (?,?)",
+        (token.upper(), reason),
+    )

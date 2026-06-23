@@ -18,6 +18,13 @@ import uvicorn
 
 import config
 import storage
+from okx_source import (
+    search_token_address,
+    fetch_cluster_overview,
+    fetch_cluster_list,
+    fetch_wallet_analysis,
+    fetch_token_trades,
+)
 import trade_logic
 from analyzer import compute_composite_scores, get_current_heat_scores
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
@@ -631,6 +638,12 @@ class TradingSettingsBody(BaseModel):
     onchain_divergence_fund_source_min: float | None = None
     onchain_surface_top10_max: float | None = None
     onchain_observation_max_days: float | None = None
+    onchain_cluster_enabled: bool | None = None
+    onchain_cluster_analysis_enabled: bool | None = None
+    onchain_cluster_analysis_interval: int | None = None
+    onchain_cluster_top_addresses: int | None = None
+    onchain_cluster_min_holding_pct: float | None = None
+    onchain_cluster_keep_rounds: int | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -922,7 +935,18 @@ def api_trade_market_close(body: TokenBody):
     with storage.get_conn() as conn:
         if not storage.trade_has_active(conn, token):
             raise HTTPException(400, f"{token} 无活跃持仓")
+        onchain_active = conn.execute(
+            "SELECT 1 FROM trade_positions WHERE token=? AND strategy='onchain' AND status IN ('OPEN','PARTIAL','PENDING')",
+            (token,),
+        ).fetchone()
         result = trade_logic.manual_close_on_unwatch(conn, token)
+    if result.get("ok") and onchain_active:
+        try:
+            with storage.get_conn(config.ONCHAIN_DB) as oc:
+                oc.execute("DELETE FROM onchain_pool WHERE token=? AND pool_stage='actionable'", (token,))
+                storage.onchain_removed_add(oc, token, "closed")
+        except Exception:
+            pass
     _cache_invalidate()
     return result
 
@@ -1031,7 +1055,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1082,6 +1106,65 @@ def api_onchain_status():
     return {k: (str(v) if isinstance(v, datetime) else v) for k, v in (st or {}).items()}
 
 
+# ---- 链上监控黑名单 ----
+
+@app.get("/api/onchain/blacklist")
+def api_onchain_blacklist():
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        rows = storage.onchain_blacklist_get_all(conn)
+    for r in rows:
+        for k, v in r.items():
+            if isinstance(v, datetime):
+                r[k] = str(v)
+    return rows
+
+
+@app.post("/api/onchain/blacklist/add")
+def api_onchain_blacklist_add(body: dict):
+    token = (body.get("token") or "").strip().upper()
+    if not token:
+        raise HTTPException(400, "缺少 token")
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        storage.onchain_blacklist_add(conn, token)
+        # 同时从观察池/建仓池移除
+        conn.execute("DELETE FROM onchain_pool WHERE token=?", (token,))
+    return {"ok": True, "token": token}
+
+
+@app.post("/api/onchain/blacklist/remove")
+def api_onchain_blacklist_remove(body: dict):
+    token = (body.get("token") or "").strip().upper()
+    if not token:
+        raise HTTPException(400, "缺少 token")
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        storage.onchain_blacklist_remove(conn, token)
+    return {"ok": True, "token": token}
+
+
+# ---- 链上监控移除名单 ----
+
+@app.get("/api/onchain/removed")
+def api_onchain_removed():
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        rows = storage.onchain_removed_get_all(conn)
+    for r in rows:
+        for k, v in r.items():
+            if isinstance(v, datetime):
+                r[k] = str(v)
+    return rows
+
+
+@app.post("/api/onchain/removed/add")
+def api_onchain_removed_add(body: dict):
+    token = (body.get("token") or "").strip().upper()
+    reason = body.get("reason", "manual")
+    if not token:
+        raise HTTPException(400, "缺少 token")
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        storage.onchain_removed_add(conn, token, reason)
+        conn.execute("DELETE FROM onchain_pool WHERE token=?", (token,))
+    return {"ok": True, "token": token}
+
 @app.get("/api/onchain/pool")
 def api_onchain_pool(stage: str = None):
     with storage.get_conn(config.ONCHAIN_DB) as conn:
@@ -1121,6 +1204,395 @@ def api_onchain_snapshots(token: str = "", limit: int = 10):
             if isinstance(v, datetime):
                 r[k] = str(v)
     return rows
+
+
+@app.get("/api/onchain/clusters")
+def api_onchain_clusters(token: str = ""):
+    """返回指定 token 最新一轮的集群列表 + 地址 + 标签"""
+    if not token:
+        raise HTTPException(400, "缺少 token 参数")
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        clusters = storage.onchain_clusters_for_token(conn, token, limit_rounds=1)
+        tags = storage.onchain_cluster_tags_for_token(conn, token, limit_rounds=1)
+    result = []
+    for c in clusters:
+        c_dict = dict(c)
+        for k, v in c_dict.items():
+            if isinstance(v, datetime):
+                c_dict[k] = str(v)
+        try:
+            c_dict["addresses"] = json.loads(c_dict.get("addresses_json") or "[]")
+        except Exception:
+            c_dict["addresses"] = []
+        c_dict["tags"] = [dict(t) for t in tags if t["cluster_index"] == c["cluster_index"]]
+        for t in c_dict["tags"]:
+            for k, v in t.items():
+                if isinstance(v, datetime):
+                    t[k] = str(v)
+        result.append(c_dict)
+    return result
+
+
+@app.get("/api/onchain/cluster/portfolio")
+def api_onchain_cluster_portfolio(token: str = "", cluster_index: int = 0):
+    """返回指定集群的地址持仓数据"""
+    if not token:
+        raise HTTPException(400, "缺少 token 参数")
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        rows = storage.onchain_address_portfolio_for_token(conn, token)
+    result = []
+    for r in rows:
+        if r["cluster_index"] != cluster_index:
+            continue
+        d = dict(r)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = str(v)
+        try:
+            d["portfolio"] = json.loads(d.get("portfolio_json") or "{}")
+            del d["portfolio_json"]
+        except Exception:
+            d["portfolio"] = {}
+        result.append(d)
+    return result
+
+
+@app.get("/api/onchain/cluster/trades")
+def api_onchain_cluster_trades(token: str = "", cluster_index: int = 0):
+    """返回指定集群的交易记录"""
+    if not token:
+        raise HTTPException(400, "缺少 token 参数")
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        rows = storage.onchain_cluster_trades_for_token(conn, token)
+    result = []
+    for r in rows:
+        if r["cluster_index"] != cluster_index:
+            continue
+        d = dict(r)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = str(v)
+        try:
+            d["trades"] = json.loads(d.get("trades_json") or "[]")
+            del d["trades_json"]
+        except Exception:
+            d["trades"] = []
+        result.append(d)
+    return result
+
+
+@app.get("/api/onchain/cluster/analysis")
+def api_onchain_cluster_analysis(token: str = ""):
+    """返回指定 token 全部集群的钱包分析数据"""
+    if not token:
+        raise HTTPException(400, "缺少 token 参数")
+    with storage.get_conn(config.ONCHAIN_DB) as conn:
+        rows = storage.onchain_wallet_analysis_for_token(conn, token)
+    result = []
+    for r in rows:
+        d = dict(r)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = str(v)
+        result.append(d)
+    return result
+
+
+# ---- Alpha 集群查询 API ----
+
+@app.post("/api/alpha/cluster/fetch")
+def api_alpha_cluster_fetch(body: dict):
+    """按 Token 符号查询集群数据（拉 CLI → 存 DB → 返回）"""
+    token = (body.get("token") or "").strip().upper()
+    chain = body.get("chain", "bsc")
+    if not token:
+        raise HTTPException(400, "缺少 token 参数")
+
+    # 1. 查合约地址
+    info = search_token_address(token, chain)
+    if not info or not info.get("token_address"):
+        raise HTTPException(404, f"未在 {chain} 链找到代币 {token}，请确认符号或手动输入合约地址")
+
+    addr = info["token_address"]
+
+    # 2. 拉集群数据
+    overview = fetch_cluster_overview(addr, chain) or {}
+    cluster_list, _ = fetch_cluster_list(addr, chain)
+    if not cluster_list:
+        return {"token": token, "token_address": addr, "chain": chain,
+                "overview": {"effective_concentration": None, "fund_source_same_pct": None},
+                "clusters": [], "analysis": {}}
+
+    # 0. 加载上次集群持仓（用于 holding_change 对比）
+    prev_hp_map = {}
+    try:
+        with storage.get_conn(config.ALPHA_CLUSTER_DB) as c0:
+            for r in c0.execute(
+                "SELECT cluster_index, holding_percent FROM onchain_clusters WHERE token=?",
+                (token,)
+            ).fetchall():
+                prev_hp_map[r["cluster_index"]] = r["holding_percent"]
+    except Exception:
+        pass
+
+    # 3. 组装集群 + 钱包分析 + 交易记录
+    clusters_out = []
+    analysis_map = {}
+    cluster_trades_map = {}  # ci → trades_list
+    addr_holdings = {}       # address → {symbols}
+
+    for ci, cl in enumerate(cluster_list):
+        has_ex = any(a["is_exchange"] for a in cl["addresses"])
+        has_ct = any(a["is_contract"] for a in cl["addresses"])
+        is_real = 0 if (has_ex or has_ct) else 1
+        holding_pct = round((cl["holding_percent"] or 0) * 100, 2)
+
+        real_addrs = [a for a in cl["addresses"]
+                     if not a.get("is_exchange") and not a.get("is_contract")][:5]
+        for a in real_addrs:
+            time.sleep(0.3)
+            wa = fetch_wallet_analysis(a["address"], chain)
+            if wa:
+                perf = wa.get("performance", {}).get("30d", {})
+                trades = wa.get("activities", {}).get("trades", [])
+                last_trade = trades[0].get("tradeTime") if trades else None
+                if last_trade:
+                    try:
+                        last_trade = datetime.fromtimestamp(int(last_trade) / 1000, timezone.utc).isoformat()
+                    except Exception:
+                        last_trade = None
+                tv_list = wa.get("totalValue") or []
+                analysis_map[a["address"]] = {
+                    "total_value_usd": float(tv_list[0].get("totalValue", 0)) if tv_list else None,
+                    "buy_count_30d": int(perf.get("buyTxCount", 0)),
+                    "sell_count_30d": int(perf.get("sellTxCount", 0)),
+                    "buy_volume_30d": float(perf.get("buyTxVolume", 0)),
+                    "sell_volume_30d": float(perf.get("sellTxVolume", 0)),
+                    "avg_buy_value": float(perf.get("avgBuyValueUsd", 0)),
+                    "avg_sell_value": round(float(perf.get("sellTxVolume", 0)) / max(int(perf.get("sellTxCount", 1)), 1), 2),
+                    "realized_pnl": float(perf.get("realizedPnlUsd", 0)),
+                    "win_rate": float(perf.get("winRate", 0)),
+                    "last_trade_time": last_trade,
+                }
+                # 提取持仓（用于交叉对比）
+                balances = wa.get("balances") or []
+                if balances:
+                    tokens_held = set()
+                    for ta in balances[0].get("tokenAssets") or []:
+                        sym = (ta.get("symbol") or "").upper()
+                        if sym:
+                            tokens_held.add(sym)
+                    if tokens_held:
+                        addr_holdings[a["address"]] = tokens_held
+
+        if real_addrs:
+            time.sleep(0.3)
+            trades_data = fetch_token_trades(addr, chain,
+                                             wallet_filter=[a["address"] for a in real_addrs])
+        else:
+            trades_data = None
+
+        if trades_data:
+            cluster_trades_map[ci] = trades_data
+
+        clusters_out.append({
+            "cluster_index": ci,
+            "holding_percent": holding_pct,
+            "trend_type": cl.get("trend_type", []),
+            "pnl_percent": cl.get("pnl_percent"),
+            "address_count": len(cl["addresses"]),
+            "is_real_cluster": is_real,
+            "addresses": cl["addresses"],
+            "tags": [],
+        })
+
+    # 3.5 标签生成
+    for ci, cl_out in enumerate(clusters_out):
+        cl = cluster_list[ci]
+        tags = cl_out["tags"]
+
+        # api 标签
+        trend_raw = cl.get("trend_type") or []
+        if isinstance(trend_raw, list) and "accumulating" in trend_raw:
+            tags.append({"tag_type": "api", "tag_label": "吸筹中"})
+        elif isinstance(trend_raw, list) and "distributing" in trend_raw:
+            tags.append({"tag_type": "api", "tag_label": "派发中"})
+        if cl.get("pnl_percent") is not None:
+            pnl = cl["pnl_percent"]
+            tags.append({"tag_type": "api", "tag_label": f"集群盈利 +{pnl:.1f}%" if pnl >= 0 else f"集群亏损 {abs(pnl):.1f}%"})
+
+        # holding_change 标签
+        prev_hp = prev_hp_map.get(ci)
+        if prev_hp is not None and cl_out["is_real_cluster"]:
+            hp_change = round(cl_out["holding_percent"] - prev_hp, 2)
+            if hp_change > 0.5:
+                tags.append({"tag_type": "holding_change", "tag_label": f"增持 +{hp_change}%"})
+            elif hp_change < -0.5:
+                tags.append({"tag_type": "holding_change", "tag_label": f"减持 {hp_change}%"})
+            elif abs(hp_change) <= 0.5:
+                tags.append({"tag_type": "holding_change", "tag_label": "持仓稳定"})
+
+        # common_holdings 标签
+        real_addrs_ci = [a["address"] for a in cl_out["addresses"]
+                        if not a.get("is_exchange") and not a.get("is_contract")]
+        holdings_list = [addr_holdings[a] for a in real_addrs_ci if a in addr_holdings]
+        if len(holdings_list) >= 2:
+            common = set.intersection(*holdings_list)
+            common.discard(token)
+            if len(common) >= 3:
+                tags.append({"tag_type": "common_holdings",
+                            "tag_label": f"共持 {len(common)} 个币",
+                            "tag_detail": ", ".join(sorted(common)[:8])})
+
+        # trade_behavior 标签
+        trades = cluster_trades_map.get(ci, [])
+        sells = [t for t in trades if str(t.get("tradeType", "")) == "2"]
+        buys = [t for t in trades if str(t.get("tradeType", "")) == "1"]
+        if not sells:
+            tags.append({"tag_type": "trade_behavior", "tag_label": "近期无卖出"})
+        elif len(sells) <= 2:
+            tags.append({"tag_type": "trade_behavior", "tag_label": f"少量卖出 ({len(sells)}笔)"})
+        else:
+            tags.append({"tag_type": "trade_behavior", "tag_label": f"活跃卖出 ({len(sells)}笔)"})
+        if buys:
+            tags.append({"tag_type": "trade_behavior", "tag_label": f"近期买入 ({len(buys)}笔)"})
+
+    # 4. 写 DB
+    eff_conc = 0.0
+    for cl in cluster_list:
+        hx = any(a["is_exchange"] for a in cl["addresses"])
+        ct = any(a["is_contract"] for a in cl["addresses"])
+        if not hx and not ct:
+            eff_conc += cl["holding_percent"] or 0.0
+
+    try:
+        storage.init_alpha_db()
+        with storage.get_conn(config.ALPHA_CLUSTER_DB) as conn:
+            storage.alpha_clear_token(conn, token)
+            for ci, cl in enumerate(cluster_list):
+                has_ex = any(a["is_exchange"] for a in cl["addresses"])
+                has_ct = any(a["is_contract"] for a in cl["addresses"])
+                conn.execute(
+                    """INSERT INTO onchain_clusters
+                       (round_number, token, token_address, chain, cluster_index,
+                        holding_percent, trend_type, pnl_percent, address_count,
+                        is_real_cluster, addresses_json)
+                       VALUES (0,?,?,?,?,?,?,?,?,?,?)""",
+                    (token, addr, chain, ci,
+                     round((cl["holding_percent"] or 0) * 100, 2),
+                     json.dumps(cl.get("trend_type", [])),
+                     cl.get("pnl_percent"),
+                     len(cl["addresses"]),
+                     0 if (has_ex or has_ct) else 1,
+                     json.dumps(cl["addresses"], ensure_ascii=False)))
+            # wallet_analysis (正确填写 cluster_index)
+            for ci, cl_out in enumerate(clusters_out):
+                real_addrs_ci = [a["address"] for a in cl_out["addresses"]
+                                if not a.get("is_exchange") and not a.get("is_contract")]
+                for a_addr in real_addrs_ci:
+                    wa = analysis_map.get(a_addr)
+                    if wa:
+                        conn.execute(
+                            """INSERT INTO onchain_wallet_analysis
+                               (round_number, token, cluster_index, address,
+                                total_value_usd, buy_count_30d, sell_count_30d,
+                                buy_volume_30d, sell_volume_30d, avg_buy_value,
+                                avg_sell_value, realized_pnl, win_rate, last_trade_time)
+                               VALUES (0,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (token, ci, a_addr,
+                             wa["total_value_usd"], wa["buy_count_30d"], wa["sell_count_30d"],
+                             wa["buy_volume_30d"], wa["sell_volume_30d"], wa["avg_buy_value"],
+                             wa["avg_sell_value"], wa["realized_pnl"], wa["win_rate"],
+                             wa["last_trade_time"]))
+            # cluster_trades
+            for ci, trades_data in cluster_trades_map.items():
+                cl_out = clusters_out[ci]
+                real_addrs_ci = [a["address"] for a in cl_out["addresses"]
+                                if not a.get("is_exchange") and not a.get("is_contract")]
+                if real_addrs_ci:
+                    conn.execute(
+                        """INSERT INTO onchain_cluster_trades
+                           (round_number, token, cluster_index, addresses_batch, trades_json)
+                           VALUES (0,?,?,?,?)""",
+                        (token, ci, ",".join(real_addrs_ci),
+                         json.dumps(trades_data, ensure_ascii=False)))
+            # tags
+            for ci, cl_out in enumerate(clusters_out):
+                for t in cl_out.get("tags", []):
+                    conn.execute(
+                        """INSERT INTO onchain_cluster_tags
+                           (round_number, token, cluster_index, tag_type, tag_label, tag_detail)
+                           VALUES (0,?,?,?,?,?)""",
+                        (token, ci, t["tag_type"], t["tag_label"], t.get("tag_detail")))
+    except Exception as e:
+        print(f"[alpha] DB 写入失败: {e}")
+
+    overview_out = {
+        "token": token,
+        "token_address": addr,
+        "chain": chain,
+        "top10_hold_pct": info.get("top10_hold_pct"),
+        "market_cap_usd": info.get("market_cap_usd"),
+        "effective_concentration": round(eff_conc * 100, 2) if eff_conc else None,
+        "fund_source_same_pct": overview.get("holder_same_fund_pct"),
+    }
+    return {"overview": overview_out, "clusters": clusters_out, "analysis": analysis_map}
+
+
+@app.get("/api/alpha/clusters")
+def api_alpha_clusters(token: str = ""):
+    """从 Alpha DB 读取集群数据（含标签）"""
+    if not token:
+        raise HTTPException(400, "缺少 token 参数")
+    with storage.get_conn(config.ALPHA_CLUSTER_DB) as conn:
+        rows = conn.execute(
+            "SELECT * FROM onchain_clusters WHERE token=? ORDER BY cluster_index",
+            (token.upper(),)
+        ).fetchall()
+        tag_rows = conn.execute(
+            "SELECT * FROM onchain_cluster_tags WHERE token=?",
+            (token.upper(),)
+        ).fetchall()
+    tags_by_ci = {}
+    for t in tag_rows:
+        td = dict(t)
+        tags_by_ci.setdefault(td["cluster_index"], []).append({
+            "tag_type": td["tag_type"], "tag_label": td["tag_label"],
+            "tag_detail": td.get("tag_detail"),
+        })
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["addresses"] = json.loads(d.get("addresses_json") or "[]")
+        except Exception:
+            d["addresses"] = []
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = str(v)
+        d["tags"] = tags_by_ci.get(r["cluster_index"], [])
+        result.append(d)
+    return result
+
+
+@app.get("/api/alpha/cluster/analysis")
+def api_alpha_cluster_analysis(token: str = ""):
+    """从 Alpha DB 读取钱包分析数据"""
+    if not token:
+        raise HTTPException(400, "缺少 token 参数")
+    with storage.get_conn(config.ALPHA_CLUSTER_DB) as conn:
+        rows = conn.execute(
+            "SELECT * FROM onchain_wallet_analysis WHERE token=?",
+            (token.upper(),)
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = str(v)
+        result.append(d)
+    return result
 
 
 @app.post("/api/trading/reset-strategy")
@@ -3815,7 +4287,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   <div class="grid3">
     <div>
       <label>扫描间隔（小时）</label>
-      <input id="trade-onchain-interval" type="number" min="1" max="24" step="1">
+      <input id="trade-onchain-interval" type="number" min="0.5" max="24" step="0.5">
     </div>
     <div>
       <label>背离阈值（资金同源%）</label>
@@ -3828,6 +4300,43 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
     <div>
       <label>观察池最长天数</label>
       <input id="trade-onchain-max-days" type="number" min="3" max="30" step="1">
+    </div>
+  </div>
+  <div style="color:var(--muted);font-size:11px;margin-top:4px">修改后点击「保存设置」立即生效，无需重启</div>
+</div>
+
+<div class="panel">
+  <h2>集群监控</h2>
+  <div class="grid3">
+    <div>
+      <label>数据采集开关</label>
+      <select id="trade-cluster-enabled">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
+      <label>标签计算开关</label>
+      <select id="trade-cluster-analysis-switch">
+        <option value="true">启用</option>
+        <option value="false">关闭</option>
+      </select>
+    </div>
+    <div>
+      <label>分析间隔（轮）</label>
+      <input id="trade-cluster-interval" type="number" min="1" max="48" step="1">
+    </div>
+    <div>
+      <label>每集群分析地址数</label>
+      <input id="trade-cluster-top-addresses" type="number" min="1" max="20" step="1">
+    </div>
+    <div>
+      <label>最小集群持仓%</label>
+      <input id="trade-cluster-min-holding" type="number" min="0.1" max="10" step="0.1">
+    </div>
+    <div>
+      <label>数据保留轮数</label>
+      <input id="trade-cluster-keep-rounds" type="number" min="50" max="5000" step="50">
     </div>
   </div>
   <div style="color:var(--muted);font-size:11px;margin-top:4px">修改后点击「保存设置」立即生效，无需重启</div>
@@ -4147,6 +4656,12 @@ async function loadSettings() {
     document.getElementById('trade-onchain-fund-min').value = s.onchain_divergence_fund_source_min ?? 30;
     document.getElementById('trade-onchain-top10-max').value = s.onchain_surface_top10_max ?? 40;
     document.getElementById('trade-onchain-max-days').value = s.onchain_observation_max_days ?? 7;
+    document.getElementById('trade-cluster-enabled').value = s.onchain_cluster_enabled ?? true;
+    document.getElementById('trade-cluster-analysis-switch').value = s.onchain_cluster_analysis_enabled ?? true;
+    document.getElementById('trade-cluster-interval').value = s.onchain_cluster_analysis_interval ?? 1;
+    document.getElementById('trade-cluster-top-addresses').value = s.onchain_cluster_top_addresses ?? 5;
+    document.getElementById('trade-cluster-min-holding').value = s.onchain_cluster_min_holding_pct ?? 1.0;
+    document.getElementById('trade-cluster-keep-rounds').value = s.onchain_cluster_keep_rounds ?? 1500;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
@@ -4200,6 +4715,12 @@ async function saveTradingSettings() {
     onchain_divergence_fund_source_min: Number(document.getElementById('trade-onchain-fund-min').value),
     onchain_surface_top10_max: Number(document.getElementById('trade-onchain-top10-max').value),
     onchain_observation_max_days: Number(document.getElementById('trade-onchain-max-days').value),
+    onchain_cluster_enabled: document.getElementById('trade-cluster-enabled').value === 'true',
+    onchain_cluster_analysis_enabled: document.getElementById('trade-cluster-analysis-switch').value === 'true',
+    onchain_cluster_analysis_interval: Number(document.getElementById('trade-cluster-interval').value),
+    onchain_cluster_top_addresses: Number(document.getElementById('trade-cluster-top-addresses').value),
+    onchain_cluster_min_holding_pct: Number(document.getElementById('trade-cluster-min-holding').value),
+    onchain_cluster_keep_rounds: Number(document.getElementById('trade-cluster-keep-rounds').value),
   };
   const oldSource = document.getElementById('trade-data-source').getAttribute('data-original') || '';
   const newSource = body.okx_data_source_enabled ? 'true' : 'false';
@@ -4819,6 +5340,20 @@ const fmtPct = v => (v!=null&&!isNaN(Number(v)))?(v>=0?'+':'')+Number(v).toFixed
 const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=1?Number(v).toFixed(4):Number(v).toFixed(6));
 const fmtTime = ts => { if (!ts) return '—'; try { const d = new Date(ts.replace(' ','T')+'Z'); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); } catch { return ts; } };
 
+async function doClose(token) {
+  if (!confirm(`确认市价平仓 ${token}？`)) return;
+  try {
+    const r = await fetch('/api/trade/market-close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token})
+    });
+    const d = await r.json();
+    if (d.ok) { showToast(`${token} 已平仓`, 'ok'); load(); }
+    else { showToast(`${token} 平仓失败：${d.reason || '未知'}`, 'err'); }
+  } catch(e) { showToast('操作失败：'+e.message, 'err'); }
+}
+
 async function load() {
   try {
     const r = await fetch('/api/strategy/stats');
@@ -4889,7 +5424,7 @@ async function load() {
       if (openList.length) {
         html += `<div class="toggle-section">
           <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📌 当前持仓 (${openList.length}) ▾</div>
-          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th>锁利</th><th class="right">入场</th><th class="right">现价</th><th>入场结构</th><th>最新结构</th><th class="right">仓位</th><th class="right">PnL%</th><th class="right">PnL$</th><th class="right">止损</th><th class="right">TP1</th><th class="right">TP2</th><th>持仓</th><th>类型</th><th>开仓时间</th></tr></thead><tbody>`;
+          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th>锁利</th><th class="right">入场</th><th class="right">现价</th><th>入场结构</th><th>最新结构</th><th class="right">仓位</th><th class="right">PnL%</th><th class="right">PnL$</th><th class="right">止损</th><th class="right">TP1</th><th class="right">TP2</th><th>持仓</th><th>类型</th><th>开仓时间</th><th>操作</th></tr></thead><tbody>`;
         for (const p of openList) {
           const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
           const cq = Number(p.closed_qty||0), tq = Number(p.quantity||0);
@@ -4904,17 +5439,17 @@ async function load() {
           let openTime = '—';
           if (p.created_at) { try { const d = new Date(p.created_at.replace(' ','T')+'Z'); openTime = d.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).replace(/\//g,'-'); } catch(e) {} }
           const orderTypeLabel = p.order_type === 'limit' ? '挂单' : '市价';
-          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td style="color:var(--green);font-size:11px">${lockedPct>0?'🔒'+lockedPct.toFixed(0)+'%':'—'}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td style="font-size:11px">${entryTrend}</td><td style="font-size:11px">${latestTrend}</td><td style="font-size:11px;white-space:nowrap">${posSize}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.unrealized_pnl)}</td><td class="right">${fmtPrice(p.stop_loss_price)}</td><td class="right">${fmtPrice(p.tp1_price)}</td><td class="right">${fmtPrice(p.tp2_price)}</td><td style="font-size:11px;white-space:nowrap">${hold}</td><td style="font-size:11px">${orderTypeLabel}</td><td style="font-size:11px;white-space:nowrap">${openTime}</td></tr>`;
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td style="color:var(--green);font-size:11px">${lockedPct>0?'🔒'+lockedPct.toFixed(0)+'%':'—'}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td style="font-size:11px">${entryTrend}</td><td style="font-size:11px">${latestTrend}</td><td style="font-size:11px;white-space:nowrap">${posSize}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.unrealized_pnl)}</td><td class="right">${fmtPrice(p.stop_loss_price)}</td><td class="right">${fmtPrice(p.tp1_price)}</td><td class="right">${fmtPrice(p.tp2_price)}</td><td style="font-size:11px;white-space:nowrap">${hold}</td><td style="font-size:11px">${orderTypeLabel}</td><td style="font-size:11px;white-space:nowrap">${openTime}</td><td><button onclick="doClose('${p.token}')" style="background:#f85149;color:#fff;border:none;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600">平仓</button></td></tr>`;
         }
         html += `</tbody></table></div></div>`;
       }
       if (closedList.length) {
         html += `<div class="toggle-section">
           <div class="toggle-header" onclick="this.nextElementSibling.classList.toggle('show')">📋 最近平仓 (${closedList.length}) ▾</div>
-          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th class="right">入场</th><th class="right">平仓</th><th class="right">PnL%</th><th class="right">盈亏</th><th>类型</th><th>平仓时间</th></tr></thead><tbody>`;
+          <div class="toggle-body" style="overflow-x:auto"><table><thead><tr><th>代币</th><th>方向</th><th class="right">入场</th><th class="right">平仓</th><th class="right">PnL%</th><th class="right">盈亏</th><th>类型</th><th>平仓时间</th><th>开仓时间</th></tr></thead><tbody>`;
         for (const p of closedList) {
           const pnlCls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
-          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.realized_pnl)}</td><td style="font-size:11px">${p.order_type === 'limit' ? '挂单' : '市价'}</td><td style="font-size:11px;white-space:nowrap">${fmtTime(p.closed_at)}</td></tr>`;
+          html += `<tr><td style="font-weight:bold;color:var(--accent)">${p.token}</td><td>${p.side}</td><td class="right">${fmtPrice(p.entry_price)}</td><td class="right">${fmtPrice(p.current_price)}</td><td class="right ${pnlCls}">${fmtPct(p.pnl_pct)}</td><td class="right ${pnlCls}">${fmtUsd(p.realized_pnl)}</td><td style="font-size:11px">${p.order_type === 'limit' ? '挂单' : '市价'}</td><td style="font-size:11px;white-space:nowrap">${fmtTime(p.closed_at)}</td><td style="font-size:11px;white-space:nowrap">${fmtTime(p.created_at)}</td></tr>`;
         }
         html += `</tbody></table></div></div>`;
       }
@@ -5324,6 +5859,211 @@ loadAll();setInterval(loadAll,15000);
 </script></body></html>"""
 
 
+CLUSTER_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>集群监控</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
+  --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
+  --yellow: #d2991d; --orange: #db6d28; --purple: #a371f7;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; padding: 20px; max-width: 1400px; margin: 0 auto; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin-bottom: 20px; }
+h2 { font-size: 16px; margin-bottom: 12px; color: var(--accent); }
+.nav-bar { display: flex; justify-content: center; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap; }
+.nav-bar a { padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
+.nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+tr:hover { background: rgba(88,166,255,0.04); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; margin-right: 4px; }
+.badge-green { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge-yellow { background: rgba(210,153,29,0.15); color: var(--yellow); }
+.badge-red { background: rgba(248,81,73,0.15); color: var(--red); }
+.badge-blue { background: rgba(88,166,255,0.15); color: var(--accent); }
+.badge-purple { background: rgba(163,113,247,0.15); color: var(--purple); }
+.metric-row { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 8px; }
+.metric { display: flex; gap: 6px; align-items: baseline; }
+.metric .lbl { color: var(--muted); font-size: 12px; }
+.metric .val { font-size: 15px; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+.cluster-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+.cluster-card.real { border-left: 3px solid var(--green); }
+.cluster-card.filtered { border-left: 3px solid var(--muted); opacity: 0.7; }
+.cluster-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; cursor: pointer; }
+.cluster-header .title { font-size: 15px; font-weight: 600; }
+.cluster-body { display: none; }
+.cluster-body.open { display: block; }
+.address-table td { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.tag-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.collapse-icon { font-size: 12px; color: var(--muted); transition: transform 0.2s; }
+.collapse-icon.open { transform: rotate(90deg); }
+</style>
+</head>
+<body>
+
+<div class="nav-bar">
+  <a href="/onchain">🔍 链上监控</a>
+  <a href="/onchain/token" class="active">📋 集群监控</a>
+  <a href="/alpha-cluster">🔬 Alpha 集群</a>
+</div>
+
+<h1 id="page-title">集群监控</h1>
+
+<div class="panel" id="overview-panel">
+  <div class="metric-row" id="overview-metrics"></div>
+</div>
+
+<div id="clusters-container"><div class="panel"><span style="color:var(--muted)">加载中...</span></div></div>
+
+<script>
+const url = new URL(window.location.href);
+const token = url.pathname.split('/').pop().toUpperCase();
+document.getElementById('page-title').textContent = '集群监控 — ' + token;
+
+async function loadCluster() {
+  try {
+    const [clResp, poolResp, anaResp] = await Promise.all([
+      fetch('/api/onchain/clusters?token=' + token),
+      fetch('/api/onchain/pool'),
+      fetch('/api/onchain/cluster/analysis?token=' + token)
+    ]);
+    const clusters = await clResp.json();
+    const pool = await poolResp.json();
+    const analysis = await anaResp.json();
+    const analysisMap = {};
+    for (const a of analysis) { analysisMap[a.address] = a; }
+    const info = (Array.isArray(pool) ? pool : []).find(p => p.token === token);
+    renderOverview(info);
+    renderClusters(clusters, analysisMap);
+  } catch(e) {
+    console.error('loadCluster:', e);
+    document.getElementById('clusters-container').innerHTML = '<div class="panel"><span style="color:var(--red)">加载失败</span></div>';
+  }
+}
+
+function renderOverview(info) {
+  const m = document.getElementById('overview-metrics');
+  if (!info) { m.innerHTML = '<span style="color:var(--muted)">Token 不在观察池中</span>'; return; }
+  const stageBadge = info.pool_stage === 'actionable'
+    ? '<span class="badge badge-purple">🎯可建仓</span>'
+    : '<span class="badge badge-green">●观察池</span>';
+  m.innerHTML =
+    '<div class="metric"><span class="lbl">代币</span><span class="val">' + esc(token) + '</span></div>' +
+    '<div class="metric"><span class="lbl">链</span><span class="val">' + esc(info.chain||'bsc') + '</span></div>' +
+    '<div class="metric"><span class="lbl">状态</span><span class="val">' + stageBadge + '</span></div>' +
+    '<div class="metric"><span class="lbl">入池</span><span class="val">' + (info.days_in_pool||0).toFixed(1) + 'd</span></div>' +
+    '<div class="metric"><span class="lbl">表层Top10</span><span class="val">' + (info.surface_top10_pct||0).toFixed(1) + '%</span></div>' +
+    '<div class="metric"><span class="lbl">资金同源</span><span class="val">' + (info.fund_source_same_pct||0).toFixed(1) + '%</span></div>' +
+    '<div class="metric"><span class="lbl">有效集中度</span><span class="val">' + ((info.effective_concentration||0)).toFixed(1) + '%</span></div>';
+}
+
+function renderClusters(clusters, analysisMap) {
+  const container = document.getElementById('clusters-container');
+  if (!clusters || !clusters.length) {
+    container.innerHTML = '<div class="panel"><span style="color:var(--muted)">暂无集群数据（等待扫描器采集）</span></div>';
+    return;
+  }
+  const visible = clusters.filter(c => (c.holding_percent || 0) > 0);
+  if (!visible.length) {
+    container.innerHTML = '<div class="panel"><span style="color:var(--muted)">暂无有效集群（持仓比例均为 0）</span></div>';
+    return;
+  }
+  let html = '<h2>集群列表 (' + visible.length + ')</h2>';
+  for (const cl of visible) {
+    const isReal = cl.is_real_cluster === 1;
+    const cls = isReal ? 'real' : 'filtered';
+    const label = isReal ? '● 真人' : (cl.addresses_json||'').indexOf('"is_exchange":true') > -1 ? '交易所' : '合约';
+    const openClass = isReal ? ' open' : '';
+    const iconClass = isReal ? ' open' : '';
+
+    // Tags
+    const tags = cl.tags || [];
+    let tagsHtml = '';
+    for (const t of tags) {
+      let cls2 = 'badge-blue';
+      if (t.tag_type === 'holding_change') cls2 = t.tag_label.indexOf('增持') >= 0 ? 'badge-green' : (t.tag_label.indexOf('减持') >= 0 ? 'badge-red' : 'badge-yellow');
+      else if (t.tag_type === 'common_holdings') cls2 = 'badge-purple';
+      else if (t.tag_type === 'trade_behavior') cls2 = t.tag_label.indexOf('无卖出') >= 0 ? 'badge-green' : 'badge-yellow';
+      tagsHtml += '<span class="badge ' + cls2 + '" title="' + esc(t.tag_detail||'') + '">' + esc(t.tag_label) + '</span> ';
+    }
+
+    html += '<div class="cluster-card ' + cls + '">' +
+      '<div class="cluster-header" onclick="toggleCluster(this)">' +
+        '<div>' +
+          '<span class="title">集群 #' + (cl.cluster_index+1) + ' [' + label + ']</span>' +
+          '<span style="margin-left:12px;font-size:13px;color:var(--muted)">控盘 ' + (cl.holding_percent||0).toFixed(1) + '%</span>' +
+          '<span style="margin-left:8px;font-size:13px;color:var(--muted)">' + (cl.pnl_percent != null ? '盈亏 ' + (cl.pnl_percent>=0?'+':'') + cl.pnl_percent.toFixed(1) + '%' : '') + '</span>' +
+          '<span style="margin-left:8px;font-size:13px;color:var(--muted)">' + cl.address_count + ' 地址</span>' +
+        '</div>' +
+        '<span class="collapse-icon ' + iconClass + '">▶</span>' +
+      '</div>' +
+      '<div class="tag-row">' + tagsHtml + '</div>' +
+      '<div class="cluster-body ' + openClass + '">' +
+        renderAddressTable(cl.addresses || [], analysisMap) +
+      '</div>' +
+    '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function renderAddressTable(addresses, analysisMap) {
+  if (!addresses || !addresses.length) return '<span style="color:var(--muted);font-size:12px">无地址数据</span>';
+  let h = '<table class="address-table"><tr><th>地址</th><th>排名</th><th>持仓%</th><th>总资产</th><th>总买入/均价</th><th>总卖出/均价</th><th>最后交易</th><th>标签</th></tr>';
+  for (const a of addresses) {
+    const addr = (a.address||'').substring(0, 10) + '...' + (a.address||'').substring((a.address||'').length - 6);
+    const wa = analysisMap[a.address] || {};
+    const tv = wa.total_value_usd ? '$' + (wa.total_value_usd/1000).toFixed(0) + 'K' : '--';
+    const buy = wa.buy_count_30d != null ? wa.buy_count_30d + '笔/$' + (wa.avg_buy_value||0).toFixed(0) : '--';
+    const sell = wa.sell_count_30d != null ? wa.sell_count_30d + '笔/$' + (wa.avg_sell_value||0).toFixed(0) : '--';
+    const lastTrade = wa.last_trade_time ? wa.last_trade_time.substring(0, 10) : '--';
+    const tags = [];
+    if (a.is_exchange) tags.push('<span class="badge badge-yellow">EX</span>');
+    if (a.is_contract) tags.push('<span class="badge badge-yellow">CT</span>');
+    if (a.is_kol) tags.push('<span class="badge badge-purple">KOL</span>');
+    if (wa.buy_count_30d > 0 && wa.sell_count_30d === 0) tags.push('<span class="badge badge-green">纯买入</span>');
+    if (wa.realized_pnl > 0) tags.push('<span class="badge badge-green">盈利</span>');
+    h += '<tr>' +
+      '<td title="' + esc(a.address||'') + '">' + esc(addr) + '</td>' +
+      '<td>#' + (a.address_rank||'--') + '</td>' +
+      '<td>' + ((a.holding_percent||0)*100).toFixed(2) + '%</td>' +
+      '<td>' + tv + '</td>' +
+      '<td>' + buy + '</td>' +
+      '<td>' + sell + '</td>' +
+      '<td>' + lastTrade + '</td>' +
+      '<td>' + tags.join(' ') + '</td>' +
+    '</tr>';
+  }
+  h += '</table>';
+  return h;
+}
+
+function toggleCluster(el) {
+  const card = el.parentElement;
+  const body = card.querySelector('.cluster-body');
+  const icon = card.querySelector('.collapse-icon');
+  body.classList.toggle('open');
+  icon.classList.toggle('open');
+}
+
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+loadCluster();
+setInterval(loadCluster, 60000);
+</script>
+</body>
+</html>
+"""
+
+
 ONCHAIN_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -5382,7 +6122,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
 .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .card-token { font-size: 16px; font-weight: 700; }
 .card-meta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
-.card-kline { width: 100%; height: 160px; border: 0; border-radius: 4px; margin-bottom: 8px; }
+.card-kline { width: 100%; height: 280px; border: 0; border-radius: 4px; margin-bottom: 8px; }
 .card-metrics { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-bottom: 4px; }
 .card-metrics .metric { display: flex; flex-direction: column; }
 .card-metrics .metric .label { color: var(--muted); font-size: 10px; }
@@ -5414,6 +6154,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
   </div>
   <a href="/dashboard">📊 市场全景</a>
   <a href="/onchain" class="active">🔍 链上监控</a>
+  <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -5446,6 +6187,26 @@ tr:hover { background: rgba(88,166,255,0.04); }
   <div class="pagination" id="act-pager"></div>
 </div>
 
+<!-- Blacklist Management -->
+<div class="panel">
+  <h2 style="cursor:pointer" onclick="document.getElementById('blacklist-body').classList.toggle('hidden')">🚫 黑名单管理 ▾</h2>
+  <div id="blacklist-body" class="hidden">
+    <div id="blacklist-table"><span style="color:var(--muted)">加载中...</span></div>
+  </div>
+</div>
+
+<!-- Removed List -->
+<div class="panel">
+  <h2 style="cursor:pointer" onclick="document.getElementById('removed-body').classList.toggle('hidden')">📋 移除名单 ▾</h2>
+  <div id="removed-body" class="hidden">
+    <div id="removed-table"><span style="color:var(--muted)">加载中...</span></div>
+  </div>
+</div>
+
+<style>
+.hidden { display: none; }
+</style>
+
 <script>
 async function loadOnchain() {
   try {
@@ -5460,8 +6221,94 @@ async function loadOnchain() {
     renderStatus(st);
     renderPool('obs-grid', 'obs-pager', obs, 'observation');
     renderPool('act-grid', 'act-pager', act, 'actionable');
+    loadBlacklist();
+    loadRemoved();
   } catch(e) {
     console.error('loadOnchain:', e);
+  }
+}
+
+async function loadBlacklist() {
+  try {
+    const r = await fetch('/api/onchain/blacklist');
+    const list = await r.json();
+    const el = document.getElementById('blacklist-table');
+    if (!list || !list.length) {
+      el.innerHTML = '<span style="color:var(--muted)">黑名单为空</span>';
+      return;
+    }
+    let h = '<table><thead><tr><th>Token</th><th>添加时间</th><th>操作</th></tr></thead><tbody>';
+    for (const b of list) {
+      h += '<tr><td style="font-weight:bold">' + esc(b.token) + '</td><td>' + (b.added_at || '') + '</td>' +
+        '<td><button data-token="' + b.token + '" onclick="removeFromBlacklist(this.dataset.token)" style="background:var(--green);color:#fff;border:none;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">恢复</button></td></tr>';
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  } catch(e) {
+    console.error('loadBlacklist:', e);
+  }
+}
+
+async function addToBlacklist(token) {
+  if (!confirm('将 ' + token + ' 移入黑名单？移入后不会再进入观察池。')) return;
+  try {
+    await fetch('/api/onchain/blacklist/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token})
+    });
+    loadOnchain();
+  } catch(e) {
+    console.error('addToBlacklist:', e);
+  }
+}
+
+async function removeFromBlacklist(token) {
+  if (!confirm('将 ' + token + ' 移出黑名单？移出后可重新进入观察池。')) return;
+  try {
+    await fetch('/api/onchain/blacklist/remove', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token})
+    });
+    loadOnchain();
+  } catch(e) {
+    console.error('removeFromBlacklist:', e);
+  }
+}
+
+async function removeFromActionable(token) {
+  if (!confirm('将 ' + token + ' 从可建仓池移除？')) return;
+  try {
+    await fetch('/api/onchain/removed/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token, reason: 'manual'})
+    });
+    loadOnchain();
+  } catch(e) {
+    console.error('removeFromActionable:', e);
+  }
+}
+
+async function loadRemoved() {
+  try {
+    const r = await fetch('/api/onchain/removed');
+    const list = await r.json();
+    const el = document.getElementById('removed-table');
+    if (!list || !list.length) {
+      el.innerHTML = '<span style="color:var(--muted)">移除名单为空</span>';
+      return;
+    }
+    let h = '<table><thead><tr><th>Token</th><th>原因</th><th>时间</th></tr></thead><tbody>';
+    for (const b of list) {
+      const reason = b.reason === 'closed' ? '平仓' : '手动';
+      h += '<tr><td style="font-weight:bold">' + esc(b.token) + '</td><td>' + reason + '</td><td>' + (b.added_at || '') + '</td></tr>';
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  } catch(e) {
+    console.error('loadRemoved:', e);
   }
 }
 
@@ -5496,7 +6343,7 @@ function renderPool(gridId, pagerId, data, stage) {
   const items = data.slice(page * perPage, page * perPage + perPage);
   const parts = ['<div class="card-grid">'];
   for (const p of items) {
-    const sym = 'BINANCE:' + p.token + 'USDT';
+    const sym = 'BINANCE%3A' + p.token + 'USDT.P';
     const eff = p.effective_concentration ? p.effective_concentration.toFixed(1) : '--';
     const top10 = p.surface_top10_pct ? p.surface_top10_pct.toFixed(1) : '--';
     const fund = p.fund_source_same_pct ? p.fund_source_same_pct.toFixed(1) : '--';
@@ -5518,8 +6365,11 @@ function renderPool(gridId, pagerId, data, stage) {
 
     parts.push('<div class="card">' +
       '<div class="card-header">' +
-        '<span class="card-token">' + esc(p.token) + '</span>' +
-        '<div class="card-meta">' + esc(p.chain) + ' ' + badge + ' ' + days + 'd</div>' +
+        '<span class="card-token"><a href="/onchain/token/' + encodeURIComponent(p.token) + '" style="color:inherit;text-decoration:none" title="查看集群详情">' + esc(p.token) + '</a></span>' +
+        '<div class="card-meta">' + esc(p.chain) + ' ' + badge + ' ' + days + 'd' +
+          (stage === 'observation' ? ' <button data-token="' + p.token + '" onclick="addToBlacklist(this.dataset.token)" title="移入黑名单" style="background:none;border:none;cursor:pointer;font-size:12px;margin-left:4px">🚫</button>' : '') +
+          (stage === 'actionable' ? ' <button data-token="' + p.token + '" onclick="removeFromActionable(this.dataset.token)" title="从可建仓移除" style="background:none;border:none;cursor:pointer;font-size:12px;margin-left:4px">🗑</button>' : '') +
+        '</div>' +
       '</div>' +
       '<iframe class="card-kline" src="https://s.tradingview.com/widgetembed/?symbol=' + sym + '&interval=60&theme=dark&style=1&width=100%25&height=100%25&hide_side_toolbar=1&withdateranges=0&save_image=0&studies="></iframe>' +
       '<div class="card-metrics">' +
@@ -5584,6 +6434,276 @@ setInterval(loadOnchain, 60000);
 def onchain_page():
     return HTMLResponse(
         content=ONCHAIN_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@app.get("/onchain/token/{token}", response_class=HTMLResponse)
+def cluster_page(token: str):
+    return HTMLResponse(
+        content=CLUSTER_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+ALPHA_CLUSTER_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpha 集群查询</title>
+<style>
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --purple: #a371f7; --yellow: #d2991d; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; }
+.nav-bar { display: flex; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.metric-row { display: flex; gap: 20px; flex-wrap: wrap; }
+.metric { display: flex; flex-direction: column; gap: 2px; }
+.metric .lbl { font-size: 11px; color: var(--muted); }
+.metric .val { font-size: 18px; font-weight: 700; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; margin-right: 4px; }
+.badge-green { background: #1a3a2a; color: var(--green); }
+.badge-red { background: #3a1a1a; color: var(--red); }
+.badge-purple { background: #2a1a3a; color: var(--purple); }
+.badge-blue { background: #1a2a3a; color: #58a6ff; }
+.badge-yellow { background: #3a2a1a; color: var(--yellow); }
+.cluster-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+.cluster-card.real { border-left: 3px solid var(--green); }
+.cluster-card.filtered { border-left: 3px solid var(--muted); opacity: 0.7; }
+.cluster-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; cursor: pointer; }
+.cluster-header .title { font-size: 15px; font-weight: 600; }
+.cluster-body { display: none; }
+.cluster-body.open { display: block; }
+.tag-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.address-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.address-table th { background: var(--bg); padding: 6px 8px; text-align: left; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); }
+.address-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; }
+.collapse-icon { transition: transform 0.2s; font-size: 12px; color: var(--muted); }
+.collapse-icon.open { transform: rotate(90deg); }
+.input-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.input-row input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 6px; font-size: 14px; width: 180px; }
+.input-row select { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 6px; font-size: 14px; }
+.input-row button { background: var(--accent); border: none; color: #fff; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+.input-row button:hover { opacity: 0.85; }
+.input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+.loading { color: var(--muted); font-size: 13px; }
+.error-msg { color: var(--red); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/onchain">🔍 链上监控</a>
+  <a href="/alpha-cluster" class="active">🔬 Alpha 集群查询</a>
+</div>
+
+<h1>🔬 Alpha 集群查询</h1>
+<p style="color:var(--muted);font-size:13px;margin-bottom:16px">输入任意 Token 符号，实时拉取链上集群数据</p>
+
+<div class="panel">
+  <div class="input-row">
+    <input id="token-input" type="text" placeholder="Token 符号, 如 PEPE" value="">
+    <select id="chain-select">
+      <option value="bsc" selected>BSC</option>
+      <option value="ethereum">Ethereum</option>
+      <option value="solana">Solana</option>
+      <option value="arbitrum">Arbitrum</option>
+      <option value="base">Base</option>
+      <option value="polygon">Polygon</option>
+    </select>
+    <button id="fetch-btn" onclick="doFetch()">🔍 查询</button>
+    <button id="refresh-btn" onclick="doRefresh()" disabled>🔄 刷新</button>
+    <span id="status-msg"></span>
+  </div>
+</div>
+
+<div class="panel" id="overview-panel" style="display:none">
+  <div class="metric-row" id="overview-metrics"></div>
+</div>
+
+<div id="clusters-container"></div>
+
+<script>
+const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+let _lastToken = '';
+let _lastChain = 'bsc';
+let _lastData = null;
+
+async function doFetch() {
+  const token = document.getElementById('token-input').value.trim();
+  const chain = document.getElementById('chain-select').value;
+  if (!token) return;
+  _lastToken = token;
+  _lastChain = chain;
+  await _fetch(token, chain);
+}
+
+async function doRefresh() {
+  if (!_lastToken) return;
+  await _fetch(_lastToken, _lastChain);
+}
+
+async function _fetch(token, chain) {
+  const btn = document.getElementById('fetch-btn');
+  const refreshBtn = document.getElementById('refresh-btn');
+  const status = document.getElementById('status-msg');
+  btn.disabled = true;
+  refreshBtn.disabled = true;
+  status.innerHTML = '<span class="loading">⏳ 查询中...</span>';
+  document.getElementById('clusters-container').innerHTML = '';
+
+  try {
+    const resp = await fetch('/api/alpha/cluster/fetch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token, chain})
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      status.innerHTML = '<span class="error-msg">❌ ' + esc(err.detail||'查询失败') + '</span>';
+      btn.disabled = false;
+      return;
+    }
+    const data = await resp.json();
+    _lastData = data;
+    status.innerHTML = '<span style="color:var(--green)">✅ 查询完成</span>';
+    refreshBtn.disabled = false;
+    renderOverview(data.overview);
+    renderClusters(data.clusters, data.analysis || {});
+  } catch(e) {
+    status.innerHTML = '<span class="error-msg">❌ 网络错误: ' + esc(e.message) + '</span>';
+  }
+  btn.disabled = false;
+}
+
+function renderOverview(info) {
+  const panel = document.getElementById('overview-panel');
+  if (!info) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  const m = document.getElementById('overview-metrics');
+  m.innerHTML =
+    '<div class="metric"><span class="lbl">代币</span><span class="val">' + esc(info.token||'') + '</span></div>' +
+    '<div class="metric"><span class="lbl">链</span><span class="val">' + esc(info.chain||'') + '</span></div>' +
+    '<div class="metric"><span class="lbl">MCap</span><span class="val">' + (info.market_cap_usd ? '$' + (info.market_cap_usd/1000000).toFixed(1) + 'M' : '--') + '</span></div>' +
+    '<div class="metric"><span class="lbl">表层Top10</span><span class="val">' + (info.top10_hold_pct||0).toFixed(1) + '%</span></div>' +
+    '<div class="metric"><span class="lbl">资金同源</span><span class="val">' + (info.fund_source_same_pct||0).toFixed(1) + '%</span></div>' +
+    '<div class="metric"><span class="lbl">有效集中度</span><span class="val">' + ((info.effective_concentration||0)).toFixed(1) + '%</span></div>' +
+    '<div class="metric"><span class="lbl">地址</span><span class="val" style="font-size:13px">' + esc((info.token_address||'').substring(0,10)+'...') + '</span></div>';
+}
+
+function renderClusters(clusters, analysisMap) {
+  const container = document.getElementById('clusters-container');
+  if (!clusters || !clusters.length) {
+    container.innerHTML = '<div class="panel"><span style="color:var(--muted)">无集群数据</span></div>';
+    return;
+  }
+  const visible = clusters.filter(c => (c.holding_percent || 0) > 0);
+  if (!visible.length) {
+    container.innerHTML = '<div class="panel"><span style="color:var(--muted)">暂无有效集群（持仓比例均为 0）</span></div>';
+    return;
+  }
+  let html = '<h2>集群列表 (' + visible.length + ')</h2>';
+  for (const cl of visible) {
+    const isReal = cl.is_real_cluster === 1;
+    const cls = isReal ? 'real' : 'filtered';
+    const label = isReal ? '● 真人' : ((cl.addresses||[]).some(a => a.is_exchange) ? '交易所' : '合约');
+    const openClass = isReal ? ' open' : '';
+    const iconClass = isReal ? ' open' : '';
+
+    html += '<div class="cluster-card ' + cls + '">' +
+      '<div class="cluster-header" onclick="toggleCluster(this)">' +
+        '<div>' +
+          '<span class="title">集群 #' + (cl.cluster_index+1) + ' [' + label + ']</span>' +
+          '<span style="margin-left:12px;font-size:13px;color:var(--muted)">控盘 ' + (cl.holding_percent||0).toFixed(1) + '%</span>' +
+          '<span style="margin-left:8px;font-size:13px;color:var(--muted)">' + (cl.pnl_percent != null ? '盈亏 ' + (cl.pnl_percent>=0?'+':'') + cl.pnl_percent.toFixed(1) + '%' : '') + '</span>' +
+          '<span style="margin-left:8px;font-size:13px;color:var(--muted)">' + (cl.address_count||0) + ' 地址</span>' +
+        '</div>' +
+        '<span class="collapse-icon ' + iconClass + '">▶</span>' +
+      '</div>' +
+      '<div class="tag-row">' + renderTags(cl.tags || []) + '</div>' +
+      '<div class="cluster-body ' + openClass + '">' +
+        renderAddressTable(cl.addresses || [], analysisMap) +
+      '</div>' +
+    '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function renderAddressTable(addresses, analysisMap) {
+  if (!addresses || !addresses.length) return '<span style="color:var(--muted);font-size:12px">无地址数据</span>';
+  const chain = _lastChain || 'bsc';
+  let h = '<table class="address-table"><tr><th>地址</th><th>排名</th><th>持仓%</th><th>总资产</th><th>总买入/均价</th><th>总卖出/均价</th><th>最后交易</th><th>标签</th></tr>';
+  for (const a of addresses) {
+    const fullAddr = a.address || '';
+    const addr = fullAddr.substring(0, 10) + '...' + fullAddr.substring(fullAddr.length - 6);
+    const addrLink = 'https://debot.ai/address/' + chain + '/' + fullAddr;
+    const wa = analysisMap[a.address] || {};
+    const tv = wa.total_value_usd ? '$' + (wa.total_value_usd/1000).toFixed(0) + 'K' : '--';
+    const buy = wa.buy_count_30d != null ? wa.buy_count_30d + '笔/$' + (wa.avg_buy_value||0).toFixed(0) : '--';
+    const sell = wa.sell_count_30d != null ? wa.sell_count_30d + '笔/$' + (wa.avg_sell_value||0).toFixed(0) : '--';
+    const lastTrade = wa.last_trade_time ? wa.last_trade_time.substring(0, 10) : '--';
+    const tags = [];
+    if (a.is_exchange) tags.push('<span class="badge badge-yellow">EX</span>');
+    if (a.is_contract) tags.push('<span class="badge badge-yellow">CT</span>');
+    if (a.is_kol) tags.push('<span class="badge badge-purple">KOL</span>');
+    if (wa.buy_count_30d > 0 && wa.sell_count_30d === 0) tags.push('<span class="badge badge-green">纯买入</span>');
+    if (wa.realized_pnl > 0) tags.push('<span class="badge badge-green">盈利</span>');
+    h += '<tr>' +
+      '<td><a href="' + addrLink + '" target="_blank" title="' + esc(fullAddr) + '" style="color:var(--accent);text-decoration:none">' + esc(addr) + '</a></td>' +
+      '<td>#' + (a.address_rank||'--') + '</td>' +
+      '<td>' + ((a.holding_percent||0)*100).toFixed(2) + '%</td>' +
+      '<td>' + tv + '</td>' +
+      '<td>' + buy + '</td>' +
+      '<td>' + sell + '</td>' +
+      '<td>' + lastTrade + '</td>' +
+      '<td>' + tags.join(' ') + '</td>' +
+    '</tr>';
+  }
+  h += '</table>';
+  return h;
+}
+
+function renderTags(tags) {
+  if (!tags || !tags.length) return '';
+  let h = '';
+  for (const t of tags) {
+    let cls = 'badge-blue';
+    if (t.tag_type === 'holding_change') cls = t.tag_label.indexOf('增持') >= 0 ? 'badge-green' : (t.tag_label.indexOf('减持') >= 0 ? 'badge-red' : 'badge-yellow');
+    else if (t.tag_type === 'common_holdings') cls = 'badge-purple';
+    else if (t.tag_type === 'trade_behavior') cls = t.tag_label.indexOf('无卖出') >= 0 ? 'badge-green' : 'badge-yellow';
+    h += '<span class="badge ' + cls + '" title="' + esc(t.tag_detail||'') + '">' + esc(t.tag_label) + '</span> ';
+  }
+  return h;
+}
+
+function toggleCluster(el) {
+  const card = el.closest('.cluster-card');
+  const body = card.querySelector('.cluster-body');
+  const icon = card.querySelector('.collapse-icon');
+  body.classList.toggle('open');
+  icon.classList.toggle('open');
+}
+
+// 输入框回车触发查询
+document.getElementById('token-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') doFetch();
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/alpha-cluster", response_class=HTMLResponse)
+def alpha_cluster_page():
+    return HTMLResponse(
+        content=ALPHA_CLUSTER_HTML,
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
