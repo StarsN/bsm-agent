@@ -15,10 +15,11 @@ from okx_source import (
     fetch_wallet_analysis,
     fetch_token_trades,
 )
-from market import has_perpetual
+from market import has_perpetual, has_spot
 
 _round = 0
 _running = False
+_scanner_started = False
 
 
 def _utcnow():
@@ -69,16 +70,20 @@ def run_round():
         price_max=getattr(config, "ONCHAIN_PRICE_CHANGE_MAX", 5),
     )
 
-    # 排除已晋级的 token（不再重复检测）
+    # 排除已晋级的 token + 黑名单 + 全局排除列表
     if candidates:
         try:
             with storage.get_conn(config.ONCHAIN_DB) as conn:
                 actionable = {r["token"] for r in storage.onchain_pool_get_all(conn, "actionable")}
+                blacklist = {r["token"] for r in storage.onchain_blacklist_get_all(conn)}
+            excluded = getattr(config, "EXCLUDED_TOKENS", set()) or set()
             before = len(candidates)
-            candidates = [c for c in candidates if c["token"] not in actionable]
+            candidates = [c for c in candidates if c["token"].upper() not in actionable
+                          and c["token"].upper() not in blacklist
+                          and c["token"].upper() not in excluded]
             skipped = before - len(candidates)
             if skipped:
-                print(f"[onchain] Step A: 跳过 {skipped} 个已在建仓池的 token")
+                print(f"[onchain] Step A: 跳过 {skipped} 个已在建仓池/黑名单的 token")
         except Exception:
             pass
 
@@ -105,6 +110,9 @@ def run_round():
 
         # 只保留有币安合约的代币
         if not has_perpetual(token):
+            continue
+        # 排除已有现货的代币（仅保留合约专属）
+        if has_spot(token):
             continue
 
         token_chain = c.get("chain", "bsc")
@@ -171,6 +179,8 @@ def run_round():
             "effective_concentration": round(effective_conc * 100, 2) if effective_conc else None,
             "divergence_score": divergence_score,
             "cluster_raw_json": cluster_raw,
+            "cluster_list_json": json.dumps(cluster_list, ensure_ascii=False) if cluster_list else None,
+            "overview_ok": overview is not None,
         }
         snapshots.append(snapshot)
 
@@ -246,6 +256,8 @@ def run_round():
             "effective_concentration": round(effective_conc * 100, 2) if effective_conc else None,
             "divergence_score": 0.0,
             "cluster_raw_json": cluster_raw,
+            "cluster_list_json": json.dumps(cluster_list, ensure_ascii=False) if cluster_list else None,
+            "overview_ok": overview is not None,
         }
         snapshots.append(snapshot)
 
@@ -346,23 +358,38 @@ def run_round():
         if round_number % stage2_interval == 0:
             print(f"[onchain] Stage 2 检查（第 {round_number} 轮）...", flush=True)
             obs_tokens = storage.onchain_pool_get_all(conn, "observation")
+            snap_lookup = {s["token"]: s for s in snapshots}
             for pt in obs_tokens:
                 token = pt["token"]
                 addr = pt["token_address"]
+                snap = snap_lookup.get(token, {})
                 print(f"  Stage2: {token}...", flush=True)
 
-                # 1. LP 储备检查
+                # 1. LP 储备检查（独有 API）
                 token_chain = pt.get("chain", "bsc")
                 lp_trend, lp_score = _check_lp_reserve(conn, token, addr, round_number, token_chain)
                 time.sleep(0.3)
 
-                # 2. Gas seeding 检查
-                gas_signal, new_addr_pct = _check_gas_seeding(addr, pt, token_chain)
+                # 2. Gas seeding 检查（复用本轮快照，overview 失败时回退 API）
+                if snap and snap.get("overview_ok"):
+                    gas_overview = {
+                        "holder_new_addr_pct": snap.get("holder_new_addr_pct"),
+                        "holder_same_fund_pct": snap.get("holder_same_fund_pct"),
+                        "holder_same_creation_pct": snap.get("holder_same_creation_pct"),
+                    }
+                else:
+                    gas_overview = None
+                gas_signal, new_addr_pct = _check_gas_seeding(addr, pt, token_chain, overview=gas_overview)
                 prev_new_saved = pt.get("prev_new_addr_pct") or 0
-                time.sleep(0.3)
 
-                # 3. CEX staging 检查
-                cex_signal = _check_cex_staging(addr, pt, token_chain)
+                # 3. CEX staging 检查（复用本轮快照，无数据时回退 API）
+                cex_clusters = None
+                if snap.get("cluster_list_json"):
+                    try:
+                        cex_clusters = json.loads(snap["cluster_list_json"])
+                    except Exception:
+                        pass
+                cex_signal = _check_cex_staging(addr, pt, token_chain, clusters=cex_clusters)
 
                 # 4. 综合置信度
                 confidence = _compute_confidence(lp_score, gas_signal, cex_signal)
@@ -514,9 +541,10 @@ def _check_lp_reserve(conn, token: str, addr: str, round_number: int, chain: str
         return "稳定", 10
 
 
-def _check_gas_seeding(addr: str, pool_entry: dict, chain: str = "bsc") -> tuple[int, float]:
+def _check_gas_seeding(addr: str, pool_entry: dict, chain: str = "bsc", overview: dict = None) -> tuple[int, float]:
     """检测新鲜钱包批量 seed gas。返回 (signal_0_1_2, new_addr_pct)"""
-    overview = fetch_cluster_overview(addr, chain)
+    if overview is None:
+        overview = fetch_cluster_overview(addr, chain)
     if not overview:
         return 0, 0
 
@@ -544,9 +572,10 @@ def _check_gas_seeding(addr: str, pool_entry: dict, chain: str = "bsc") -> tuple
     return 0, new_addr_pct
 
 
-def _check_cex_staging(addr: str, pool_entry: dict, chain: str = "bsc") -> int:
+def _check_cex_staging(addr: str, pool_entry: dict, chain: str = "bsc", clusters: list = None) -> int:
     """检测 CEX 充值地址 staging。返回 0=无, 1=弱, 2=强（权重低）"""
-    clusters, _ = fetch_cluster_list(addr, chain)
+    if clusters is None:
+        clusters, _ = fetch_cluster_list(addr, chain)
     if not clusters:
         return 0
 
@@ -593,14 +622,26 @@ def _open_onchain_position(conn, token: str, pool_entry: dict):
             "price": snap["mark_price"],
             "market": {"snapshot": snap, "analysis": {}},
             "realtime": {},
-            "direction": "long",
+            "direction": "short",
         }
         with storage.get_conn() as main_conn:
             settings = storage.trading_settings_get(main_conn)
             result = trade_logic.open_paper_position(
-                main_conn, candidate, settings, strategy="onchain", side="LONG")
+                main_conn, candidate, settings, strategy="onchain", side="SHORT")
             if result:
                 print(f"    [onchain trade] {token} 开仓成功 @ ${snap['mark_price']}")
+                # 实盘镜像
+                if settings.get("onchain_live_mode") == "live":
+                    try:
+                        pos = main_conn.execute(
+                            "SELECT * FROM trade_positions WHERE token=? AND strategy='onchain' ORDER BY id DESC LIMIT 1",
+                            (token,),
+                        ).fetchone()
+                        if pos:
+                            import exchange_bridge
+                            exchange_bridge.mirror_open(dict(pos))
+                    except Exception as _e:
+                        print(f"    [onchain trade] {token} 实盘镜像失败: {_e}")
             else:
                 print(f"    [onchain trade] {token} 开仓被拒（去重/风控）")
     except Exception as e:
@@ -618,7 +659,7 @@ def _write_status(**fields):
 
 def scanner_loop():
     """后台扫描主循环"""
-    global _running
+    global _running, _scanner_started
     _running = True
 
     interval_hours = float(_load_setting("onchain_scan_interval_hours",
@@ -638,9 +679,15 @@ def scanner_loop():
 
     while True:
         try:
-            if not getattr(config, "ONCHAIN_SCAN_ENABLED", True):
+            if not _load_setting("onchain_scan_enabled", True):
                 time.sleep(60)
                 continue
+
+            # 首次启动延迟 2 分钟，错开 worker 首轮 API 调用高峰
+            if not _scanner_started:
+                print("[onchain scanner] 首次启动，等待 120s 错开 worker 首轮...", flush=True)
+                time.sleep(120)
+                _scanner_started = True
 
             run_round()
 

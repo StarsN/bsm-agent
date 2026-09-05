@@ -148,6 +148,16 @@ def _build_close_snap(close_price: float, snap: dict, analysis: dict) -> str:
     return json.dumps(result, default=str, ensure_ascii=False)
 
 
+def _archive_onchain_pool(token: str):
+    """onchain 策略平仓后从池中移除，以便后续重新检测吸筹信号"""
+    try:
+        with storage.get_conn(config.ONCHAIN_DB) as oc:
+            storage.onchain_pool_archive(oc, token, "closed")
+            storage.onchain_removed_add(oc, token, "closed")
+    except Exception:
+        pass
+
+
 def _position_price(token: str, market: dict, realtime: dict) -> float | None:
     age = _timestamp_age_seconds(realtime.get("cache_updated_at"))
     if age is not None and age <= REALTIME_PRICE_MAX_AGE_SECONDS:
@@ -1153,9 +1163,9 @@ def update_paper_positions(conn):
                 close_reason="sl_hit", dimension_data=close_snap,
                 hold_duration=_calc_hold(pos.get("created_at")),
             )
+            if pos.get("strategy") == "onchain":
+                _archive_onchain_pool(pos["token"])
             continue
-
-        # ---- 止盈 TP1：达到 +1R，平 TP1_CLOSE_PCT%，止损移到保本 ----
         tp1_pct = config.TRADING_TP1_CLOSE_PCT / 100
         tp2_pct = config.TRADING_TP2_CLOSE_PCT / 100
         # 用"是否已触发过某档"而不是脆弱的数量比较
@@ -1240,6 +1250,8 @@ def update_paper_positions(conn):
                     close_reason="tp_hit", dimension_data=close_snap,
                     hold_duration=_calc_hold(pos.get("created_at")),
                 )
+                if pos.get("strategy") == "onchain":
+                    _archive_onchain_pool(pos["token"])
                 continue
 
         unrealized = ((entry - price) if is_short else (price - entry)) * open_qty

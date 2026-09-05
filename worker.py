@@ -576,8 +576,9 @@ async def main():
     console.print()
 
     # 启动链上监控扫描器（独立后台线程）
-    if getattr(config, "ONCHAIN_SCAN_ENABLED", True):
+    if ts.get("onchain_scan_enabled", getattr(config, "ONCHAIN_SCAN_ENABLED", True)):
         storage.init_onchain_db()
+        storage.init_onchain_live_db()
         from onchain_scanner import scanner_loop
         onchain_thread = threading.Thread(target=scanner_loop, daemon=True)
         onchain_thread.start()

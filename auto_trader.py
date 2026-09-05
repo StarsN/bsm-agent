@@ -363,6 +363,11 @@ def one_scan():
     # 2. 更新现有持仓（TP/SL/跟踪止盈）
     with storage.get_conn() as conn:
         trade_logic.update_paper_positions(conn)
+        try:
+            import exchange_bridge
+            exchange_bridge.sync_orders(conn)
+        except Exception:
+            pass
 
     if not settings.get("enabled"):
         return {"opened": 0, "enabled": False}

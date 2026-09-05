@@ -18,6 +18,47 @@ import config
 
 FAPI_REST = "https://fapi.binance.com"
 
+_symbol_filters_cache = {}
+_last_error_msg = ""  # 供 bridge 读取最后一次错误
+
+
+def get_last_error() -> str:
+    return _last_error_msg
+
+
+def _fetch_symbol_filters(symbol: str) -> dict:
+    """查交易对的 stepSize / minQty。缓存 1 小时。"""
+    now = time.time()
+    entry = _symbol_filters_cache.get(symbol)
+    if entry and now - entry["_ts"] < 3600:
+        return entry
+
+    r = _signed_request("GET", "/fapi/v1/exchangeInfo")
+    if not r:
+        return {"stepSize": 0.001, "minQty": 0}
+
+    for s in r.get("symbols", []):
+        sym = s.get("symbol", "")
+        for f in s.get("filters", []):
+            if f["filterType"] == "LOT_SIZE":
+                info = {
+                    "stepSize": float(f.get("stepSize", 0.001)),
+                    "minQty": float(f.get("minQty", 0)),
+                    "_ts": now,
+                }
+                _symbol_filters_cache[sym] = info
+
+    return _symbol_filters_cache.get(symbol, {"stepSize": 0.001, "minQty": 0})
+
+
+def _round_qty(symbol: str, qty: float) -> float:
+    """将数量对齐到 symbol 的 stepSize"""
+    filters = _fetch_symbol_filters(symbol)
+    step = filters["stepSize"]
+    ticks = round(qty / step)
+    result = round(ticks * step, 8)
+    return max(result, filters["minQty"])
+
 
 def _sign(params: dict) -> str:
     params["timestamp"] = int(time.time() * 1000)
@@ -46,7 +87,8 @@ def _signed_request(method: str, path: str, params: dict = None) -> Optional[dic
             err = json.loads(e.read().decode("utf-8"))
             code = err.get("code", 0)
             msg = err.get("msg", "")
-            print(f"[exchange] {path} HTTP {e.code}: {code} {msg}")
+            _last_error_msg = f"{code} {msg}"
+            print(f"[exchange] {method} {path} HTTP {e.code}: {code} {msg}")
             if e.code == 429:
                 time.sleep(10)
             elif e.code >= 500:
@@ -54,7 +96,8 @@ def _signed_request(method: str, path: str, params: dict = None) -> Optional[dic
             else:
                 return None
         except Exception as e:
-            print(f"[exchange] {path} 网络异常: {e}")
+            _last_error_msg = str(e)
+            print(f"[exchange] {method} {path} 网络异常: {e}")
             if attempt < 2:
                 time.sleep(2)
     return None
@@ -101,12 +144,39 @@ def get_positions() -> list[dict]:
 def market_open_long(token: str, quantity: float) -> dict | None:
     """市价开多。返回: {order_id, price, quantity, status}"""
     symbol = f"{token.upper()}USDT"
-    r = _signed_request("POST", "/fapi/v1/order", {
+    qty = _round_qty(symbol, quantity)
+    params = {
         "symbol": symbol,
         "side": "BUY",
         "type": "MARKET",
-        "quantity": quantity,
-    })
+        "quantity": qty,
+    }
+    if config.BINANCE_HEDGE_MODE:
+        params["positionSide"] = "LONG"
+    r = _signed_request("POST", "/fapi/v1/order", params)
+    if not r:
+        return None
+    return {
+        "order_id": r.get("orderId"),
+        "symbol": symbol,
+        "price": float(r.get("fills")[0]["price"]) if r.get("fills") else 0,
+        "quantity": float(r.get("executedQty", 0)),
+        "status": r.get("status"),
+    }
+
+
+def market_open_short(token: str, quantity: float) -> dict | None:
+    """市价开空。返回: {order_id, price, quantity, status}"""
+    symbol = f"{token.upper()}USDT"
+    qty = _round_qty(symbol, quantity)
+    params = {
+        "symbol": symbol,
+        "side": "SELL",
+        "type": "MARKET",
+        "quantity": qty,
+        "positionSide": "SHORT",
+    }
+    r = _signed_request("POST", "/fapi/v1/order", params)
     if not r:
         return None
     return {
@@ -119,42 +189,53 @@ def market_open_long(token: str, quantity: float) -> dict | None:
 
 
 def stop_loss_order(token: str, side: str, quantity: float,
-                    stop_price: float) -> dict | None:
-    """挂止损单（STOP_MARKET）"""
+                    stop_price: float, position_side: str = "LONG") -> dict | None:
+    """挂止损单（STOP_MARKET, algoOrder 端点）"""
     symbol = f"{token.upper()}USDT"
-    r = _signed_request("POST", "/fapi/v1/order", {
-        "symbol": symbol,
-        "side": side,
-        "type": "STOP_MARKET",
-        "quantity": quantity,
-        "stopPrice": round(stop_price, 6),
-        "reduceOnly": "true",
-    })
+    qty = _round_qty(symbol, quantity)
+    params = {
+        "symbol": symbol, "side": side,
+        "type": "STOP_MARKET", "algoType": "CONDITIONAL",
+        "quantity": qty, "triggerPrice": round(stop_price, 6),
+        "workingType": "MARK_PRICE",
+    }
+    if config.BINANCE_HEDGE_MODE:
+        params["positionSide"] = position_side
+    r = _signed_request("POST", "/fapi/v1/algoOrder", params)
     if not r:
         return None
-    return {"order_id": r.get("orderId"), "status": r.get("status")}
+    return {"order_id": r.get("algoId"), "status": r.get("algoStatus")}
 
 
 def take_profit_order(token: str, side: str, quantity: float,
-                      stop_price: float) -> dict | None:
-    """挂止盈单（TAKE_PROFIT_MARKET）"""
+                      stop_price: float, position_side: str = "LONG") -> dict | None:
+    """挂止盈单（TAKE_PROFIT_MARKET, algoOrder 端点）"""
     symbol = f"{token.upper()}USDT"
-    r = _signed_request("POST", "/fapi/v1/order", {
-        "symbol": symbol,
-        "side": side,
-        "type": "TAKE_PROFIT_MARKET",
-        "quantity": quantity,
-        "stopPrice": round(stop_price, 6),
-        "reduceOnly": "true",
-    })
+    qty = _round_qty(symbol, quantity)
+    params = {
+        "symbol": symbol, "side": side,
+        "type": "TAKE_PROFIT_MARKET", "algoType": "CONDITIONAL",
+        "quantity": qty, "triggerPrice": round(stop_price, 6),
+        "workingType": "MARK_PRICE",
+    }
+    if config.BINANCE_HEDGE_MODE:
+        params["positionSide"] = position_side
+    r = _signed_request("POST", "/fapi/v1/algoOrder", params)
     if not r:
         return None
-    return {"order_id": r.get("orderId"), "status": r.get("status")}
+    return {"order_id": r.get("algoId"), "status": r.get("algoStatus")}
 
 
 def cancel_order(token: str, order_id: int) -> bool:
-    """撤单"""
+    """撤单（algo 优先，再试普通订单）"""
     symbol = f"{token.upper()}USDT"
+    # 先试 algo 撤单（绝大多数取消的都是条件单）
+    r = _signed_request("DELETE", "/fapi/v1/algoOrder", {
+        "symbol": symbol, "algoId": order_id,
+    })
+    if r:
+        return True
+    # 回退普通撤单
     r = _signed_request("DELETE", "/fapi/v1/order", {
         "symbol": symbol, "orderId": order_id,
     })
@@ -162,10 +243,11 @@ def cancel_order(token: str, order_id: int) -> bool:
 
 
 def cancel_all_orders(token: str) -> bool:
-    """撤销某币所有挂单"""
+    """撤销某币所有挂单（普通 + algo）"""
     symbol = f"{token.upper()}USDT"
-    r = _signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
-    return bool(r)
+    ok1 = bool(_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}))
+    ok2 = bool(_signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol}))
+    return ok1 or ok2
 
 
 def get_open_orders(token: str = None) -> list[dict]:
@@ -175,3 +257,48 @@ def get_open_orders(token: str = None) -> list[dict]:
         params["symbol"] = f"{token.upper()}USDT"
     r = _signed_request("GET", "/fapi/v1/openOrders", params)
     return r if isinstance(r, list) else []
+
+
+def close_position_market(token: str, quantity: float, position_side: str = "LONG") -> dict | None:
+    """市价平仓（Hedge 模式用 positionSide 区分），默认平多"""
+    is_short = position_side == "SHORT"
+    symbol = f"{token.upper()}USDT"
+    qty = _round_qty(symbol, quantity)
+    params = {
+        "symbol": symbol,
+        "side": "BUY" if is_short else "SELL",
+        "type": "MARKET",
+        "quantity": qty,
+        "reduceOnly": "true",
+    }
+    if config.BINANCE_HEDGE_MODE:
+        params["positionSide"] = position_side
+        params.pop("reduceOnly", None)
+    r = _signed_request("POST", "/fapi/v1/order", params)
+    if not r:
+        return None
+    return {
+        "order_id": r.get("orderId"),
+        "price": float(r.get("fills")[0]["price"]) if r.get("fills") else 0,
+        "quantity": float(r.get("executedQty", 0)),
+        "status": r.get("status"),
+    }
+
+
+def trailing_stop_order(token: str, side: str, quantity: float,
+                        callback_rate: float, position_side: str = "LONG") -> dict | None:
+    """挂追踪止盈单（TRAILING_STOP_MARKET, algoOrder 端点）"""
+    symbol = f"{token.upper()}USDT"
+    qty = _round_qty(symbol, quantity)
+    params = {
+        "symbol": symbol, "side": side,
+        "type": "TRAILING_STOP_MARKET", "algoType": "CONDITIONAL",
+        "quantity": qty, "callbackRate": round(callback_rate, 1),
+        "workingType": "MARK_PRICE",
+    }
+    if config.BINANCE_HEDGE_MODE:
+        params["positionSide"] = position_side
+    r = _signed_request("POST", "/fapi/v1/algoOrder", params)
+    if not r:
+        return None
+    return {"order_id": r.get("algoId"), "status": r.get("algoStatus")}

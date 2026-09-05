@@ -147,6 +147,34 @@ def get_futures_symbols() -> set[str]:
     return symbols
 
 
+# 现货上市列表缓存（与合约缓存对称，同一 TTL）
+_SPOT_SYMBOLS_CACHE: dict = {"ts": 0.0, "symbols": set()}
+
+
+def get_spot_symbols() -> set[str]:
+    """返回币安现货 USDT 交易对的所有 base 币种 set，比如 {'BTC', 'ETH', 'PEPE', ...}"""
+    global _SPOT_SYMBOLS_CACHE
+    now = time.time()
+    if now - _SPOT_SYMBOLS_CACHE["ts"] < _CACHE_TTL and _SPOT_SYMBOLS_CACHE["symbols"]:
+        return _SPOT_SYMBOLS_CACHE["symbols"]
+
+    data = _http_get("https://api.binance.com/api/v3/exchangeInfo")
+    if not data:
+        return _SPOT_SYMBOLS_CACHE["symbols"]
+
+    symbols = set()
+    for s in data.get("symbols", []):
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+            symbols.add(s.get("baseAsset", "").upper())
+
+    _SPOT_SYMBOLS_CACHE = {"ts": now, "symbols": symbols}
+    return symbols
+
+
+def has_spot(token: str) -> bool:
+    return token.upper() in get_spot_symbols()
+
+
 def has_perpetual(token: str) -> bool:
     return token.upper() in get_futures_symbols()
 

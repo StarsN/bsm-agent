@@ -809,6 +809,29 @@ CREATE TABLE IF NOT EXISTS onchain_removed (
     reason      TEXT DEFAULT 'manual',
     added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS onchain_pool_archive (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    token                   TEXT NOT NULL,
+    token_address           TEXT,
+    chain                   TEXT,
+    pool_stage              TEXT,
+    surface_top10_pct       REAL,
+    effective_concentration REAL,
+    fund_source_same_pct    REAL,
+    divergence_detected     INTEGER,
+    days_in_pool            REAL,
+    rounds_in_pool          INTEGER,
+    lp_reserve_trend        TEXT,
+    lp_trend_score          REAL,
+    gas_seeding_signal      INTEGER,
+    cex_staging_signal      INTEGER,
+    confidence_score        REAL,
+    first_seen_at           TIMESTAMP,
+    last_updated_at         TIMESTAMP,
+    reason                  TEXT NOT NULL,
+    archived_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -838,6 +861,29 @@ CREATE TABLE IF NOT EXISTS onchain_removed (
     token       TEXT PRIMARY KEY,
     reason      TEXT DEFAULT 'manual',
     added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)""")
+    conn.execute("""\
+CREATE TABLE IF NOT EXISTS onchain_pool_archive (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    token                   TEXT NOT NULL,
+    token_address           TEXT,
+    chain                   TEXT,
+    pool_stage              TEXT,
+    surface_top10_pct       REAL,
+    effective_concentration REAL,
+    fund_source_same_pct    REAL,
+    divergence_detected     INTEGER,
+    days_in_pool            REAL,
+    rounds_in_pool          INTEGER,
+    lp_reserve_trend        TEXT,
+    lp_trend_score          REAL,
+    gas_seeding_signal      INTEGER,
+    cex_staging_signal      INTEGER,
+    confidence_score        REAL,
+    first_seen_at           TIMESTAMP,
+    last_updated_at         TIMESTAMP,
+    reason                  TEXT NOT NULL,
+    archived_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )""")
 
 
@@ -873,6 +919,168 @@ def alpha_clear_token(conn, token: str):
     for table in ("onchain_clusters", "onchain_wallet_analysis",
                   "onchain_cluster_trades", "onchain_cluster_tags"):
         conn.execute(f"DELETE FROM {table} WHERE token=?", (token,))
+
+
+_LIVE_DDL = """\
+CREATE TABLE IF NOT EXISTS live_positions (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_position_id     INTEGER NOT NULL UNIQUE,
+    token                 TEXT NOT NULL,
+    symbol                TEXT NOT NULL,
+    side                  TEXT DEFAULT 'LONG',
+    strategy              TEXT DEFAULT 'onchain',
+    entry_price           REAL,
+    quantity              REAL,
+    leverage              INTEGER DEFAULT 1,
+    margin_usd            REAL,
+    exchange_orders_json  TEXT,
+    tp1_done              INTEGER DEFAULT 0,
+    tp2_done              INTEGER DEFAULT 0,
+    status                TEXT DEFAULT 'OPEN',
+    realized_pnl          REAL DEFAULT 0,
+    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    closed_at             TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS live_daily_snapshots (
+    date                  TEXT NOT NULL,
+    strategy              TEXT DEFAULT 'onchain',
+    equity                REAL,
+    available_balance     REAL,
+    margin_used           REAL,
+    unrealized_pnl        REAL,
+    realized_pnl          REAL,
+    daily_pnl             REAL,
+    fees_paid             REAL DEFAULT 0,
+    snapshot_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (date, strategy)
+);
+
+CREATE TABLE IF NOT EXISTS live_trade_log (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    token                 TEXT NOT NULL,
+    strategy              TEXT DEFAULT 'onchain',
+    action                TEXT,
+    price                 REAL,
+    quantity              REAL,
+    paper_position_id     INTEGER,
+    exchange_order_id     TEXT,
+    details_json          TEXT,
+    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def init_onchain_live_db():
+    """初始化链上实盘独立 DB"""
+    with get_conn(config.LIVE_DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(_LIVE_DDL)
+
+
+def live_position_insert(conn, pos: dict) -> bool:
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO live_positions
+               (paper_position_id, token, symbol, side, strategy,
+                entry_price, quantity, leverage, margin_usd,
+                exchange_orders_json, tp1_done, tp2_done, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pos["paper_position_id"], pos["token"], pos["symbol"],
+             pos.get("side", "LONG"), pos.get("strategy", "onchain"),
+             pos["entry_price"], pos["quantity"], pos.get("leverage", 1),
+             pos.get("margin_usd"), pos.get("exchange_orders_json"),
+             pos.get("tp1_done", 0), pos.get("tp2_done", 0),
+             pos.get("status", "OPEN")),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def live_position_update(conn, live_id: int, fields: dict):
+    if not fields:
+        return
+    sets = []
+    params = []
+    for k, v in fields.items():
+        if v == "__CURRENT_TIMESTAMP__":
+            sets.append(f"{k}=CURRENT_TIMESTAMP")
+        else:
+            sets.append(f"{k}=?")
+            params.append(v)
+    params.append(live_id)
+    conn.execute(
+        f"UPDATE live_positions SET {', '.join(sets)} WHERE id=?",
+        params,
+    )
+
+
+def live_position_get_by_paper(conn, paper_position_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM live_positions WHERE paper_position_id=?",
+        (paper_position_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def live_positions_open(conn, strategy: str = None) -> list[dict]:
+    sql = "SELECT * FROM live_positions WHERE status IN ('OPEN','PARTIAL')"
+    params = ()
+    if strategy:
+        sql += " AND strategy=?"
+        params = (strategy,)
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def live_trade_log_insert(conn, entry: dict):
+    conn.execute(
+        """INSERT INTO live_trade_log
+           (token, strategy, action, price, quantity,
+            paper_position_id, exchange_order_id, details_json)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (entry["token"], entry.get("strategy", "onchain"),
+         entry["action"], entry.get("price"), entry.get("quantity"),
+         entry.get("paper_position_id"), entry.get("exchange_order_id"),
+         entry.get("details_json")),
+    )
+
+
+def live_trade_log_for_token(conn, token: str, limit: int = 20) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM live_trade_log WHERE token=? ORDER BY id DESC LIMIT ?",
+        (token, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def live_daily_snapshot_upsert(conn, entry: dict):
+    conn.execute(
+        """INSERT OR REPLACE INTO live_daily_snapshots
+           (date, strategy, equity, available_balance, margin_used,
+            unrealized_pnl, realized_pnl, daily_pnl, fees_paid)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (entry["date"], entry.get("strategy", "onchain"),
+         entry["equity"], entry.get("available_balance"),
+         entry.get("margin_used"), entry.get("unrealized_pnl"),
+         entry.get("realized_pnl"), entry.get("daily_pnl", 0),
+         entry.get("fees_paid", 0)),
+    )
+
+
+def live_daily_snapshots_get(conn, strategy: str = None, limit: int = 30) -> list[dict]:
+    if strategy:
+        rows = conn.execute(
+            "SELECT * FROM live_daily_snapshots WHERE strategy=? ORDER BY date DESC LIMIT ?",
+            (strategy, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM live_daily_snapshots ORDER BY date DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def init_db():
@@ -1502,6 +1710,7 @@ def trading_settings_defaults() -> dict:
         "strategy_initial_agent_short": getattr(config, "STRATEGY_INITIAL_AGENT_SHORT", 1000),
         "agent_short_interval_minutes": getattr(config, "AGENT_SHORT_INTERVAL_MINUTES", 16),
         "onchain_strategy_enabled": getattr(config, "ONCHAIN_STRATEGY_ENABLED", True),
+        "onchain_scan_enabled": getattr(config, "ONCHAIN_SCAN_ENABLED", True),
         "strategy_initial_onchain": getattr(config, "STRATEGY_INITIAL_ONCHAIN", 1000),
         # 链上监控阈值
         "onchain_scan_interval_hours": getattr(config, "ONCHAIN_SCAN_INTERVAL_HOURS", 4),
@@ -1515,6 +1724,7 @@ def trading_settings_defaults() -> dict:
         "onchain_cluster_top_addresses": getattr(config, "ONCHAIN_CLUSTER_TOP_ADDRESSES", 5),
         "onchain_cluster_min_holding_pct": getattr(config, "ONCHAIN_CLUSTER_MIN_HOLDING_PCT", 1.0),
         "onchain_cluster_keep_rounds": getattr(config, "ONCHAIN_CLUSTER_KEEP_ROUNDS", 1500),
+        "onchain_live_mode": getattr(config, "ONCHAIN_LIVE_MODE", "paper"),
     }
 
 
@@ -1523,7 +1733,7 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
         elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds"}:
             try:
@@ -1540,7 +1750,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -2415,6 +2625,7 @@ def onchain_pool_get_all(conn, stage: str = None) -> list[dict]:
 
 def onchain_pool_remove(conn, token: str):
     conn.execute("DELETE FROM onchain_pool WHERE token=?", (token,))
+    conn.execute("DELETE FROM onchain_lp_snapshots WHERE token=?", (token,))
 
 
 def onchain_lp_snapshot_insert_batch(conn, snapshots: list[dict]):
@@ -2609,3 +2820,23 @@ def onchain_removed_add(conn, token: str, reason: str = "manual"):
         "INSERT OR REPLACE INTO onchain_removed (token, reason) VALUES (?,?)",
         (token.upper(), reason),
     )
+
+
+def onchain_pool_archive(conn, token: str, reason: str):
+    """先归档 onchain_pool 行到 onchain_pool_archive，再删除"""
+    conn.execute("""
+        INSERT INTO onchain_pool_archive
+        (token, token_address, chain, pool_stage, surface_top10_pct,
+         effective_concentration, fund_source_same_pct, divergence_detected,
+         days_in_pool, rounds_in_pool, lp_reserve_trend, lp_trend_score,
+         gas_seeding_signal, cex_staging_signal, confidence_score,
+         first_seen_at, last_updated_at, reason)
+        SELECT token, token_address, chain, pool_stage, surface_top10_pct,
+               effective_concentration, fund_source_same_pct, divergence_detected,
+               days_in_pool, rounds_in_pool, lp_reserve_trend, lp_trend_score,
+               gas_seeding_signal, cex_staging_signal, confidence_score,
+               first_seen_at, last_updated_at, ?
+        FROM onchain_pool WHERE token=?
+    """, (reason, token))
+    conn.execute("DELETE FROM onchain_pool WHERE token=?", (token,))
+    conn.execute("DELETE FROM onchain_lp_snapshots WHERE token=?", (token,))
