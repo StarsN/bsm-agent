@@ -586,6 +586,17 @@ async def main():
         console.print(f"   扫描间隔: {getattr(config, 'ONCHAIN_SCAN_INTERVAL_HOURS', 4)}h")
         console.print()
 
+    # 启动超级趋势策略线程（始终创建：开关由线程每轮读 trading_settings 决定空转/交易，热生效）
+    try:
+        import supertrend_strategy
+        supertrend_strategy.init_db()
+        st_thread = threading.Thread(target=supertrend_strategy.supertrend_loop, daemon=True)
+        st_thread.start()
+        console.print("[green]=== 超级趋势策略已启动 ===[/green]")
+        console.print()
+    except Exception as e:
+        console.print(f"[red]超级趋势策略启动失败: {e}[/red]")
+
     while _running:
         try:
             await asyncio.wait_for(one_round(scraper), timeout=round_timeout)

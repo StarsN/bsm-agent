@@ -646,6 +646,11 @@ class TradingSettingsBody(BaseModel):
     onchain_cluster_min_holding_pct: float | None = None
     onchain_cluster_keep_rounds: int | None = None
     onchain_live_mode: str | None = None
+    supertrend_enabled: bool | None = None
+    supertrend_sl_tolerance_pct: float | None = None
+    supertrend_notional_usd: float | None = None
+    supertrend_leverage: float | None = None
+    strategy_initial_supertrend: float | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -1063,7 +1068,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1075,6 +1080,14 @@ def api_trading_settings(body: TradingSettingsBody):
         raise HTTPException(400, "order_amount must be positive")
     if "initial_balance" in fields and fields["initial_balance"] <= 0:
         raise HTTPException(400, "initial_balance must be positive")
+    if "supertrend_sl_tolerance_pct" in fields and not (0 <= fields["supertrend_sl_tolerance_pct"] <= 20):
+        raise HTTPException(400, "supertrend 容忍%必须在 [0, 20] 之间")
+    if "supertrend_notional_usd" in fields and fields["supertrend_notional_usd"] <= 0:
+        raise HTTPException(400, "supertrend 名义金额必须为正数")
+    if "supertrend_leverage" in fields and not (1 <= fields["supertrend_leverage"] <= 125):
+        raise HTTPException(400, "supertrend 杠杆必须在 [1, 125] 之间")
+    if "strategy_initial_supertrend" in fields and fields["strategy_initial_supertrend"] < 0:
+        raise HTTPException(400, "supertrend 初始金额不能为负数")
     with storage.get_conn() as conn:
         storage.trading_settings_update(conn, fields)
         settings = storage.trading_settings_get(conn)
@@ -2429,6 +2442,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
   <a href="/onchain">🔍 链上监控</a>
   <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -3481,6 +3495,7 @@ tr:hover { background: #1f2536; }
   <a href="/onchain">🔍 链上监控</a>
   <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -4639,6 +4654,36 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   </div>
 
   <div class="strategy-block">
+    <div class="strategy-name">主流币趋势交易（超级趋势）</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-supertrend-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>初始金额 USDT</label>
+        <input id="trade-strategy-supertrend" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>容忍%（轨道价百分比，0=紧贴轨道）</label>
+        <input id="trade-supertrend-tolerance" type="number" min="0" max="20" step="0.1">
+      </div>
+      <div>
+        <label>每笔名义金额 USDT</label>
+        <input id="trade-supertrend-notional" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>杠杆</label>
+        <input id="trade-supertrend-leverage" type="number" min="1" max="125" step="1">
+      </div>
+    </div>
+    <div style="color:var(--muted);font-size:11px;margin-top:4px">修改后点击「保存设置」立即生效，无需重启（监控币种在 /supertrend 页面添加）</div>
+  </div>
+
+  <div class="strategy-block">
     <div class="strategy-name">系统策略</div>
     <div class="grid3">
       <div>
@@ -4768,6 +4813,11 @@ async function loadSettings() {
     document.getElementById('trade-cluster-min-holding').value = s.onchain_cluster_min_holding_pct ?? 1.0;
     document.getElementById('trade-cluster-keep-rounds').value = s.onchain_cluster_keep_rounds ?? 1500;
     document.getElementById('trade-onchain-live-mode').value = s.onchain_live_mode || 'paper';
+    document.getElementById('trade-supertrend-switch').value = s.supertrend_enabled ?? true;
+    document.getElementById('trade-strategy-supertrend').value = s.strategy_initial_supertrend ?? 1000;
+    document.getElementById('trade-supertrend-tolerance').value = s.supertrend_sl_tolerance_pct ?? 1.0;
+    document.getElementById('trade-supertrend-notional').value = s.supertrend_notional_usd ?? 50;
+    document.getElementById('trade-supertrend-leverage').value = s.supertrend_leverage ?? 3;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
@@ -4829,6 +4879,11 @@ async function saveTradingSettings() {
     onchain_cluster_min_holding_pct: Number(document.getElementById('trade-cluster-min-holding').value),
     onchain_cluster_keep_rounds: Number(document.getElementById('trade-cluster-keep-rounds').value),
     onchain_live_mode: document.getElementById('trade-onchain-live-mode').value,
+    supertrend_enabled: document.getElementById('trade-supertrend-switch').value === 'true',
+    supertrend_sl_tolerance_pct: Number(document.getElementById('trade-supertrend-tolerance').value),
+    supertrend_notional_usd: Number(document.getElementById('trade-supertrend-notional').value),
+    supertrend_leverage: Number(document.getElementById('trade-supertrend-leverage').value),
+    strategy_initial_supertrend: Number(document.getElementById('trade-strategy-supertrend').value),
   };
   const oldSource = document.getElementById('trade-data-source').getAttribute('data-original') || '';
   const newSource = body.okx_data_source_enabled ? 'true' : 'false';
@@ -4987,10 +5042,22 @@ def api_strategy_stats():
             "kol_snapshot": ts.get("kol_snapshot_enabled", True),
             "system": ts.get("system_auto_trade_enabled", True),
             "onchain": ts.get("onchain_strategy_enabled", True),
+            "supertrend": ts.get("supertrend_enabled", True),
         }
         for s in strategies:
             s["running"] = enabled_map.get(s["strategy"], True)
             s["live_mode"] = ts.get("onchain_live_mode", "paper")
+        # supertrend 启用但暂无仓位记录时补空统计行（卡片常驻运行策略页）
+        if "supertrend" not in {s["strategy"] for s in strategies} \
+                and ts.get("supertrend_enabled", True):
+            strategies.append({
+                "strategy": "supertrend", "total": 0, "wins": 0, "losses": 0,
+                "total_pnl": 0, "avg_pnl": 0, "open_count": 0,
+                "total_7d": 0, "wins_7d": 0, "loss_tags": {},
+                "account": trade_logic.strategy_account_summary(conn, "supertrend"),
+                "open_positions": [], "closed_positions": [],
+                "running": True, "live_mode": "paper",
+            })
     return {"strategies": strategies}
 
 
@@ -5169,6 +5236,7 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
   <a href="/onchain">🔍 链上监控</a>
   <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -5440,6 +5508,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
   <a href="/onchain">🔍 链上监控</a>
   <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -5487,6 +5556,7 @@ async function load() {
       agent_no_lessons: '<span class="strategy-badge" style="background:#2a2a1a;color:#d29922">📋 无教训对照</span>',
         agent_short: '<span class="strategy-badge" style="background:#4a1a1a;color:#f85149">🔻 做空Agent</span>',
         onchain: '<span class="strategy-badge" style="background:#1a3a2a;color:#0ECB81">🔗 链上监控</span>',
+        supertrend: '<span class="strategy-badge" style="background:#1a2a3a;color:#4fc3f7">📈 超级趋势</span>',
     };
     let html = '';
     for (const s of strategies) {
@@ -5855,6 +5925,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
   <a href="/onchain">🔍 链上监控</a>
   <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -6272,6 +6343,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
   <a href="/onchain" class="active">🔍 链上监控</a>
   <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -6638,6 +6710,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system,Bli
   <a href="/onchain">🔍 链上监控</a>
   <a href="/alpha-cluster" class="active">🔬 Alpha 集群查询</a>
   <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 
@@ -6847,6 +6920,317 @@ def alpha_cluster_page():
     )
 
 
+# ---- 超级趋势策略（主流币趋势交易）----
+
+@app.get("/api/supertrend/overview")
+def api_supertrend_overview():
+    with storage.get_conn() as main_conn:
+        settings = storage.trading_settings_get(main_conn)
+        positions = [dict(r) for r in main_conn.execute(
+            "SELECT * FROM trade_positions WHERE strategy='supertrend' "
+            "ORDER BY id DESC LIMIT 100")]
+        open_pos = [p for p in positions if p["status"] in ("OPEN", "PARTIAL")]
+        closed = [p for p in positions if p["status"] == "CLOSED"][:20]
+    with storage.get_conn(config.SUPERTREND_DB) as st_conn:
+        tokens = [dict(r) for r in st_conn.execute(
+            "SELECT * FROM supertrend_tokens ORDER BY added_at DESC")]
+        status_map = {r["token"]: dict(r) for r in st_conn.execute(
+            "SELECT * FROM supertrend_status")}
+    cards = []
+    for t in tokens:
+        if t["status"] != "ACTIVE":
+            continue
+        st = status_map.get(t["token"], {})
+        pos = next((p for p in open_pos if p["token"] == t["token"]), None)
+        cards.append({
+            "token": t["token"],
+            "token_status": t["status"],
+            "trend": st.get("trend"),
+            "upper_band": st.get("upper_band"),
+            "lower_band": st.get("lower_band"),
+            "last_candle_ts": st.get("last_candle_ts"),
+            "last_price": st.get("last_price"),
+            "state": st.get("state"),
+            "fetch_error": st.get("fetch_error"),
+            "updated_at": st.get("updated_at"),
+            "forming_trend": st.get("forming_trend"),
+            "forming_upper_band": st.get("forming_upper_band"),
+            "forming_lower_band": st.get("forming_lower_band"),
+            "position": pos,
+        })
+    return {
+        "enabled": bool(settings.get("supertrend_enabled", True)),
+        "params": {
+            "tolerance_pct": settings.get("supertrend_sl_tolerance_pct", 1.0),
+            "notional_usd": settings.get("supertrend_notional_usd", 50.0),
+            "leverage": settings.get("supertrend_leverage", 3.0),
+        },
+        "cards": cards,
+        "history": closed,
+    }
+
+
+@app.post("/api/supertrend/tokens")
+def api_supertrend_add(body: TokenBody):
+    token = (body.token or "").strip().upper()
+    if not token or not all(c.isalnum() for c in token) or len(token) > 20:
+        raise HTTPException(400, "币种格式无效（如 BTC）")
+    import supertrend_strategy
+    if supertrend_strategy._fetch_okx_supertrend(token, attempts=1) is None:
+        raise HTTPException(400, "该币种无 OKX 永续合约超势数据")
+    if not supertrend_strategy.get_mark_price(token):
+        raise HTTPException(400, "该币种无币安标记价（扫损检测依赖）")
+    now = int(time.time())
+    with storage.get_conn(config.SUPERTREND_DB) as conn:
+        conn.execute(
+            "INSERT INTO supertrend_tokens (token, status, added_at) VALUES (?, 'ACTIVE', ?) "
+            "ON CONFLICT(token) DO UPDATE SET status='ACTIVE', removed_at=NULL, added_at=?",
+            (token, now, now),
+        )
+    return {"ok": True, "token": token}
+
+
+@app.delete("/api/supertrend/tokens/{token}")
+def api_supertrend_remove(token: str):
+    token = token.strip().upper()
+    import supertrend_strategy
+    now = int(time.time())
+    with storage.get_conn(config.SUPERTREND_DB) as conn:
+        cur = conn.execute(
+            "UPDATE supertrend_tokens SET status='REMOVED', removed_at=? "
+            "WHERE token=? AND status='ACTIVE'",
+            (now, token),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "该币种未在监控列表中")
+    closed = supertrend_strategy.close_supertrend_position(token, "REMOVED")
+    return {"ok": True, "token": token, "closed": closed}
+
+
+SUPERTREND_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>主流币趋势交易</title>
+<style>
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; max-width: 1100px; margin: 0 auto; font-size: 13px; }
+.nav-bar { display: flex; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin-bottom: 8px; }
+.muted { color: var(--muted); }
+.green { color: var(--green); }
+.red { color: var(--red); }
+.yellow { color: var(--yellow); }
+.add-row { display: flex; gap: 8px; margin-top: 10px; }
+.add-row input { flex: 0 0 200px; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 13px; }
+.add-row button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.card { background: #0a0e15; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+.card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.card-head .token { font-size: 15px; font-weight: 700; color: var(--accent); }
+.card-head button { background: #3a1a1a; color: var(--red); border: 1px solid #5a2a2a; border-radius: 4px; padding: 3px 10px; cursor: pointer; font-size: 11px; }
+.kv { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
+.kv .k { color: var(--muted); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge-up { background: #1a3a2a; color: var(--green); }
+.badge-down { background: #3a1a1a; color: var(--red); }
+.badge-flat { background: #2a2a2a; color: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 11px; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+tr:hover { background: rgba(88,166,255,0.04); }
+.right { text-align: right; }
+.toast { position: fixed; top: 20px; right: 20px; padding: 10px 18px; border-radius: 6px; color: #fff; font-size: 13px; z-index: 999; opacity: 0; transition: opacity 0.3s; }
+.toast.show { opacity: 1; }
+.toast.ok { background: var(--green); }
+.toast.err { background: var(--red); }
+</style>
+</head>
+<body>
+
+<div class="nav-bar">
+  <a href="/">📊 市场监控</a>
+  <a href="/strategies">📈 运行策略</a>
+  <div class="nav-dropdown">
+    <a href="#">🤖 Agent 面板 ▾</a>
+    <div class="nav-dropdown-content">
+      <a href="/agent">Agent-合约扫描</a>
+      <a href="/heat-agent">Agent-热度榜单</a>
+      <a href="/agent-heat-lessons">Agent-热度有教训</a>
+      <a href="/agent-nl">Agent-无教训</a>
+      <a href="/agent-short">Agent-做空</a>
+      <a href="/agent-kol">Agent-KOL 监控</a>
+      <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
+    </div>
+  </div>
+  <a href="/dashboard">📊 市场全景</a>
+  <a href="/onchain">🔍 链上监控</a>
+  <a href="/alpha-cluster">🔬 Alpha 集群</a>
+  <a href="/live-onchain">💹 实盘监控</a>
+  <a href="/supertrend" class="active">📈 主流币趋势</a>
+  <a href="/settings">⚙ 系统设置</a>
+</div>
+
+<h1>📈 主流币趋势交易（15m 超级趋势）</h1>
+<div class="muted" id="strategy-state" style="margin-bottom:14px">加载中...</div>
+
+<div class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+    <b>监控币种</b>
+    <span class="muted" id="params-line"></span>
+  </div>
+  <div class="add-row">
+    <input id="add-token" placeholder="输入币种，如 BTC" maxlength="20">
+    <button onclick="addToken()">添加监控</button>
+    <span class="muted" id="add-hint" style="align-self:center">添加后 ≤60s 按当前 15m 趋势自动开仓</span>
+  </div>
+</div>
+
+<div class="cards" id="cards"><span class="muted">加载中...</span></div>
+
+<div class="panel">
+  <b>扫损重开历史</b><span class="muted" style="margin-left:8px;font-size:11px">（最近 20 条）</span>
+  <div id="history-table" style="margin-top:8px"><span class="muted">加载中...</span></div>
+</div>
+
+<script>
+const fmtUsd = v => (v!=null && !isNaN(Number(v))) ? '$'+Number(v).toFixed(2) : '--';
+const fmtPct = v => (v!=null && !isNaN(Number(v))) ? (v>=0?'+':'')+Number(v).toFixed(2)+'%' : '--';
+const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=1?Number(v).toFixed(4):Number(v).toFixed(6));
+const fmtTime = ts => { if (!ts) return '—'; try { const d = new Date(ts.replace(' ','T')+'Z'); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); } catch { return ts; } };
+
+function showToast(msg, cls) {
+  let el = document.getElementById('toast');
+  if (!el) { el = document.createElement('div'); el.id = 'toast'; el.className = 'toast'; document.body.appendChild(el); }
+  el.textContent = msg; el.className = 'toast ' + cls + ' show';
+  setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+function addToken() {
+  const v = document.getElementById('add-token').value.trim().toUpperCase();
+  if (!v) return;
+  fetch('/api/supertrend/tokens', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: v})
+  }).then(async r => {
+    const d = await r.json();
+    if (r.ok) { showToast(v + ' 已加入监控', 'ok'); document.getElementById('add-token').value=''; load(); }
+    else showToast('添加失败：' + (d.detail || '未知'), 'err');
+  }).catch(e => showToast('添加失败：' + e.message, 'err'));
+}
+
+function removeToken(token) {
+  if (!confirm('移除 ' + token + ' 监控？将立即平仓该币持仓。')) return;
+  fetch('/api/supertrend/tokens/' + token, {method: 'DELETE'})
+    .then(async r => {
+      const d = await r.json();
+      if (r.ok) { showToast(token + ' 已移除监控' + (d.closed ? '，已平仓' : ''), 'ok'); load(); }
+      else showToast('移除失败：' + (d.detail || '未知'), 'err');
+    }).catch(e => showToast('移除失败：' + e.message, 'err'));
+}
+
+function renderCards(cards) {
+  const el = document.getElementById('cards');
+  if (!cards.length) { el.innerHTML = '<span class="muted">暂无监控币种</span>'; return; }
+  let h = '';
+  for (const c of cards) {
+    const trendBadge = c.trend === 'UP' ? '<span class="badge badge-up">▲ UP</span>'
+      : c.trend === 'DOWN' ? '<span class="badge badge-down">▼ DOWN</span>'
+      : '<span class="badge badge-flat">等待信号</span>';
+    const p = c.position;
+    let posHtml = '<div class="kv"><span class="k">持仓</span><span>空仓' + (c.state==='HOLDING' ? '' : '（等待开仓）') + '</span></div>';
+    if (p) {
+      const upnl = Number(p.unrealized_pnl || 0);
+      const cls = upnl >= 0 ? 'green' : 'red';
+      posHtml = '<div class="kv"><span class="k">持仓</span><span>' + (p.side==='LONG'?'多':'空') + ' @' + fmtPrice(p.entry_price) + ' → SL ' + fmtPrice(p.stop_loss_price) + '</span></div>'
+        + '<div class="kv"><span class="k">浮盈</span><span class="' + cls + '">' + fmtUsd(upnl) + ' (' + fmtPct(p.pnl_pct) + ')</span></div>'
+        + '<div class="kv"><span class="k">持仓时间</span><span>' + fmtTime(p.created_at) + '</span></div>';
+    }
+    const fetchErr = c.fetch_error ? '<div class="kv"><span class="k">⚠ 数据</span><span class="red">' + c.fetch_error + '</span></div>' : '';
+    const sigAge = c.updated_at ? '<div class="kv"><span class="k">信号更新</span><span>' + Math.floor((Date.now()/1000 - c.updated_at)) + ' 秒前</span></div>' : '';
+    const klineTime = c.last_candle_ts ? '<div class="kv"><span class="k">K线时间</span><span>' + new Date(c.last_candle_ts).toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-') + '</span></div>' : '';
+    // 有持仓用系统 2s 刷新的 current_price，无持仓用线程 60s 的 last_price
+    const showPrice = (p && p.current_price != null) ? p.current_price : c.last_price;
+    const formingHtml = c.forming_trend
+      ? '<div class="kv"><span class="k">实时轨道（参考）</span><span class="muted">' + (c.forming_trend === 'UP' ? '▲' : '▼') + ' ' + c.forming_trend + ' · 上 ' + fmtPrice(c.forming_upper_band) + ' · 下 ' + fmtPrice(c.forming_lower_band) + '</span></div>'
+      : '';
+    h += '<div class="card">'
+      + '<div class="card-head"><span class="token">' + c.token + '</span>' + trendBadge + '<button onclick="removeToken(\\'' + c.token + '\\')">移除监控</button></div>'
+      + '<div class="kv"><span class="k">上轨道（已闭合）</span><span>' + fmtPrice(c.upper_band) + '</span></div>'
+      + '<div class="kv"><span class="k">下轨道（已闭合）</span><span>' + fmtPrice(c.lower_band) + '</span></div>'
+      + formingHtml
+      + '<div class="kv"><span class="k">最新价</span><span>' + fmtPrice(showPrice) + '</span></div>'
+      + posHtml + fetchErr + sigAge + klineTime
+      + '</div>';
+  }
+  el.innerHTML = h;
+}
+
+function renderHistory(list) {
+  const el = document.getElementById('history-table');
+  if (!list.length) { el.innerHTML = '<span class="muted">暂无平仓记录</span>'; return; }
+  let h = '<table><thead><tr><th>时间</th><th>币种</th><th>方向</th><th class="right">开仓价</th><th class="right">平仓价</th><th class="right">盈亏%</th><th class="right">盈亏$</th><th>结果</th></tr></thead><tbody>';
+  for (const p of list) {
+    const cls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
+    const isRemove = (p.advice||'').includes('移除');
+    const result = isRemove ? '移除平仓' : '扫损→重开';
+    h += '<tr><td>' + fmtTime(p.closed_at) + '</td><td style="font-weight:bold;color:var(--accent)">' + p.token + '</td><td>' + (p.side==='LONG'?'多':'空') + '</td>'
+      + '<td class="right">' + fmtPrice(p.entry_price) + '</td><td class="right">' + fmtPrice(p.current_price) + '</td>'
+      + '<td class="right ' + cls + '">' + fmtPct(p.pnl_pct) + '</td><td class="right ' + cls + '">' + fmtUsd(p.realized_pnl) + '</td>'
+      + '<td>' + result + '</td></tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/supertrend/overview');
+    const d = await r.json();
+    document.getElementById('strategy-state').innerHTML = d.enabled
+      ? '● 运行中 · 每 60s 跟随 15m 超势更新止损 · 扫损后按趋势重开'
+      : '<span class="red">○ 已暂停（设置页开关关闭）——已有持仓仍受系统 2s 扫损保护</span>';
+    document.getElementById('params-line').textContent =
+      '容忍 ' + d.params.tolerance_pct + '% · 名义 $' + d.params.notional_usd + ' · 杠杆 ' + d.params.leverage + 'x（设置页可改，热生效）';
+    renderCards(d.cards);
+    renderHistory(d.history);
+  } catch(e) {
+    document.getElementById('cards').innerHTML = '<span class="red">加载失败: ' + e.message + '</span>';
+  }
+}
+
+document.getElementById('add-token').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') addToken();
+});
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/supertrend", response_class=HTMLResponse)
+def supertrend_page():
+    return HTMLResponse(
+        content=SUPERTREND_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
 @app.get("/strategies", response_class=HTMLResponse)
 def strategies_page():
     return HTMLResponse(
@@ -6923,6 +7307,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
   <a href="/onchain">🔍 链上监控</a>
   <a href="/alpha-cluster">🔬 Alpha 集群</a>
   <a href="/live-onchain" class="active">💹 实盘监控</a>
+  <a href="/supertrend">📈 主流币趋势</a>
   <a href="/settings">⚙ 系统设置</a>
 </div>
 

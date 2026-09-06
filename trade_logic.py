@@ -1130,6 +1130,7 @@ def update_paper_positions(conn):
         # ---- 止损：考虑滑点（比 stop 价更差的价格成交）----
         stop_triggered = (stop > 0 and price >= stop) if is_short else (stop > 0 and price <= stop)
         if stop_triggered:
+            is_supertrend = pos.get("strategy") == "supertrend"
             # 真实场景止损触发时常有滑点；paper 交易模拟更保守的成交价
             if is_short:
                 fill_price = max(price, stop * (1 + config.TRADING_STOP_SLIPPAGE_PCT / 100))
@@ -1138,7 +1139,7 @@ def update_paper_positions(conn):
                 slip_factor = 1 - config.TRADING_STOP_SLIPPAGE_PCT / 100
                 fill_price = min(price, stop * slip_factor)
                 realized += (fill_price - entry) * open_qty
-            if realized < 0:
+            if realized < 0 and not is_supertrend:
                 _archive_stop_loss(conn, pos, fill_price, realized, market, realtime)
             fields.update({
                 "status": "CLOSED",
@@ -1152,17 +1153,18 @@ def update_paper_positions(conn):
             })
             storage.trade_position_update(conn, pos["id"], fields)
             storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
-            # 写平仓 journal
-            _cs_snap = get_market_snapshot(pos["token"], heavy=True)
-            _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
-            close_snap = _build_close_snap(fill_price, _cs_snap or {}, _cs_analysis)
-            storage.journal_add_close(
-                conn, order_id=pos["id"], token=pos["token"], price=fill_price,
-                reason=f"止损触发 @ ${fill_price:.6g}（含假设滑点）",
-                pnl_pct=_margin_pnl_pct(realized, 0, float(pos.get("margin_amount") or 1)),
-                close_reason="sl_hit", dimension_data=close_snap,
-                hold_duration=_calc_hold(pos.get("created_at")),
-            )
+            # 写平仓 journal（supertrend 跳过：不污染 agent 复盘数据）
+            if not is_supertrend:
+                _cs_snap = get_market_snapshot(pos["token"], heavy=True)
+                _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
+                close_snap = _build_close_snap(fill_price, _cs_snap or {}, _cs_analysis)
+                storage.journal_add_close(
+                    conn, order_id=pos["id"], token=pos["token"], price=fill_price,
+                    reason=f"止损触发 @ ${fill_price:.6g}（含假设滑点）",
+                    pnl_pct=_margin_pnl_pct(realized, 0, float(pos.get("margin_amount") or 1)),
+                    close_reason="sl_hit", dimension_data=close_snap,
+                    hold_duration=_calc_hold(pos.get("created_at")),
+                )
             if pos.get("strategy") == "onchain":
                 _archive_onchain_pool(pos["token"])
             continue
