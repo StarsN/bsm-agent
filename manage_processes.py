@@ -22,12 +22,15 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 PID_FILE = BASE_DIR / ".monitor_processes.json"
 WEB_URL = "http://127.0.0.1:8000"
+# 错峰启动：轻量进程在前，最重的 worker（Chromium+抓取）放最后，
+# 每进程间隔 START_INTERVAL 秒，避免 import 高峰+Chromium 启动在 2 核 CPU 上叠加
 PROGRAMS = [
-    ("worker", "worker.py"),
-    ("market_realtime", "market_realtime.py"),
     ("web", "web.py"),
     ("auto_trader", "auto_trader.py"),
+    ("market_realtime", "market_realtime.py"),
+    ("worker", "worker.py"),
 ]
+START_INTERVAL = 20
 
 
 def _load_state() -> dict:
@@ -117,7 +120,7 @@ def start(open_browser: bool = True):
         state[name] = info
         changed = True
         print(f"{name}: started pid={info['pid']}")
-        time.sleep(0.8)
+        time.sleep(START_INTERVAL)
 
     if changed:
         _save_state(state)
@@ -138,7 +141,17 @@ def _stop_pid(pid: int) -> bool:
             check=False,
         )
     else:
+        # SIGTERM 优雅退出；SSE 长连接/阻塞调用可能导致优雅退出卡住，
+        # 3 秒未退出则升级 SIGKILL 强杀
         os.kill(pid, signal.SIGTERM)
+        for _ in range(6):
+            time.sleep(0.5)
+            if not _pid_running(pid):
+                return True
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
     return True
 
 

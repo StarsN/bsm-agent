@@ -3,6 +3,7 @@ Web 仪表盘服务
 运行：python web.py
 访问：http://localhost:8000
 """
+import asyncio
 import json
 import subprocess
 import sys
@@ -11,8 +12,10 @@ import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+import requests
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -33,6 +36,57 @@ import kol_agent
 
 
 app = FastAPI(title="Binance Square Monitor")
+
+
+# ============================================================
+# 统一导航栏：高频直达 + 分组下拉（各页面 HTML 用 {NAV} 占位符）
+# ============================================================
+_NAV_ITEMS = [
+    ("/", "📊 市场监控", "home"),
+    ("/strategies", "📈 运行策略", "strategies"),
+    ("/alphafox", "📡 跟单雷达", "alphafox"),
+]
+_NAV_DROPDOWNS = [
+    ("🔍 链上数据", [
+        ("/onchain", "链上监控", "onchain"),
+        ("/alpha-cluster", "Alpha 集群", "alpha-cluster"),
+        ("/live-onchain", "实盘监控", "live-onchain"),
+    ]),
+    ("📈 策略行情", [
+        ("/dashboard", "市场全景", "dashboard"),
+        ("/supertrend", "主流币趋势", "supertrend"),
+    ]),
+    ("🤖 Agent 面板", [
+        ("/agent", "Agent-合约扫描", "agent"),
+        ("/heat-agent", "Agent-热度榜单", "heat-agent"),
+        ("/agent-heat-lessons", "Agent-热度有教训", "agent-heat-lessons"),
+        ("/agent-nl", "Agent-无教训", "agent-nl"),
+        ("/agent-short", "Agent-做空", "agent-short"),
+        ("/agent-kol", "Agent-KOL 监控", "agent-kol"),
+        ("/agent-kol-snapshot", "Agent-KOL 快照监控", "agent-kol-snapshot"),
+    ]),
+]
+_NAV_TAIL = ("/settings", "⚙ 系统设置", "settings")
+
+
+def _nav_html(active: str) -> str:
+    parts = []
+    for href, label, key in _NAV_ITEMS:
+        cls = ' class="active"' if key == active else ''
+        parts.append(f'<a href="{href}"{cls}>{label}</a>')
+    for title, entries in _NAV_DROPDOWNS:
+        cur = any(k == active for _, _, k in entries)
+        tcls = ' class="active"' if cur else ''
+        parts.append(f'<div class="nav-dropdown"><a href="#" {tcls}>{title} ▾</a>'
+                     f'<div class="nav-dropdown-content">')
+        for href, label, key in entries:
+            cls = ' class="active"' if key == active else ''
+            parts.append(f'<a href="{href}"{cls}>{label}</a>')
+        parts.append('</div></div>')
+    href, label, key = _NAV_TAIL
+    cls = ' class="active"' if key == active else ''
+    parts.append(f'<a href="{href}"{cls}>{label}</a>')
+    return '<div class="nav-bar">\n  ' + '\n  '.join(parts) + '\n</div>'
 
 
 # ============================================================
@@ -648,9 +702,15 @@ class TradingSettingsBody(BaseModel):
     onchain_live_mode: str | None = None
     supertrend_enabled: bool | None = None
     supertrend_sl_tolerance_pct: float | None = None
+    supertrend_order_tolerance_pct: float | None = None
     supertrend_notional_usd: float | None = None
     supertrend_leverage: float | None = None
     strategy_initial_supertrend: float | None = None
+    alphafox_poll_seconds: int | None = None
+    alphafox_trade_enabled: bool | None = None
+    alphafox_trade_budget: float | None = None
+    alphafox_slippage_pct: float | None = None
+    alphafox_fee_pct: float | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -1068,7 +1128,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1088,6 +1148,14 @@ def api_trading_settings(body: TradingSettingsBody):
         raise HTTPException(400, "supertrend 杠杆必须在 [1, 125] 之间")
     if "strategy_initial_supertrend" in fields and fields["strategy_initial_supertrend"] < 0:
         raise HTTPException(400, "supertrend 初始金额不能为负数")
+    if "alphafox_poll_seconds" in fields and not (5 <= fields["alphafox_poll_seconds"] <= 300):
+        raise HTTPException(400, "alphafox 探测间隔必须在 [5, 300] 秒之间")
+    if "alphafox_trade_budget" in fields and fields["alphafox_trade_budget"] <= 0:
+        raise HTTPException(400, "跟单总额必须为正数")
+    if "alphafox_slippage_pct" in fields and not (0 <= fields["alphafox_slippage_pct"] <= 5):
+        raise HTTPException(400, "跟单滑点必须在 [0, 5] 之间")
+    if "alphafox_fee_pct" in fields and not (0 <= fields["alphafox_fee_pct"] <= 5):
+        raise HTTPException(400, "跟单手续费必须在 [0, 5] 之间")
     with storage.get_conn() as conn:
         storage.trading_settings_update(conn, fields)
         settings = storage.trading_settings_get(conn)
@@ -1702,7 +1770,8 @@ def api_trading_reset_strategy(body: TradingResetStrategyBody):
         raise HTTPException(400, "需要 confirm=true 以确认重置")
     strategy = body.strategy.strip().lower()
     valid = {"agent", "heat_agent", "heat_agent_lessons", "agent_no_lessons",
-             "kol_agent", "kol_snapshot", "system", "manual", "agent_short", "onchain"}
+             "kol_agent", "kol_snapshot", "system", "manual", "agent_short", "onchain",
+             "supertrend"}
     if strategy not in valid:
         raise HTTPException(400, f"无效策略: {body.strategy}")
     with storage.get_conn() as conn:
@@ -2090,6 +2159,18 @@ HTML = """
 <title>Binance Square Monitor</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root {
   --bg: #0f1419;
   --panel: #1a1f2e;
@@ -2399,23 +2480,16 @@ tr.flash { animation: row-flash 1.5s ease-out; }
   vertical-align: middle;
   cursor: default;
 }
-.nav-bar {
-  display: flex; justify-content: center; gap: 0; margin-bottom: 16px;
-  border-bottom: 1px solid var(--border); padding-bottom: 0;
-}
-.nav-bar a {
-  padding: 10px 24px; color: var(--muted); text-decoration: none;
-  font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
-  transition: all 0.2s;
-}
-.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown { position: relative; }
-.nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
-.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
-.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
-.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
-.nav-dropdown:hover .nav-dropdown-content { display: block; }
+
+
+
+
+
+
+
+
+
+
 </style>
 </head>
 <body>
@@ -2423,28 +2497,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
 <div class="progress-bar" id="progress-bar"><div class="fill" id="progress-fill" style="width:0%"></div></div>
 <div class="toast" id="toast"></div>
 
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-  <a href="#">🤖 Agent 面板 ▾</a>
-  <div class="nav-dropdown-content">
-    <a href="/agent">Agent-合约扫描</a>
-    <a href="/heat-agent">Agent-热度榜单</a>
-    <a href="/agent-heat-lessons">Agent-热度有教训</a>
-    <a href="/agent-nl">Agent-无教训</a>
-                <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-          </div>
-</div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <div style="display:flex;align-items:center;gap:16px;margin-bottom:4px;">
 <h1 style="margin:0">🔥 热度监控</h1>
@@ -3358,6 +3411,18 @@ AGENT_HTML = """
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root {
   --bg: #0f1419; --panel: #1a1f2e; --border: #2a3142;
   --text: #e6e8eb; --muted: #8b92a5; --accent: #58a6ff;
@@ -3374,22 +3439,16 @@ h2 { font-size: 14px; color: var(--accent); margin: 0 0 10px; }
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .header-time { color: var(--muted); font-size: 12px; }
 .subtitle { color: var(--muted); font-size: 12px; margin-top: 2px; }
-.nav-bar-agent {
-  display: flex; justify-content: center; gap: 0; margin-bottom: 16px;
-  border-bottom: 1px solid var(--border); padding-bottom: 0;
-}
-.nav-bar-agent a {
-  padding: 10px 24px; color: var(--muted); text-decoration: none;
-  font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
-}
-.nav-bar-agent a.active, .nav-bar-agent a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-bar-agent .nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
-.nav-bar-agent .nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown { position: relative; }
-.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
-.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
-.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
-.nav-dropdown:hover .nav-dropdown-content { display: block; }
+
+
+
+
+
+
+
+
+
+
 .nav-link { color: var(--accent); text-decoration: none; font-size: 12px; }
 .nav-link:hover { text-decoration: underline; }
 
@@ -3476,28 +3535,7 @@ tr:hover { background: #1f2536; }
 </head>
 <body>
 
-<div class="nav-bar-agent">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-    <a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-    <a href="/agent-heat-lessons">Agent-热度有教训</a>
-    <a href="/agent-nl">Agent-无教训</a>
-                <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-              </div>
-  </div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <div class="header">
   <div>
@@ -4254,6 +4292,18 @@ SETTINGS_HTML = """
 <title>系统设置 - BSM Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root {
   --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
   --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
@@ -4282,23 +4332,16 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .toast.show { opacity: 1; }
 .toast.ok { background: var(--green); }
 .toast.err { background: var(--red); }
-.nav-bar {
-  display: flex; justify-content: center; gap: 0; margin-bottom: 20px;
-  border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap;
-}
-.nav-bar a {
-  padding: 8px 16px; color: var(--muted); text-decoration: none;
-  font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent;
-  transition: all 0.2s; white-space: nowrap;
-}
-.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown { position: relative; }
-.nav-dropdown > a { display: inline-block; padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
-.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 140px; z-index: 100; padding: 4px 0; }
-.nav-dropdown-content a { display: block; padding: 6px 14px; color: var(--text); border-bottom: none !important; font-size: 12px; white-space: nowrap; }
-.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
-.nav-dropdown:hover .nav-dropdown-content { display: block; }
+
+
+
+
+
+
+
+
+
+
 .strategy-block {
   border-bottom: 1px solid var(--border); padding: 12px 0;
 }
@@ -4311,25 +4354,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 </style>
 </head>
 <body>
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-  <a href="#">🤖 Agent 面板 ▾</a>
-  <div class="nav-dropdown-content">
-    <a href="/agent">Agent-合约扫描</a>
-    <a href="/heat-agent">Agent-热度榜单</a>
-    <a href="/agent-heat-lessons">Agent-热度有教训</a>
-    <a href="/agent-nl">Agent-无教训</a>
-                <a href="/agent-short">Agent-做空</a>
-    <a href="/agent-kol">Agent-KOL 监控</a>
-              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-  </div>
-</div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/settings" class="active">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <h1>⚙ 系统设置</h1>
 
@@ -4672,6 +4697,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <input id="trade-supertrend-tolerance" type="number" min="0" max="20" step="0.1">
       </div>
       <div>
+        <label>挂单容忍%（挂单价离轨道的百分比）</label>
+        <input id="trade-supertrend-order-tolerance" type="number" min="0" max="20" step="0.1">
+      </div>
+      <div>
         <label>每笔名义金额 USDT</label>
         <input id="trade-supertrend-notional" type="number" min="1" step="1">
       </div>
@@ -4681,6 +4710,40 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       </div>
     </div>
     <div style="color:var(--muted);font-size:11px;margin-top:4px">修改后点击「保存设置」立即生效，无需重启（监控币种在 /supertrend 页面添加）</div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">跟单雷达（alphofox 数据源）</div>
+    <div class="grid3">
+      <div>
+        <label>探测间隔（秒）</label>
+        <input id="trade-alphafox-poll" type="number" min="5" max="300" step="5">
+      </div>
+      <div>
+        <label>跟单开关</label>
+        <select id="trade-alphafox-trade-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>跟单总额 USDT</label>
+        <input id="trade-alphafox-budget" type="number" min="10" step="10">
+      </div>
+      <div>
+        <label>滑点 %</label>
+        <input id="trade-alphafox-slip" type="number" min="0" max="5" step="0.01">
+      </div>
+      <div>
+        <label>手续费 %</label>
+        <input id="trade-alphafox-fee" type="number" min="0" max="5" step="0.01">
+      </div>
+    </div>
+    <div style="color:var(--muted);font-size:11px;margin-top:4px">跟单开关为总开关（每交易员的跟单在 /alphafox 页面按钮控制）；参数修改后立即生效</div>
+    <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
+      <button type="button" onclick="syncAlphofoxSymbols()" style="background:var(--accent);color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer;font-size:13px;font-weight:600">同步跟单交易对映射</button>
+      <span class="muted" id="alphafox-sync-result" style="font-size:12px">从 Hyperliquid 拉取全部 HIP-3 合约符号入库（已存在的映射不覆盖）</span>
+    </div>
   </div>
 
   <div class="strategy-block">
@@ -4730,6 +4793,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <option value="manual">手动</option>
         <option value="agent_short">Agent-做空版</option>
         <option value="onchain">链上监控</option>
+        <option value="supertrend">主流币趋势</option>
       </select>
     </div>
     <div>
@@ -4816,8 +4880,14 @@ async function loadSettings() {
     document.getElementById('trade-supertrend-switch').value = s.supertrend_enabled ?? true;
     document.getElementById('trade-strategy-supertrend').value = s.strategy_initial_supertrend ?? 1000;
     document.getElementById('trade-supertrend-tolerance').value = s.supertrend_sl_tolerance_pct ?? 1.0;
+    document.getElementById('trade-supertrend-order-tolerance').value = s.supertrend_order_tolerance_pct ?? 1.0;
     document.getElementById('trade-supertrend-notional').value = s.supertrend_notional_usd ?? 50;
     document.getElementById('trade-supertrend-leverage').value = s.supertrend_leverage ?? 3;
+    document.getElementById('trade-alphafox-poll').value = s.alphafox_poll_seconds ?? 30;
+    document.getElementById('trade-alphafox-trade-switch').value = s.alphafox_trade_enabled ?? true;
+    document.getElementById('trade-alphafox-budget').value = s.alphafox_trade_budget ?? 1000;
+    document.getElementById('trade-alphafox-slip').value = s.alphafox_slippage_pct ?? 0.05;
+    document.getElementById('trade-alphafox-fee').value = s.alphafox_fee_pct ?? 0.04;
     document.getElementById('trade-strategy-agent').value = s.strategy_initial_agent ?? 1000;
     document.getElementById('trade-strategy-heat').value = s.strategy_initial_heat_agent ?? 1000;
     document.getElementById('trade-strategy-system').value = s.strategy_initial_system ?? 1000;
@@ -4826,6 +4896,18 @@ async function loadSettings() {
     document.getElementById('trade-strategy-nl').value = s.strategy_initial_agent_no_lessons ?? 1000;
     document.getElementById('trade-strategy-heat-lessons').value = s.strategy_initial_heat_agent_lessons ?? 1000;
   } catch(e) { console.error(e); }
+}
+async function syncAlphofoxSymbols() {
+  const el = document.getElementById('alphafox-sync-result');
+  if (el) el.textContent = '同步中...';
+  fetch('/api/alphofox/sync-symbols', {method: 'POST'})
+    .then(async r => {
+      const d = await r.json();
+      if (el) el.textContent = r.ok
+        ? ('同步完成：新增 ' + d.added + ' 个，已存在跳过 ' + d.skipped + ' 个')
+        : ('同步失败：' + (d.detail || '未知'));
+    })
+    .catch(e => { if (el) el.textContent = '同步失败：' + e.message; });
 }
 async function saveTradingSettings() {
   const body = {
@@ -4881,9 +4963,15 @@ async function saveTradingSettings() {
     onchain_live_mode: document.getElementById('trade-onchain-live-mode').value,
     supertrend_enabled: document.getElementById('trade-supertrend-switch').value === 'true',
     supertrend_sl_tolerance_pct: Number(document.getElementById('trade-supertrend-tolerance').value),
+    supertrend_order_tolerance_pct: Number(document.getElementById('trade-supertrend-order-tolerance').value),
     supertrend_notional_usd: Number(document.getElementById('trade-supertrend-notional').value),
     supertrend_leverage: Number(document.getElementById('trade-supertrend-leverage').value),
     strategy_initial_supertrend: Number(document.getElementById('trade-strategy-supertrend').value),
+    alphafox_poll_seconds: Number(document.getElementById('trade-alphafox-poll').value),
+    alphafox_trade_enabled: document.getElementById('trade-alphafox-trade-switch').value === 'true',
+    alphafox_trade_budget: Number(document.getElementById('trade-alphafox-budget').value),
+    alphafox_slippage_pct: Number(document.getElementById('trade-alphafox-slip').value),
+    alphafox_fee_pct: Number(document.getElementById('trade-alphafox-fee').value),
   };
   const oldSource = document.getElementById('trade-data-source').getAttribute('data-original') || '';
   const newSource = body.okx_data_source_enabled ? 'true' : 'false';
@@ -4960,7 +5048,7 @@ loadSettings();
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page():
     return HTMLResponse(
-        content=SETTINGS_HTML,
+        content=SETTINGS_HTML.replace("{NAV}", _nav_html("settings")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -5043,6 +5131,7 @@ def api_strategy_stats():
             "system": ts.get("system_auto_trade_enabled", True),
             "onchain": ts.get("onchain_strategy_enabled", True),
             "supertrend": ts.get("supertrend_enabled", True),
+            "alphafox": ts.get("alphafox_trade_enabled", True),
         }
         for s in strategies:
             s["running"] = enabled_map.get(s["strategy"], True)
@@ -5124,6 +5213,18 @@ KOL_AGENT_HTML = """
 <title>AI 判断流详细版 - BSM Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root {
   --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
   --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
@@ -5133,23 +5234,16 @@ KOL_AGENT_HTML = """
 body { background: var(--bg); color: var(--text); font-family: 'Inter','JetBrains Mono',-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif; padding: 20px; max-width: 1200px; margin: 0 auto; font-size: 13px; }
 h1 { font-size: 20px; margin-bottom: 4px; }
 h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
-.nav-bar {
-  display: flex; justify-content: center; gap: 0; margin-bottom: 16px;
-  border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap;
-}
-.nav-bar a {
-  padding: 8px 16px; color: var(--muted); text-decoration: none;
-  font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent;
-  transition: all 0.2s; white-space: nowrap;
-}
-.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown { position: relative; }
-.nav-dropdown > a { display: inline-block; padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
-.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 140px; z-index: 100; padding: 4px 0; }
-.nav-dropdown-content a { display: block; padding: 6px 14px; color: var(--text); border-bottom: none !important; font-size: 12px; white-space: nowrap; }
-.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
-.nav-dropdown:hover .nav-dropdown-content { display: block; }
+
+
+
+
+
+
+
+
+
+
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .header-time { color: var(--muted); font-size: 12px; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
@@ -5217,28 +5311,7 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
 </head>
 <body>
 
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-    <a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-    <a href="/agent-heat-lessons">Agent-热度有教训</a>
-    <a href="/agent-nl">Agent-无教训</a>
-                <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-          </div>
-  </div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <div class="header">
   <div></div>
@@ -5446,6 +5519,18 @@ STRATEGIES_HTML = """
 <title>运行策略 - BSM Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root {
   --bg: #0f1419; --panel: #1a1f2e; --border: #2a3142;
   --text: #e6e8eb; --muted: #8b92a5; --accent: #58a6ff;
@@ -5456,16 +5541,16 @@ body { background: var(--bg); color: var(--text); font-family: 'JetBrains Mono',
 h1 { font-size: 20px; margin-bottom: 8px; }
 h2 { font-size: 15px; margin: 20px 0 12px; color: var(--accent); }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
-.nav-bar { display: flex; justify-content: center; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
-.nav-bar a { padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
-.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown { position: relative; }
-.nav-dropdown > a { display: inline-block; padding: 10px 24px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; }
-.nav-dropdown > a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 160px; z-index: 100; padding: 4px 0; }
-.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--text); border-bottom: none !important; font-size: 13px; white-space: nowrap; }
-.nav-dropdown-content a:hover { background: #1a1f2e; color: var(--accent) !important; }
-.nav-dropdown:hover .nav-dropdown-content { display: block; }
+
+
+
+
+
+
+
+
+
+
 .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
 .metric { background: #0a0e15; padding: 10px 12px; border-radius: 8px; }
 .metric .label { color: var(--muted); font-size: 11px; }
@@ -5489,28 +5574,7 @@ td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 </style>
 </head>
 <body>
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies" class="active">📈 运行策略</a>
-  <div class="nav-dropdown">
-    <a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-    <a href="/agent-heat-lessons">Agent-热度有教训</a>
-    <a href="/agent-nl">Agent-无教训</a>
-                <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-              </div>
-  </div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <h1>📈 运行策略</h1>
 
@@ -5557,6 +5621,7 @@ async function load() {
         agent_short: '<span class="strategy-badge" style="background:#4a1a1a;color:#f85149">🔻 做空Agent</span>',
         onchain: '<span class="strategy-badge" style="background:#1a3a2a;color:#0ECB81">🔗 链上监控</span>',
         supertrend: '<span class="strategy-badge" style="background:#1a2a3a;color:#4fc3f7">📈 超级趋势</span>',
+        alphafox: '<span class="strategy-badge" style="background:#2a1a3a;color:#e0a0ff">📡 跟单雷达</span>',
     };
     let html = '';
     for (const s of strategies) {
@@ -5791,14 +5856,14 @@ setInterval(loadLLMLogs,60000);
 @app.get("/heat-agent", response_class=HTMLResponse)
 def heat_agent_page():
     return HTMLResponse(
-        content=HEAT_AGENT_HTML,
+        content=HEAT_AGENT_HTML.replace("{NAV}", _nav_html("heat-agent")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
 @app.get("/agent-nl", response_class=HTMLResponse)
 def agent_nl_page():
     return HTMLResponse(
-        content=NL_AGENT_HTML,
+        content=NL_AGENT_HTML.replace("{NAV}", _nav_html("agent-nl")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -5806,14 +5871,14 @@ def agent_nl_page():
 @app.get("/agent-short", response_class=HTMLResponse)
 def agent_short_page():
     return HTMLResponse(
-        content=AGENT_SHORT_HTML,
+        content=AGENT_SHORT_HTML.replace("{NAV}", _nav_html("agent-short")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
 @app.get("/agent-kol-snapshot", response_class=HTMLResponse)
 def agent_kol_snapshot_page():
     return HTMLResponse(
-        content=KOL_SNAPSHOT_MONITOR_HTML,
+        content=KOL_SNAPSHOT_MONITOR_HTML.replace("{NAV}", _nav_html("agent-kol-snapshot")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -5821,28 +5886,28 @@ def agent_kol_snapshot_page():
 @app.get("/agent-kol", response_class=HTMLResponse)
 def agent_kol_page():
     return HTMLResponse(
-        content=KOL_MONITOR_HTML,
+        content=KOL_MONITOR_HTML.replace("{NAV}", _nav_html("agent-kol")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
 @app.get("/agent-heat-lessons", response_class=HTMLResponse)
 def agent_heat_lessons_page():
     return HTMLResponse(
-        content=HEAT_LESSONS_HTML,
+        content=HEAT_LESSONS_HTML.replace("{NAV}", _nav_html("agent-heat-lessons")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
 @app.get("/kol", response_class=HTMLResponse)
 def kol_agent_page():
     return HTMLResponse(
-        content=KOL_AGENT_HTML,
+        content=KOL_AGENT_HTML.replace("{NAV}", _nav_html("agent-kol")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page():
     return HTMLResponse(
-        content=DASHBOARD_HTML,
+        content=DASHBOARD_HTML.replace("{NAV}", _nav_html("dashboard")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -5853,13 +5918,25 @@ DASHBOARD_HTML = """
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>市场全景分析 — BSM Agent</title>
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root{--bg:#0a0e14;--panel:#11161d;--border:#1e2530;--text:#c9d1d9;--muted:#6e7681;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--orange:#f0883e}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Inter',-apple-system,"Microsoft YaHei",sans-serif;padding:16px;max-width:1400px;margin:0 auto;font-size:13px}
 h1{font-size:18px;margin-bottom:2px}h2{font-size:14px;color:var(--accent);margin-bottom:6px}
-.nav-bar{display:flex;justify-content:center;gap:0;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:0;flex-wrap:wrap}
-.nav-bar a{padding:8px 14px;color:var(--muted);text-decoration:none;font-size:12px;font-weight:500;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}
-.nav-bar a.active,.nav-bar a:hover{color:var(--accent);border-bottom-color:var(--accent)}
+
+
+
 .header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .status-badge{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:600}
 .status-warning{background:#3a2a0a;color:var(--yellow);border:1px solid var(--yellow);animation:breathe 2s ease-in-out infinite}
@@ -5904,30 +5981,10 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .refresh-info{font-size:11px;color:var(--muted)}
 .empty{text-align:center;color:var(--muted);padding:20px}
 @media(max-width:768px){.metrics-row{grid-template-columns:repeat(3,1fr)}.macro-4col{grid-template-columns:1fr 1fr}.events-grid{grid-template-columns:1fr}}
-.nav-dropdown{position:relative}.nav-dropdown>a{display:inline-block;padding:8px 14px;color:var(--muted);text-decoration:none;font-size:12px;font-weight:500;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}.nav-dropdown>a:hover{color:var(--accent);border-bottom-color:var(--accent)}.nav-dropdown-content{display:none;position:absolute;top:100%;left:0;background:var(--panel);border:1px solid var(--border);border-radius:6px;min-width:140px;z-index:100;padding:4px 0}.nav-dropdown-content a{display:block;padding:6px 14px;color:var(--text);border-bottom:none!important;font-size:12px;white-space:nowrap}.nav-dropdown-content a:hover{background:#1a1f2e;color:var(--accent)!important}.nav-dropdown:hover .nav-dropdown-content{display:block}
+.nav-dropdown>a{display:inline-block;padding:8px 14px;color:var(--muted);text-decoration:none;font-size:12px;font-weight:500;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}.nav-dropdown>a:hover{color:var(--accent);border-bottom-color:var(--accent)}.nav-dropdown-content{display:none;position:absolute;top:100%;left:0;background:var(--panel);border:1px solid var(--border);border-radius:6px;min-width:140px;z-index:100;padding:4px 0}.nav-dropdown-content a{display:block;padding:6px 14px;color:var(--text);border-bottom:none!important;font-size:12px;white-space:nowrap}.nav-dropdown-content a:hover{background:#1a1f2e;color:var(--accent)!important}.nav-dropdown:hover .nav-dropdown-content{display:block}
 </style></head><body>
 
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown"><a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约搜索</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/agent-heat-lessons">Agent-热度有教训</a>
-      <a href="/agent-nl">Agent-无教训</a>
-                <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-              <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-    </div>
-  </div>
-  <a href="/dashboard" class="active">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <div class="header-row">
   <div><h1>📊 市场全景分析</h1></div>
@@ -6054,6 +6111,18 @@ CLUSTER_HTML = """
 <title>集群监控</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&family=JetBrains+Mono&display=swap" rel="stylesheet">
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root {
   --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
   --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
@@ -6064,9 +6133,16 @@ body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-ser
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
 h1 { font-size: 20px; margin-bottom: 20px; }
 h2 { font-size: 16px; margin-bottom: 12px; color: var(--accent); }
-.nav-bar { display: flex; justify-content: center; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap; }
-.nav-bar a { padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
-.nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+
+
+
+
+
+
+
+
+
+
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
 td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
@@ -6096,12 +6172,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
 </head>
 <body>
 
-<div class="nav-bar">
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/onchain/token" class="active">📋 集群监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-</div>
+{NAV}
 
 <h1 id="page-title">集群监控</h1>
 
@@ -6260,6 +6331,18 @@ ONCHAIN_HTML = """
 <title>链上监控</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&family=JetBrains+Mono&display=swap" rel="stylesheet">
 <style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
 :root {
   --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; --muted: #8b949e;
   --accent: #58a6ff; --border: #30363d; --red: #f85149; --green: #3fb950;
@@ -6270,14 +6353,14 @@ body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-ser
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
 h1 { font-size: 20px; margin-bottom: 20px; }
 h2 { font-size: 16px; margin-bottom: 12px; color: var(--accent); }
-.nav-bar { display: flex; justify-content: center; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap; }
-.nav-bar a { padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; font-weight: 500; border-bottom: 2px solid transparent; transition: all 0.2s; white-space: nowrap; }
-.nav-bar a.active, .nav-bar a:hover { color: var(--accent); border-bottom-color: var(--accent); }
-.nav-dropdown { position: relative; display: inline-block; }
-.nav-dropdown-content { display: none; position: absolute; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 200px; z-index: 100; }
-.nav-dropdown:hover .nav-dropdown-content { display: block; }
-.nav-dropdown-content a { display: block; padding: 8px 16px; color: var(--muted); text-decoration: none; font-size: 12px; }
-.nav-dropdown-content a:hover { color: var(--accent); background: rgba(88,166,255,0.06); }
+
+
+
+
+
+
+
+
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
 td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
@@ -6324,28 +6407,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
 </head>
 <body>
 
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-    <a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/agent-heat-lessons">Agent-热度有教训</a>
-      <a href="/agent-nl">Agent-无教训</a>
-      <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-      <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-    </div>
-  </div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain" class="active">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <h1>链上监控 — Stage 1 吸筹 & Stage 2 启动准备</h1>
 
@@ -6622,7 +6684,7 @@ setInterval(loadOnchain, 60000);
 @app.get("/onchain", response_class=HTMLResponse)
 def onchain_page():
     return HTMLResponse(
-        content=ONCHAIN_HTML,
+        content=ONCHAIN_HTML.replace("{NAV}", _nav_html("onchain")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -6630,7 +6692,7 @@ def onchain_page():
 @app.get("/onchain/token/{token}", response_class=HTMLResponse)
 def cluster_page(token: str):
     return HTMLResponse(
-        content=CLUSTER_HTML,
+        content=CLUSTER_HTML.replace("{NAV}", _nav_html("cluster")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -6642,19 +6704,31 @@ ALPHA_CLUSTER_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Alpha 集群查询</title>
 <style>
-:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --purple: #a371f7; --yellow: #d2991d; }
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; }
-.nav-bar { display: flex; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
 .nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
 .nav-bar a:hover { color: var(--text); }
 .nav-bar a.active { color: var(--accent); font-weight: 600; }
 .nav-dropdown { position: relative; display: inline-block; }
-.nav-dropdown > a { cursor: pointer; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
 .nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
 .nav-dropdown:hover .nav-dropdown-content { display: block; }
 .nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
 .nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --purple: #a371f7; --yellow: #d2991d; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; }
+
+
+
+
+
+
+
+
+
+
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 .metric-row { display: flex; gap: 20px; flex-wrap: wrap; }
 .metric { display: flex; flex-direction: column; gap: 2px; }
@@ -6691,28 +6765,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system,Bli
 </head>
 <body>
 
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-    <a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/agent-heat-lessons">Agent-热度有教训</a>
-      <a href="/agent-nl">Agent-无教训</a>
-      <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-      <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-    </div>
-  </div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster" class="active">🔬 Alpha 集群查询</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <h1>🔬 Alpha 集群查询</h1>
 <p style="color:var(--muted);font-size:13px;margin-bottom:16px">输入任意 Token 符号，实时拉取链上集群数据</p>
@@ -6915,33 +6968,318 @@ document.getElementById('token-input').addEventListener('keydown', function(e) {
 @app.get("/alpha-cluster", response_class=HTMLResponse)
 def alpha_cluster_page():
     return HTMLResponse(
-        content=ALPHA_CLUSTER_HTML,
+        content=ALPHA_CLUSTER_HTML.replace("{NAV}", _nav_html("alpha-cluster")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
+
+
+# ---- Alphafox 跟单雷达（数据源: alphafox.app，SSE 推送无缓存）----
+
+AF_BASE = "https://www.alphafox.app"
+AF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "Chrome/126.0 Safari/537.36",
+}
+
+_af_latest = {}    # sourceId -> {"version": int, "payload": {"snapshot","dna","symbol_stats"}}
+_af_watchers = {}  # sourceId -> SSE 订阅计数（探测线程只探测有订阅的交易员）
+_af_lock = threading.Lock()
+
+
+def _af_request(path: str, method: str = "GET", body: dict | None = None) -> dict:
+    """直连 alphofox；dna 需要 Origin/Referer 头绕过 same-origin 校验"""
+    headers = dict(AF_HEADERS)
+    if method == "POST":
+        headers.update({
+            "Content-Type": "application/json",
+            "Origin": AF_BASE,
+            "Referer": AF_BASE + "/zh/radar",
+        })
+        resp = requests.post(AF_BASE + path, headers=headers, json=body, timeout=15)
+    else:
+        resp = requests.get(AF_BASE + path, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _af_build_payload(snapshot: dict, prev_dna: dict | None = None) -> dict:
+    """snapshot + dna 合并 + 币种盈亏聚合 + 裁剪页面不用的字段（SSE 推送体积）。
+    dna 失败时回退上一次的 dna（避免分析 tab 闪空）。"""
+    data = snapshot.get("data") or {}
+    pid = data.get("portfolioId")
+    dna = None
+    if pid:
+        try:
+            dna = _af_request("/api/radar/dna", "POST", {"portfolioId": str(pid)})
+        except Exception as e:
+            print(f"[alphafox] dna 拉取失败: {e}")
+            dna = prev_dna
+    # 裁剪 snapshot：只保留页面字段（丢掉 closedPositions/lifecycle/performanceCurve 等大字段）
+    snap_keep = ("marginBalance", "aumAmount", "currentCopyCount", "maxCopyCount",
+                 "effectiveLeverage", "sharpRatio", "winRate", "maxDrawdown",
+                 "totalPnl", "totalCopierPnl", "traderName", "avatarUrl", "polledAt",
+                 "positions", "latestOrders", "tradePoints")
+    slim_snap = {k: data.get(k) for k in snap_keep}
+    slim_snap["portfolioId"] = pid
+    slim_dna = None
+    if dna:
+        if "data" in dna and isinstance(dna.get("data"), dict):
+            # 原始 alphofox dna 响应 → 裁剪
+            norm = (dna.get("data") or {}).get("normalized") or {}
+            slim_dna = {
+                "profile": (norm.get("profile") or {}).get("description"),
+                "profitSharingRate": (norm.get("profile") or {}).get("profitSharingRate"),
+                "performance": norm.get("performance"),
+                "charts": (norm.get("charts") or {}).get("items"),
+                "cycleItems": (norm.get("positions") or {}).get("items"),
+            }
+        else:
+            # 回退场景：已是裁剪后的 slim 结构
+            slim_dna = dna
+    symbol_stats = []
+    if slim_dna and slim_dna.get("cycleItems"):
+        items = slim_dna["cycleItems"]
+        agg: dict = {}
+        for it in items:
+            a = agg.setdefault(it.get("symbol"), {
+                "count": 0, "pnl": 0.0, "wins": 0, "losses": 0, "items": []})
+            a["count"] += 1
+            a["pnl"] += it.get("pnl") or 0
+            if (it.get("pnl") or 0) > 0:
+                a["wins"] += 1
+            elif (it.get("pnl") or 0) < 0:
+                a["losses"] += 1
+            a["items"].append(it)
+        for sym, a in agg.items():
+            symbol_stats.append({
+                "symbol": sym,
+                "count": a["count"],
+                "pnl": round(a["pnl"], 4),
+                "win_rate": round(a["wins"] / max(a["wins"] + a["losses"], 1) * 100, 1),
+                "items": sorted(a["items"], key=lambda x: x.get("openTime") or 0, reverse=True),
+            })
+        symbol_stats.sort(key=lambda x: -x["pnl"])
+    return {"snapshot": slim_snap, "dna": slim_dna, "symbol_stats": symbol_stats}
+
+
+def _af_poll_loop():
+    """探测线程：探测集合 = 页面订阅 ∪ 跟单交易员（跟单交易员恒探测不漏信号）。
+    polledAt 变化 → ①系统跟单处理（先开仓）→ ②更新推送载荷（页面刷新）→ ③TG 异步。
+    页面通过 SSE 收到完整数据直接渲染，无缓存。"""
+    import alphafox_trade
+    import tg_notify
+    alphafox_trade.init_db()
+    while True:
+        try:
+            with storage.get_conn() as conn:
+                ts = storage.trading_settings_get(conn)
+                poll = int(ts.get("alphafox_poll_seconds")
+                           or getattr(config, "ALPHAFOX_POLL_SECONDS", 30))
+                trade_enabled = bool(ts.get("alphafox_trade_enabled", True))
+                raw_budget = ts.get("alphafox_trade_budget")
+                raw_slip = ts.get("alphafox_slippage_pct")
+                raw_fee = ts.get("alphafox_fee_pct")
+                trade_params = {
+                    "budget": float(raw_budget)
+                    if raw_budget is not None else getattr(config, "ALPHAFOX_TRADE_BUDGET", 1000.0),
+                    "slip": float(raw_slip)
+                    if raw_slip is not None else getattr(config, "ALPHAFOX_SLIPPAGE_PCT", 0.05),
+                    "fee": float(raw_fee)
+                    if raw_fee is not None else getattr(config, "ALPHAFOX_FEE_PCT", 0.04),
+                }
+        except Exception:
+            poll = getattr(config, "ALPHAFOX_POLL_SECONDS", 30)
+            trade_enabled = getattr(config, "ALPHAFOX_TRADE_ENABLED", True)
+            trade_params = {"budget": 1000.0, "slip": 0.05, "fee": 0.04}
+        with _af_lock:
+            ids = list(_af_watchers.keys())
+        following = set(alphafox_trade.following_ids()) if trade_enabled else set()
+        ids = list(dict.fromkeys(ids + list(following)))  # 去重保序
+        for sid in ids:
+            try:
+                snap = _af_request(f"/api/radar/snapshot?sourceId={sid}")
+                prev = _af_latest.get(sid) or {}
+                prev_polled = (((prev.get("payload") or {}).get("snapshot") or {})
+                               .get("data") or {}).get("polledAt")
+                cur_polled = (snap.get("data") or {}).get("polledAt")
+                if cur_polled and cur_polled != prev_polled:
+                    # ① 系统跟单处理（同步，先开平仓）
+                    tg_signals = []
+                    if sid in following:
+                        try:
+                            tg_signals = alphafox_trade.process(sid, snap, trade_params)
+                        except Exception as e:
+                            print(f"[alphafox] 跟单处理 {sid} 异常: {e}")
+                    # ② 更新页面推送载荷（仅当有页面订阅时构建，避免无谓的 dna 调用）
+                    with _af_lock:
+                        has_watcher = _af_watchers.get(sid, 0) > 0
+                    if has_watcher:
+                        prev_dna = ((prev.get("payload") or {}).get("dna"))
+                        payload = _af_build_payload(snap, prev_dna)
+                        _af_latest[sid] = {
+                            "version": (prev.get("version") or 0) + 1,
+                            "payload": payload,
+                        }
+                    # ③ TG 异步推送（不阻塞）
+                    if tg_signals:
+                        threading.Thread(
+                            target=tg_notify.send_alphafox_signals,
+                            args=(tg_signals,), daemon=True).start()
+            except Exception as e:
+                print(f"[alphafox] 探测 {sid} 异常: {e}")
+        time.sleep(max(5, poll))
+
+
+_af_thread = threading.Thread(target=_af_poll_loop, daemon=True)
+_af_thread.start()
+
+
+@app.post("/api/alphofox/sync-symbols")
+def api_alphofox_sync_symbols():
+    """设置页按钮：从 Hyperliquid meta API 同步全部 HIP-3 合约符号到映射表"""
+    import alphafox_trade
+    alphafox_trade.init_db()
+    try:
+        return alphafox_trade.sync_symbols_from_hl()
+    except Exception as e:
+        raise HTTPException(500, f"同步失败: {e}")
+
+
+@app.get("/api/alphafox/traders")
+def api_alphafox_traders():
+    """交易员列表（30s 缓存，低频共享数据），附跟单状态"""
+    def compute():
+        d = _af_request("/api/radar/traders")
+        return d.get("traders") or []
+    try:
+        import alphafox_trade
+        fmap = alphafox_trade.following_map()
+        traders = _cached("alphafox_traders", 30, compute)
+        for t in traders:
+            t["following"] = fmap.get(t.get("id"), False)
+        return {"ok": True, "traders": traders}
+    except Exception as e:
+        raise HTTPException(502, f"alphofox 数据源不可用: {e}") from e
+
+
+@app.post("/api/alphafox/follow")
+def api_alphafox_follow(body: dict):
+    """跟单按钮：启用/移除某交易员的跟单（写 alphafox.db）"""
+    trader_id = (body.get("trader_id") or "").strip()
+    follow = bool(body.get("follow"))
+    label = (body.get("label") or "").strip()
+    signal_type = body.get("signal_type") or ""
+    if not trader_id:
+        raise HTTPException(400, "trader_id 必填")
+    import alphafox_trade
+    alphafox_trade.set_follow(trader_id, label, signal_type, follow)
+    return {"ok": True, "trader_id": trader_id, "follow": follow}
+
+
+@app.get("/api/alphafox/detail")
+def api_alphafox_detail(sourceId: str = ""):
+    """交易员详情（页面切换时一次性直连；之后更新走 SSE 推送）"""
+    if not sourceId:
+        raise HTTPException(400, "sourceId 必填")
+    try:
+        snap = _af_request(f"/api/radar/snapshot?sourceId={sourceId}")
+    except Exception as e:
+        raise HTTPException(502, f"alphofox 数据源不可用: {e}") from e
+    return _af_build_payload(snap)
+
+
+@app.get("/api/alphafox/stream")
+async def api_alphafox_stream(request: Request, sourceId: str = ""):
+    """SSE：探测线程发现数据更新 → 推送完整 payload"""
+    if not sourceId:
+        raise HTTPException(400, "sourceId 必填")
+
+    async def gen():
+        with _af_lock:
+            _af_watchers[sourceId] = _af_watchers.get(sourceId, 0) + 1
+        last_ver = (_af_latest.get(sourceId) or {}).get("version", 0)
+        try:
+            yield "event: connected\ndata: {}\n\n"
+            idle = 0
+            while True:
+                try:
+                    if await request.is_disconnected():
+                        break
+                except Exception:
+                    pass  # 旧版 starlette 无此方法，靠心跳 yield 感知断开
+                await asyncio.sleep(1)
+                cur = _af_latest.get(sourceId)
+                ver = cur.get("version", 0) if cur else 0
+                if ver and ver != last_ver:
+                    last_ver = ver
+                    idle = 0
+                    yield ("event: updated\ndata: "
+                           + json.dumps(cur["payload"], ensure_ascii=False) + "\n\n")
+                else:
+                    idle += 1
+                    if idle >= 20:
+                        # 心跳：yield 在客户端断开时抛异常退出（兜底注销 watcher），
+                        # 同时防中间代理空闲超时断连
+                        idle = 0
+                        yield ": ping\n\n"
+        except Exception:
+            pass  # 客户端断开（yield 抛异常），静默退出
+        finally:
+            with _af_lock:
+                _af_watchers[sourceId] = _af_watchers.get(sourceId, 1) - 1
+                if _af_watchers[sourceId] <= 0:
+                    _af_watchers.pop(sourceId, None)
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ---- 超级趋势策略（主流币趋势交易）----
 
 @app.get("/api/supertrend/overview")
 def api_supertrend_overview():
+    import supertrend_strategy
+    supertrend_strategy.init_db()  # 幂等迁移：web 可能先于 worker 启动，确保新列已加
     with storage.get_conn() as main_conn:
         settings = storage.trading_settings_get(main_conn)
         positions = [dict(r) for r in main_conn.execute(
             "SELECT * FROM trade_positions WHERE strategy='supertrend' "
             "ORDER BY id DESC LIMIT 100")]
-        open_pos = [p for p in positions if p["status"] in ("OPEN", "PARTIAL")]
+        open_pos = [p for p in positions if p["status"] in ("OPEN", "PARTIAL", "PENDING")]
         closed = [p for p in positions if p["status"] == "CLOSED"][:20]
     with storage.get_conn(config.SUPERTREND_DB) as st_conn:
         tokens = [dict(r) for r in st_conn.execute(
-            "SELECT * FROM supertrend_tokens ORDER BY added_at DESC")]
+            "SELECT * FROM supertrend_tokens ORDER BY "
+            "COALESCE(sort_order, 999999) ASC, added_at DESC")]
         status_map = {r["token"]: dict(r) for r in st_conn.execute(
             "SELECT * FROM supertrend_status")}
+        try:
+            snap_map = {r["position_id"]: dict(r) for r in st_conn.execute(
+                "SELECT * FROM supertrend_close_snaps")}
+        except Exception:
+            snap_map = {}  # 新表尚未由 worker 建出（web 先重启）时兜底
+    for p in closed:
+        p["close_snap"] = snap_map.get(p["id"])
     cards = []
     for t in tokens:
         if t["status"] != "ACTIVE":
             continue
         st = status_map.get(t["token"], {})
-        pos = next((p for p in open_pos if p["token"] == t["token"]), None)
+        # 持仓与挂单并存（反转市价开场景）：持仓优先显示，挂单单独一行
+        pos = next((p for p in open_pos
+                    if p["token"] == t["token"] and p["status"] in ("OPEN", "PARTIAL")), None)
+        pend = next((p for p in open_pos
+                     if p["token"] == t["token"] and p["status"] == "PENDING"), None)
+        last_price = st.get("last_price")
+        if t.get("paused") in (1, "1", True) and pos is None:
+            # 暂停币线程不刷新价格 → 实时取一次，避免页面显示冻结旧值
+            try:
+                live = supertrend_strategy.get_mark_price(t["token"])
+                if live:
+                    last_price = live
+            except Exception:
+                pass
         cards.append({
             "token": t["token"],
             "token_status": t["status"],
@@ -6949,19 +7287,28 @@ def api_supertrend_overview():
             "upper_band": st.get("upper_band"),
             "lower_band": st.get("lower_band"),
             "last_candle_ts": st.get("last_candle_ts"),
-            "last_price": st.get("last_price"),
+            "last_price": last_price,
             "state": st.get("state"),
             "fetch_error": st.get("fetch_error"),
             "updated_at": st.get("updated_at"),
             "forming_trend": st.get("forming_trend"),
             "forming_upper_band": st.get("forming_upper_band"),
             "forming_lower_band": st.get("forming_lower_band"),
+            "notional_usd": t.get("notional_usd"),
+            "sl_tolerance_pct": t.get("sl_tolerance_pct"),
+            "order_tolerance_pct": t.get("order_tolerance_pct"),
+            "leverage": t.get("leverage"),
+            "direction": t.get("direction") or "BOTH",
+            "flip_market_open": t.get("flip_market_open") in (1, "1", True),
+            "paused": t.get("paused") in (1, "1", True),
             "position": pos,
+            "pending": pend,
         })
     return {
         "enabled": bool(settings.get("supertrend_enabled", True)),
         "params": {
             "tolerance_pct": settings.get("supertrend_sl_tolerance_pct", 1.0),
+            "order_tolerance_pct": settings.get("supertrend_order_tolerance_pct", 1.0),
             "notional_usd": settings.get("supertrend_notional_usd", 50.0),
             "leverage": settings.get("supertrend_leverage", 3.0),
         },
@@ -6987,7 +7334,91 @@ def api_supertrend_add(body: TokenBody):
             "ON CONFLICT(token) DO UPDATE SET status='ACTIVE', removed_at=NULL, added_at=?",
             (token, now, now),
         )
+        # 清除旧信号状态：重新激活走首次流程（记基准→等闭合），
+        # 不带移除前的旧 trend（否则可能误判"反转"立即市价开）
+        conn.execute("DELETE FROM supertrend_status WHERE token=?", (token,))
     return {"ok": True, "token": token}
+
+
+@app.post("/api/supertrend/set-token")
+def api_supertrend_set_token(body: dict):
+    """单币参数设置：空字符串/None → NULL（用全局默认），越界 → 400"""
+    import supertrend_strategy
+    supertrend_strategy.init_db()  # 幂等迁移：web 可能先于 worker 启动，确保新列已加
+    token = (body.get("token") or "").strip().upper()
+    if not token:
+        raise HTTPException(400, "缺少币种")
+
+    def _num(v, lo, hi, name):
+        if v is None or str(v).strip() == "":
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{name} 格式无效")
+        if not (lo <= f <= hi):
+            raise HTTPException(400, f"{name} 需在 {lo}~{hi} 之间")
+        return f
+
+    notional = _num(body.get("notional_usd"), 0.01, 1e8, "名义金额")
+    sl_tol = _num(body.get("sl_tolerance_pct"), 0, 20, "SL容忍")
+    order_tol = _num(body.get("order_tolerance_pct"), 0, 20, "挂单容忍")
+    lev = _num(body.get("leverage"), 1, 125, "杠杆")
+    direction = str(body.get("direction") or "BOTH").strip().upper()
+    if direction not in ("BOTH", "LONG_ONLY", "SHORT_ONLY"):
+        raise HTTPException(400, "方向只能是 BOTH / LONG_ONLY / SHORT_ONLY")
+    flip = 1 if str(body.get("flip_market_open")).strip() in ("1", "true", "True") else 0
+    if direction == "BOTH":
+        flip = 0  # 反转市价开仅对方向限制的币有意义
+    with storage.get_conn(config.SUPERTREND_DB) as conn:
+        cur = conn.execute(
+            "UPDATE supertrend_tokens SET notional_usd=?, sl_tolerance_pct=?, "
+            "order_tolerance_pct=?, leverage=?, direction=?, flip_market_open=? "
+            "WHERE token=?",
+            (notional, sl_tol, order_tol, lev, direction, flip, token),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "该币种未在监控列表中")
+    return {"ok": True, "token": token}
+
+
+@app.post("/api/supertrend/pause")
+def api_supertrend_pause(body: dict):
+    """单币暂停/恢复监控。暂停=线程跳过（不拉信号不处理），持仓/挂单不动；
+    恢复=清 status 走首次流程（不追溯暂停期间的反转）。"""
+    import supertrend_strategy
+    supertrend_strategy.init_db()
+    token = (body.get("token") or "").strip().upper()
+    if not token:
+        raise HTTPException(400, "缺少币种")
+    paused = 1 if body.get("paused") else 0
+    with storage.get_conn(config.SUPERTREND_DB) as conn:
+        cur = conn.execute(
+            "UPDATE supertrend_tokens SET paused=? WHERE token=?", (paused, token))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "该币种未在监控列表中")
+        if paused:
+            conn.execute(
+                "UPDATE supertrend_status SET state='PAUSED' WHERE token=?", (token,))
+        else:
+            conn.execute("DELETE FROM supertrend_status WHERE token=?", (token,))
+    return {"ok": True, "token": token, "paused": bool(paused)}
+
+
+@app.post("/api/supertrend/reorder")
+def api_supertrend_reorder(body: dict):
+    """卡片拖拽排序：tokens 列表顺序 → sort_order 索引（幂等）"""
+    import supertrend_strategy
+    supertrend_strategy.init_db()
+    tokens = body.get("tokens") or []
+    if not isinstance(tokens, list) or not tokens:
+        raise HTTPException(400, "tokens 列表无效")
+    with storage.get_conn(config.SUPERTREND_DB) as conn:
+        for i, tk in enumerate(tokens):
+            conn.execute(
+                "UPDATE supertrend_tokens SET sort_order=? WHERE token=?",
+                (i, str(tk).strip().upper()))
+    return {"ok": True}
 
 
 @app.delete("/api/supertrend/tokens/{token}")
@@ -7014,19 +7445,31 @@ SUPERTREND_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>主流币趋势交易</title>
 <style>
-:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; max-width: 1100px; margin: 0 auto; font-size: 13px; }
-.nav-bar { display: flex; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
 .nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
 .nav-bar a:hover { color: var(--text); }
 .nav-bar a.active { color: var(--accent); font-weight: 600; }
 .nav-dropdown { position: relative; display: inline-block; }
-.nav-dropdown > a { cursor: pointer; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
 .nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
 .nav-dropdown:hover .nav-dropdown-content { display: block; }
 .nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
 .nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; max-width: 1100px; margin: 0 auto; font-size: 13px; }
+
+
+
+
+
+
+
+
+
+
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 h1 { font-size: 20px; margin-bottom: 8px; }
 .muted { color: var(--muted); }
@@ -7037,10 +7480,22 @@ h1 { font-size: 20px; margin-bottom: 8px; }
 .add-row input { flex: 0 0 200px; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 13px; }
 .add-row button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
-.card { background: #0a0e15; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+.card { background: #0a0e15; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; user-select: none; cursor: grab; }
+/* 暂停样式只淡化内容行，头部（含操作菜单）保持清晰——opacity 乘法继承无法在子级还原 */
+.card.paused { border-color: #5a5a2a; background: #0d1118; }
+.card.paused .kv { opacity: 0.6; }
 .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .card-head .token { font-size: 15px; font-weight: 700; color: var(--accent); }
 .card-head button { background: #3a1a1a; color: var(--red); border: 1px solid #5a2a2a; border-radius: 4px; padding: 3px 10px; cursor: pointer; font-size: 11px; }
+.card-head .btn-set { background: #1a2230; color: var(--accent); border: 1px solid #2a3a50; margin-right: 6px; }
+.card-head .menu-btn { background: #1a2230; color: var(--muted); border: 1px solid #2a3a50; }
+.card-menu-wrap { position: relative; }
+.card-menu { position: absolute; right: 0; top: calc(100% + 4px); background: var(--panel); border: 1px solid var(--border); border-radius: 6px; min-width: 110px; z-index: 20; padding: 4px 0; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+.card-menu.show { display: block; }
+.card-menu button { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--text); padding: 7px 14px; cursor: pointer; font-size: 12px; border-radius: 0; }
+.card-menu button:hover { background: rgba(88,166,255,0.1); }
+.card-menu button.danger { color: var(--red); }
+.card-menu button.danger:hover { background: rgba(248,81,73,0.1); }
 .kv { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
 .kv .k { color: var(--muted); }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
@@ -7056,32 +7511,21 @@ tr:hover { background: rgba(88,166,255,0.04); }
 .toast.show { opacity: 1; }
 .toast.ok { background: var(--green); }
 .toast.err { background: var(--red); }
+.modal-mask { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 998; }
+.modal-mask.show { display: flex; align-items: center; justify-content: center; }
+.modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px; width: 340px; }
+.modal-box h3 { margin-bottom: 14px; font-size: 15px; }
+.modal-box label { display: block; color: var(--muted); margin: 10px 0 4px; font-size: 12px; }
+.modal-box input, .modal-box select { width: 100%; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 13px; }
+.modal-btns { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
+.modal-btns button { border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 13px; }
+.btn-primary { background: var(--accent); color: #fff; border: none; font-weight: 600; }
+.btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
 </style>
 </head>
 <body>
 
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-    <a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/agent-heat-lessons">Agent-热度有教训</a>
-      <a href="/agent-nl">Agent-无教训</a>
-      <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-      <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-    </div>
-  </div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain">💹 实盘监控</a>
-  <a href="/supertrend" class="active">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <h1>📈 主流币趋势交易（15m 超级趋势）</h1>
 <div class="muted" id="strategy-state" style="margin-bottom:14px">加载中...</div>
@@ -7094,11 +7538,40 @@ tr:hover { background: rgba(88,166,255,0.04); }
   <div class="add-row">
     <input id="add-token" placeholder="输入币种，如 BTC" maxlength="20">
     <button onclick="addToken()">添加监控</button>
-    <span class="muted" id="add-hint" style="align-self:center">添加后 ≤60s 按当前 15m 趋势自动开仓</span>
+    <span class="muted" id="add-hint" style="align-self:center">添加后等 15m K 线闭合自动开仓</span>
   </div>
 </div>
 
 <div class="cards" id="cards"><span class="muted">加载中...</span></div>
+
+<div class="modal-mask" id="tok-modal">
+  <div class="modal-box">
+    <h3 id="tok-modal-title">币种设置</h3>
+    <label>名义金额 USDT（留空=全局 <span id="ph-notional"></span>）</label>
+    <input id="set-notional" type="number" step="1" min="0.01">
+    <label>SL 容忍 %（留空=全局 <span id="ph-sl"></span>）</label>
+    <input id="set-sl-tol" type="number" step="0.1" min="0" max="20">
+    <label>挂单容忍 %（留空=全局 <span id="ph-order"></span>）</label>
+    <input id="set-order-tol" type="number" step="0.1" min="0" max="20">
+    <label>杠杆（留空=全局 <span id="ph-lev"></span>）</label>
+    <input id="set-lev" type="number" step="1" min="1" max="125">
+    <label>方向</label>
+    <select id="set-direction" onchange="toggleFlip()">
+      <option value="BOTH">多空都做</option>
+      <option value="LONG_ONLY">只做多</option>
+      <option value="SHORT_ONLY">只做空</option>
+    </select>
+    <label>趋势反转到允许方向时立即市价开仓（仅只做多/只做空生效）</label>
+    <select id="set-flip">
+      <option value="0">否（反转时正常挂单）</option>
+      <option value="1">是（反转时市价开仓 + 挂单）</option>
+    </select>
+    <div class="modal-btns">
+      <button class="btn-ghost" onclick="closeTokenModal()">取消</button>
+      <button class="btn-primary" onclick="saveTokenSettings()">保存</button>
+    </div>
+  </div>
+</div>
 
 <div class="panel">
   <b>扫损重开历史</b><span class="muted" style="margin-left:8px;font-size:11px">（最近 20 条）</span>
@@ -7141,24 +7614,216 @@ function removeToken(token) {
     }).catch(e => showToast('移除失败：' + e.message, 'err'));
 }
 
+let _lastCards = [];
+let _editToken = null;
+
+function toggleCardMenu(e, token) {
+  e.stopPropagation();
+  const menu = document.getElementById('menu-' + token);
+  if (!menu) return;
+  const wasOpen = menu.classList.contains('show');
+  document.querySelectorAll('.card-menu.show').forEach(m => m.classList.remove('show'));
+  if (!wasOpen) menu.classList.add('show');
+}
+
+function togglePause(token, paused) {
+  fetch('/api/supertrend/pause', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: token, paused: paused})
+  }).then(async r => {
+    const d = await r.json();
+    if (r.ok) { showToast(token + (paused ? ' 已暂停监控（持仓/挂单不受影响）' : ' 已恢复监控'), 'ok'); load(); }
+    else showToast('操作失败：' + (d.detail || '未知'), 'err');
+  }).catch(e => showToast('操作失败：' + e.message, 'err'));
+}
+
+function toggleFlip() {
+  const d = document.getElementById('set-direction').value;
+  const flip = document.getElementById('set-flip');
+  flip.disabled = (d === 'BOTH');
+  if (d === 'BOTH') flip.value = '0';
+}
+
+function openTokenModal(token) {
+  const c = _lastCards.find(x => x.token === token);
+  if (!c) return;
+  _editToken = token;
+  document.getElementById('tok-modal-title').textContent = token + ' 设置（留空=用全局默认）';
+  document.getElementById('set-notional').value = c.notional_usd != null ? c.notional_usd : '';
+  document.getElementById('set-sl-tol').value = c.sl_tolerance_pct != null ? c.sl_tolerance_pct : '';
+  document.getElementById('set-order-tol').value = c.order_tolerance_pct != null ? c.order_tolerance_pct : '';
+  document.getElementById('set-lev').value = c.leverage != null ? c.leverage : '';
+  document.getElementById('set-direction').value = c.direction || 'BOTH';
+  document.getElementById('set-flip').value = c.flip_market_open ? '1' : '0';
+  toggleFlip();
+  document.getElementById('tok-modal').classList.add('show');
+}
+
+function closeTokenModal() { document.getElementById('tok-modal').classList.remove('show'); }
+
+function saveTokenSettings() {
+  const body = {
+    token: _editToken,
+    notional_usd: document.getElementById('set-notional').value,
+    sl_tolerance_pct: document.getElementById('set-sl-tol').value,
+    order_tolerance_pct: document.getElementById('set-order-tol').value,
+    leverage: document.getElementById('set-lev').value,
+    direction: document.getElementById('set-direction').value,
+    flip_market_open: document.getElementById('set-flip').value,
+  };
+  fetch('/api/supertrend/set-token', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(async r => {
+    const d = await r.json();
+    if (r.ok) { showToast(_editToken + ' 设置已保存（≤60s 生效）', 'ok'); closeTokenModal(); load(); }
+    else showToast('保存失败：' + (d.detail || '未知'), 'err');
+  }).catch(e => showToast('保存失败：' + e.message, 'err'));
+}
+
+document.getElementById('tok-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeTokenModal();
+});
+
+// 点击菜单项执行动作后关闭菜单；点击页面其他位置关闭所有菜单
+document.addEventListener('click', function(e) {
+  if (e.target.closest('.card-menu')) {
+    document.querySelectorAll('.card-menu.show').forEach(m => m.classList.remove('show'));
+  } else if (!e.target.closest('.card-menu-wrap')) {
+    document.querySelectorAll('.card-menu.show').forEach(m => m.classList.remove('show'));
+  }
+});
+
+// ---- 卡片长按拖拽排序（长按 500ms 进入拖拽，松手保存顺序）----
+let _dragCtx = null;
+
+function startDrag(e, cardEl) {
+  const startX = e.clientX, startY = e.clientY;
+  const timer = setTimeout(() => {
+    const ghost = cardEl.cloneNode(true);
+    ghost.style.cssText = 'position:fixed;z-index:1000;opacity:0.85;pointer-events:none;width:'
+      + cardEl.offsetWidth + 'px;';
+    document.body.appendChild(ghost);
+    ghost.style.left = (e.clientX - cardEl.offsetWidth / 2) + 'px';
+    ghost.style.top = (e.clientY - 20) + 'px';
+    _dragCtx = {
+      cardEl: cardEl, ghost: ghost,
+      placeholder: document.createElement('div'),
+      startX: startX, startY: startY,
+    };
+    _dragCtx.placeholder.style.cssText = 'height:' + cardEl.offsetHeight
+      + 'px;border:1px dashed var(--accent);border-radius:8px;';
+    cardEl.style.display = 'none';
+    cardEl.parentNode.insertBefore(_dragCtx.placeholder, cardEl);
+  }, 500);
+  const onMove = (ev) => {
+    if (!_dragCtx) {
+      // 长按前大幅移动 → 视为普通操作，取消拖拽
+      if (Math.abs(ev.clientX - startX) > 6 || Math.abs(ev.clientY - startY) > 6) {
+        clearTimeout(timer);
+      }
+      return;
+    }
+    ev.preventDefault();
+    _dragCtx.ghost.style.left = (ev.clientX - _dragCtx.ghost.offsetWidth / 2) + 'px';
+    _dragCtx.ghost.style.top = (ev.clientY - 20) + 'px';
+    // 与其他卡片中点比对，计算插入位置
+    const cards = [...document.querySelectorAll('#cards .card')]
+      .filter(el => el !== _dragCtx.cardEl);
+    let target = null;
+    for (const el of cards) {
+      const r = el.getBoundingClientRect();
+      if (ev.clientY < r.top + r.height / 2) { target = el; break; }
+    }
+    if (target) {
+      _dragCtx.placeholder.parentNode.insertBefore(_dragCtx.placeholder, target);
+    } else {
+      _dragCtx.placeholder.parentNode.appendChild(_dragCtx.placeholder);
+    }
+  };
+  const onUp = () => {
+    clearTimeout(timer);
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.removeEventListener('mouseleave', onUp);
+    if (_dragCtx) {
+      try {
+        _dragCtx.ghost.remove();
+        // 拖拽中页面恰好刷新（load 重写 innerHTML）→ 卡片已脱离 DOM，跳过归位
+        if (_dragCtx.cardEl.isConnected) {
+          _dragCtx.placeholder.parentNode.insertBefore(_dragCtx.cardEl, _dragCtx.placeholder);
+          _dragCtx.placeholder.remove();
+          _dragCtx.cardEl.style.display = '';
+          saveCardOrder();
+        }
+      } catch (e) {}
+      _dragCtx = null;
+    }
+  };
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+  document.addEventListener('mouseleave', onUp);  // 拖出窗口 → 取消拖拽归位
+}
+
+function saveCardOrder() {
+  const tokens = [...document.querySelectorAll('#cards .card')].map(
+    el => el.getAttribute('data-token'));
+  fetch('/api/supertrend/reorder', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tokens: tokens})
+  }).catch(e => showToast('排序保存失败：' + e.message, 'err'));
+}
+
 function renderCards(cards) {
   const el = document.getElementById('cards');
+  _lastCards = cards;
   if (!cards.length) { el.innerHTML = '<span class="muted">暂无监控币种</span>'; return; }
   let h = '';
   for (const c of cards) {
     const trendBadge = c.trend === 'UP' ? '<span class="badge badge-up">▲ UP</span>'
       : c.trend === 'DOWN' ? '<span class="badge badge-down">▼ DOWN</span>'
       : '<span class="badge badge-flat">等待信号</span>';
+    const dirBadge = c.direction === 'LONG_ONLY' ? '<span class="badge badge-up">只做多</span>'
+      : c.direction === 'SHORT_ONLY' ? '<span class="badge badge-down">只做空</span>' : '';
     const p = c.position;
-    let posHtml = '<div class="kv"><span class="k">持仓</span><span>空仓' + (c.state==='HOLDING' ? '' : '（等待开仓）') + '</span></div>';
+    const pend = c.pending;
+    let posHtml = '<div class="kv"><span class="k">持仓</span><span>空仓（等待开仓）</span></div>';
     if (p) {
       const upnl = Number(p.unrealized_pnl || 0);
       const cls = upnl >= 0 ? 'green' : 'red';
       posHtml = '<div class="kv"><span class="k">持仓</span><span>' + (p.side==='LONG'?'多':'空') + ' @' + fmtPrice(p.entry_price) + ' → SL ' + fmtPrice(p.stop_loss_price) + '</span></div>'
         + '<div class="kv"><span class="k">浮盈</span><span class="' + cls + '">' + fmtUsd(upnl) + ' (' + fmtPct(p.pnl_pct) + ')</span></div>'
         + '<div class="kv"><span class="k">持仓时间</span><span>' + fmtTime(p.created_at) + '</span></div>';
+    } else if (c.state === 'WAITING') {
+      // 下一根K线闭合时刻 = 最新已闭合K线起点 + 30min（服务器数据，不依赖本机时钟）
+      const closeAt = c.last_candle_ts ? new Date(c.last_candle_ts + 30*60*1000)
+        .toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai',
+         month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-') : null;
+      posHtml = '<div class="kv"><span class="k">持仓</span><span class="yellow">空仓 · 等待15m K线闭合后挂单'
+        + (closeAt ? '（约 ' + closeAt + ' 闭合）' : '') + '</span></div>';
+    } else if (c.state === 'WAIT_DIR') {
+      const dirLong = c.direction === 'LONG_ONLY';
+      posHtml = '<div class="kv"><span class="k">持仓</span><span class="yellow">空仓 · 只做'
+        + (dirLong ? '多' : '空') + ' · 等待' + (dirLong ? '上升' : '下降') + '趋势后挂单</span></div>';
     }
+    if (c.paused) {
+      posHtml = '<div class="kv"><span class="k">状态</span><span class="yellow">已暂停监控（持仓/挂单不受影响）</span></div>' + posHtml;
+    }
+    // 反转市价开场景：持仓与挂单并存，挂单单独一行显示
+    const pendHtml = pend ? '<div class="kv"><span class="k">挂单</span><span class="yellow">'
+        + (pend.side==='LONG'?'多':'空') + ' @' + fmtPrice(pend.limit_price)
+        + ' · SL ' + fmtPrice(pend.stop_loss_price) + '</span></div>'
+        + '<div class="kv"><span class="k">挂单时间</span><span>' + fmtTime(pend.created_at) + '</span></div>' : '';
     const fetchErr = c.fetch_error ? '<div class="kv"><span class="k">⚠ 数据</span><span class="red">' + c.fetch_error + '</span></div>' : '';
+    const cust = [];
+    if (c.notional_usd != null) cust.push('$' + c.notional_usd);
+    if (c.sl_tolerance_pct != null) cust.push('SL' + c.sl_tolerance_pct + '%');
+    if (c.order_tolerance_pct != null) cust.push('挂单' + c.order_tolerance_pct + '%');
+    if (c.leverage != null) cust.push(c.leverage + 'x');
+    if (c.flip_market_open && (c.direction === 'LONG_ONLY' || c.direction === 'SHORT_ONLY'))
+      cust.push('反转市价开');
+    const custParams = cust.length
+      ? '<div class="kv"><span class="k">自定义参数</span><span class="muted">' + cust.join(' · ') + '</span></div>' : '';
     const sigAge = c.updated_at ? '<div class="kv"><span class="k">信号更新</span><span>' + Math.floor((Date.now()/1000 - c.updated_at)) + ' 秒前</span></div>' : '';
     const klineTime = c.last_candle_ts ? '<div class="kv"><span class="k">K线时间</span><span>' + new Date(c.last_candle_ts).toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-') + '</span></div>' : '';
     // 有持仓用系统 2s 刷新的 current_price，无持仓用线程 60s 的 last_price
@@ -7166,13 +7831,24 @@ function renderCards(cards) {
     const formingHtml = c.forming_trend
       ? '<div class="kv"><span class="k">实时轨道（参考）</span><span class="muted">' + (c.forming_trend === 'UP' ? '▲' : '▼') + ' ' + c.forming_trend + ' · 上 ' + fmtPrice(c.forming_upper_band) + ' · 下 ' + fmtPrice(c.forming_lower_band) + '</span></div>'
       : '';
-    h += '<div class="card">'
-      + '<div class="card-head"><span class="token">' + c.token + '</span>' + trendBadge + '<button onclick="removeToken(\\'' + c.token + '\\')">移除监控</button></div>'
+    const menuHtml = '<span class="card-menu-wrap">'
+      + '<button class="menu-btn" onmousedown="event.stopPropagation()" onclick="toggleCardMenu(event, \\'' + c.token + '\\')">操作 ▾</button>'
+      + '<div class="card-menu" id="menu-' + c.token + '" onmousedown="event.stopPropagation()">'
+      + (c.paused
+         ? '<button onclick="togglePause(\\'' + c.token + '\\', false)">恢复监控</button>'
+         : '<button onclick="togglePause(\\'' + c.token + '\\', true)">暂停监控</button>')
+      + '<button onclick="openTokenModal(\\'' + c.token + '\\')">设置</button>'
+      + '<button class="danger" onclick="removeToken(\\'' + c.token + '\\')">移除监控</button>'
+      + '</div></span>';
+    h += '<div class="card' + (c.paused ? ' paused' : '') + '" data-token="' + c.token
+      + '" onmousedown="startDrag(event, this)">'
+      + '<div class="card-head"><span class="token">' + c.token + '</span><span>' + trendBadge + dirBadge + '</span>'
+      + menuHtml + '</div>'
       + '<div class="kv"><span class="k">上轨道（已闭合）</span><span>' + fmtPrice(c.upper_band) + '</span></div>'
       + '<div class="kv"><span class="k">下轨道（已闭合）</span><span>' + fmtPrice(c.lower_band) + '</span></div>'
       + formingHtml
       + '<div class="kv"><span class="k">最新价</span><span>' + fmtPrice(showPrice) + '</span></div>'
-      + posHtml + fetchErr + sigAge + klineTime
+      + posHtml + pendHtml + custParams + fetchErr + sigAge + klineTime
       + '</div>';
   }
   el.innerHTML = h;
@@ -7181,13 +7857,19 @@ function renderCards(cards) {
 function renderHistory(list) {
   const el = document.getElementById('history-table');
   if (!list.length) { el.innerHTML = '<span class="muted">暂无平仓记录</span>'; return; }
-  let h = '<table><thead><tr><th>时间</th><th>币种</th><th>方向</th><th class="right">开仓价</th><th class="right">平仓价</th><th class="right">盈亏%</th><th class="right">盈亏$</th><th>结果</th></tr></thead><tbody>';
+  let h = '<table><thead><tr><th>时间</th><th>币种</th><th>方向</th><th class="right">开仓价</th><th class="right">平仓价</th><th>平仓时15m</th><th class="right">盈亏%</th><th class="right">盈亏$</th><th>结果</th></tr></thead><tbody>';
   for (const p of list) {
     const cls = (p.pnl_pct||0) >= 0 ? 'green' : 'red';
     const isRemove = (p.advice||'').includes('移除');
-    const result = isRemove ? '移除平仓' : '扫损→重开';
+    const isManual = (p.advice||'').includes('手动');
+    const result = isRemove ? '移除平仓' : isManual ? '手动平仓' : '扫损→重开';
+    const cs = p.close_snap;
+    const csTxt = cs && cs.trend
+      ? (cs.trend === 'UP' ? '▲ UP ' : '▼ DOWN ') + fmtPrice(cs.lower_band) + ' / ' + fmtPrice(cs.upper_band)
+      : '—';
     h += '<tr><td>' + fmtTime(p.closed_at) + '</td><td style="font-weight:bold;color:var(--accent)">' + p.token + '</td><td>' + (p.side==='LONG'?'多':'空') + '</td>'
       + '<td class="right">' + fmtPrice(p.entry_price) + '</td><td class="right">' + fmtPrice(p.current_price) + '</td>'
+      + '<td>' + csTxt + '</td>'
       + '<td class="right ' + cls + '">' + fmtPct(p.pnl_pct) + '</td><td class="right ' + cls + '">' + fmtUsd(p.realized_pnl) + '</td>'
       + '<td>' + result + '</td></tr>';
   }
@@ -7203,7 +7885,12 @@ async function load() {
       ? '● 运行中 · 每 60s 跟随 15m 超势更新止损 · 扫损后按趋势重开'
       : '<span class="red">○ 已暂停（设置页开关关闭）——已有持仓仍受系统 2s 扫损保护</span>';
     document.getElementById('params-line').textContent =
-      '容忍 ' + d.params.tolerance_pct + '% · 名义 $' + d.params.notional_usd + ' · 杠杆 ' + d.params.leverage + 'x（设置页可改，热生效）';
+      '全局默认：SL容忍 ' + d.params.tolerance_pct + '% · 挂单容忍 ' + d.params.order_tolerance_pct
+      + '% · 名义 $' + d.params.notional_usd + ' · 杠杆 ' + d.params.leverage + 'x（设置页可改，热生效）';
+    document.getElementById('ph-notional').textContent = '$' + d.params.notional_usd;
+    document.getElementById('ph-sl').textContent = d.params.tolerance_pct + '%';
+    document.getElementById('ph-order').textContent = d.params.order_tolerance_pct + '%';
+    document.getElementById('ph-lev').textContent = d.params.leverage + 'x';
     renderCards(d.cards);
     renderHistory(d.history);
   } catch(e) {
@@ -7223,10 +7910,408 @@ setInterval(load, 30000);
 """
 
 
+ALPHAFOX_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>跟单雷达 - BSM Agent</title>
+<style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; max-width: 1400px; margin: 0 auto; font-size: 13px; }
+
+
+
+
+
+
+
+
+
+
+.layout { display: flex; gap: 14px; align-items: flex-start; }
+.trader-col { flex: 0 0 250px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-height: calc(100vh - 130px); overflow-y: auto; position: sticky; top: 20px; }
+.trader-col h2 { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+.trader-search { width: 100%; background: #0a0e15; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 12px; margin-bottom: 10px; box-sizing: border-box; }
+.trader-search:focus { outline: none; border-color: var(--accent); }
+.t-item { padding: 9px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; }
+.t-item:hover { background: rgba(88,166,255,0.08); }
+.t-item.active { background: rgba(31,111,235,0.18); }
+.t-item .t-name { font-weight: 600; font-size: 13px; }
+.t-item .t-meta { display: flex; justify-content: space-between; align-items: center; margin-top: 3px; font-size: 11px; color: var(--muted); }
+.f-btn { border: 1px solid var(--border); background: #0a0e15; color: var(--muted); border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 10px; white-space: nowrap; }
+.f-btn:hover { color: var(--text); border-color: var(--accent); }
+.f-btn.on { background: #1a3a2a; border-color: #2a5a3a; color: var(--green); }
+.detail-col { flex: 1; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 14px; }
+.trader-head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.trader-head img { width: 42px; height: 42px; border-radius: 50%; background: #0a0e15; }
+.trader-head .name { font-size: 18px; font-weight: 700; }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 10px; }
+.metrics2 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.metric { background: #0a0e15; border-radius: 8px; padding: 10px 12px; }
+.metric .lbl { font-size: 11px; color: var(--muted); }
+.metric .val { font-size: 17px; font-weight: 700; margin-top: 2px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+.badge-binance { background: #3a2a1a; color: #f0b90b; }
+.badge-hyper { background: #1a2a3a; color: #4fc3f7; }
+.badge-other { background: #2a2a2a; color: var(--muted); }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.tab { padding: 8px 18px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; font-size: 13px; font-weight: 500; }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.green { color: var(--green); }
+.red { color: var(--red); }
+.yellow { color: var(--yellow); }
+.muted { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 7px 8px; border-bottom: 1px solid var(--border); font-size: 11px; }
+td { padding: 7px 8px; border-bottom: 1px solid var(--border); }
+tr:hover { background: rgba(88,166,255,0.04); }
+.right { text-align: right; }
+.tag-up { background: #1a3a2a; color: var(--green); padding: 1px 7px; border-radius: 8px; font-size: 11px; font-weight: 600; }
+.tag-down { background: #3a1a1a; color: var(--red); padding: 1px 7px; border-radius: 8px; font-size: 11px; font-weight: 600; }
+.tag-open { background: #1a3a2a; color: var(--green); padding: 1px 7px; border-radius: 8px; font-size: 11px; }
+.tag-close { background: #3a1a1a; color: var(--red); padding: 1px 7px; border-radius: 8px; font-size: 11px; }
+.tp-layout { display: flex; gap: 12px; }
+.tp-coins { flex: 0 0 200px; background: #0a0e15; border: 1px solid var(--border); border-radius: 8px; padding: 8px; max-height: 420px; overflow-y: auto; }
+.tp-coin { padding: 7px 10px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; font-size: 12px; }
+.tp-coin:hover { background: rgba(88,166,255,0.08); }
+.tp-coin.active { background: rgba(31,111,235,0.18); }
+.tp-detail { flex: 1; }
+.sym-row { display: flex; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.sym-row:hover { background: rgba(88,166,255,0.04); }
+.sym-detail { padding: 8px 12px; background: #0a0e15; border-bottom: 1px solid var(--border); }
+.desc { color: var(--muted); font-size: 12px; white-space: pre-wrap; margin-top: 8px; }
+.empty { color: var(--muted); text-align: center; padding: 30px; }
+</style>
+</head>
+<body>
+
+{NAV}
+
+<div class="layout">
+  <div class="trader-col">
+    <h2>📡 交易员雷达（<span id="trader-count">-</span>）</h2>
+    <input id="trader-search" class="trader-search" placeholder="搜索交易员昵称..." autocomplete="off">
+    <div id="trader-list"><span class="muted">加载中...</span></div>
+  </div>
+  <div class="detail-col" id="detail">
+    <div class="panel"><div class="empty">点击左侧交易员查看跟单数据</div></div>
+  </div>
+</div>
+
+<script>
+const fmtUsd = v => (v!=null && !isNaN(Number(v))) ? '$'+Number(v).toLocaleString('en-US', {maximumFractionDigits: 0}) : '--';
+const fmtUsd2 = v => (v!=null && !isNaN(Number(v))) ? '$'+Number(v).toLocaleString('en-US', {maximumFractionDigits: 2}) : '--';
+const fmtPct = v => (v!=null && !isNaN(Number(v))) ? (v>=0?'+':'')+Number(v).toFixed(2)+'%' : '--';
+const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=1?Number(v).toFixed(4):Number(v).toFixed(6));
+const fmtNum = v => (v!=null && !isNaN(Number(v))) ? Number(v).toLocaleString('en-US') : '--';
+const fmtWan = v => (v!=null && !isNaN(Number(v))) ? '$'+(Number(v)>=1e4 ? (Number(v)/1e4).toFixed(1)+'万' : Number(v).toFixed(0)) : '--';
+const fmtMs = ms => { if (!ms) return '—'; const d = new Date(Number(ms)); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); };
+const fmtIso = ts => { if (!ts) return '—'; const d = new Date(ts); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); };
+// 外部数据（昵称/自述/头像URL）转义防 XSS
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+let traders = [], currentId = null, curData = null, curTab = 'positions', es = null;
+let tpCoin = null;   // 交易点位当前选中币种
+let expandedSym = null; // 分析区展开的币种
+let searchKw = '';   // 左列搜索关键词
+
+function sigBadge(st) {
+  if (st === 'Binance') return '<span class="badge badge-binance">币安</span>';
+  if (st === 'hyperliquid') return '<span class="badge badge-hyper">Hyperliquid</span>';
+  return '<span class="badge badge-other">' + esc(st || '') + '</span>';
+}
+
+async function loadTraders() {
+  try {
+    const r = await fetch('/api/alphafox/traders');
+    const d = await r.json();
+    traders = d.traders || [];
+    document.getElementById('trader-count').textContent = traders.length;
+    renderTraderList();
+  } catch(e) {
+    document.getElementById('trader-list').innerHTML = '<span class="red">加载失败: ' + e.message + '</span>';
+  }
+}
+
+function renderTraderList() {
+  const el = document.getElementById('trader-list');
+  if (!traders.length) { el.innerHTML = '<span class="muted">无数据</span>'; return; }
+  const list = searchKw
+    ? traders.filter(t => (t.label || '').toLowerCase().includes(searchKw))
+    : traders;
+  if (!list.length) { el.innerHTML = '<span class="muted">无匹配交易员</span>'; return; }
+  el.innerHTML = list.map(t =>
+    '<div class="t-item' + (t.id === currentId ? ' active' : '') + '" data-id="' + t.id + '">' +
+    '<div class="t-name">' + esc(t.label || t.id) + sigBadge(t.signalType) + '</div>' +
+    '<div class="t-meta"><span>保证金</span>' +
+    (t.following
+      ? '<button class="f-btn on" data-fid="' + t.id + '">✓ 已跟单</button>'
+      : '<button class="f-btn" data-fid="' + t.id + '">+ 跟单</button>') +
+    '</div></div>').join('');
+}
+
+async function toggleFollow(tid) {
+  const t = traders.find(x => x.id === tid);
+  if (!t) return;
+  const follow = !t.following;
+  try {
+    const r = await fetch('/api/alphafox/follow', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({trader_id: tid, follow: follow,
+                            label: t.label, signal_type: t.signalType})
+    });
+    const d = await r.json();
+    if (d.ok) { t.following = follow; renderTraderList(); }
+    else { alert('跟单设置失败：' + (d.detail || '未知错误')); }
+  } catch(e) { alert('跟单设置失败：' + e.message); }
+}
+
+document.getElementById('trader-search').addEventListener('input', e => {
+  searchKw = e.target.value.trim().toLowerCase();
+  renderTraderList();
+});
+
+document.getElementById('trader-list').addEventListener('click', e => {
+  const fb = e.target.closest('.f-btn');
+  if (fb) { e.stopPropagation(); toggleFollow(fb.dataset.fid); return; }
+  const el = e.target.closest('.t-item');
+  if (el && el.dataset.id !== currentId) selectTrader(el.dataset.id);
+});
+
+async function selectTrader(id) {
+  currentId = id;
+  renderTraderList();
+  curData = null; tpCoin = null; expandedSym = null;
+  if (es) { es.close(); es = null; }
+  document.getElementById('detail').innerHTML =
+    '<div class="panel"><div class="empty">加载中...</div></div>';
+  // 首次直连
+  try {
+    const r = await fetch('/api/alphafox/detail?sourceId=' + encodeURIComponent(id));
+    const data = await r.json();
+    if (id !== currentId) return;  // 过期响应丢弃（用户已切换交易员）
+    curData = data;
+    renderDetail();
+  } catch(e) {
+    if (id !== currentId) return;
+    document.getElementById('detail').innerHTML =
+      '<div class="panel"><div class="empty red">加载失败: ' + e.message + '</div></div>';
+  }
+  // SSE 订阅：数据更新直接推送
+  es = new EventSource('/api/alphafox/stream?sourceId=' + encodeURIComponent(id));
+  es.addEventListener('updated', e => {
+    if (id !== currentId) return;  // 过期推送丢弃
+    try { curData = JSON.parse(e.data); renderDetail(); } catch(err) {}
+  });
+}
+
+function renderDetail() {
+  const snap = curData.snapshot || {};
+  const dna = curData.dna || {};
+  const perf = dna.performance || {};
+  const prof = { description: dna.profile, profitSharingRate: dna.profitSharingRate };
+  const t = traders.find(x => x.id === currentId) || {};
+  const side = snap.traderName || t.label || '交易员';
+  const pnlCls = (perf.pnl||0) >= 0 ? 'green' : 'red';
+  let html = '<div class="panel">';
+  html += '<div class="trader-head">' +
+    (snap.avatarUrl ? '<img src="' + esc(snap.avatarUrl) + '">' : '') +
+    '<div><div class="name">' + esc(side) + sigBadge(t.signalType) + '</div>' +
+    '<div class="muted" style="font-size:11px">数据时间 ' + fmtIso(snap.polledAt) + ' · 更新推送中</div></div></div>';
+  html += '<div class="metrics">' +
+    '<div class="metric"><div class="lbl">带单保证金余额</div><div class="val">' + fmtUsd(snap.marginBalance) + '</div></div>' +
+    '<div class="metric"><div class="lbl">资产管理规模 AUM</div><div class="val">' + fmtUsd(snap.aumAmount) + '</div></div>' +
+    '<div class="metric"><div class="lbl">跟单用户数</div><div class="val">' + fmtNum(snap.currentCopyCount) + ' / ' + fmtNum(snap.maxCopyCount) + '</div></div>' +
+    '<div class="metric"><div class="lbl">推算真实杠杆</div><div class="val">' + (snap.effectiveLeverage != null ? Number(snap.effectiveLeverage).toFixed(2) + 'x' : '—') + '</div></div>' +
+    '</div>';
+  html += '<div class="metrics2">' +
+    '<div class="metric"><div class="lbl">胜率</div><div class="val">' + fmtPct(perf.winRate) + '</div></div>' +
+    '<div class="metric"><div class="lbl">夏普</div><div class="val">' + (snap.sharpRatio != null ? Number(snap.sharpRatio).toFixed(2) : '—') + '</div></div>' +
+    '<div class="metric"><div class="lbl">最大回撤</div><div class="val red">' + (perf.mdd != null ? Number(perf.mdd).toFixed(2) + '%' : (snap.maxDrawdown != null ? (Number(snap.maxDrawdown)*100).toFixed(2) + '%' : '—')) + '</div></div>' +
+    '<div class="metric"><div class="lbl">ROI</div><div class="val ' + ((perf.roi||0)>=0?'green':'red') + '">' + fmtPct(perf.roi) + '</div></div>' +
+    '<div class="metric"><div class="lbl">总盈亏</div><div class="val ' + pnlCls + '">' + fmtUsd2(perf.pnl != null ? perf.pnl : snap.totalPnl) + '</div></div>' +
+    '</div></div>';
+  html += '<div class="panel"><div class="tabs">' +
+    '<div class="tab' + (curTab==='positions'?' active':'') + '" data-tab="positions">持有仓位</div>' +
+    '<div class="tab' + (curTab==='orders'?' active':'') + '" data-tab="orders">成交流水</div>' +
+    '<div class="tab' + (curTab==='points'?' active':'') + '" data-tab="points">交易点位</div>' +
+    '<div class="tab' + (curTab==='analysis'?' active':'') + '" data-tab="analysis">交易分析</div>' +
+    '</div><div id="tab-body"></div></div>';
+  document.getElementById('detail').innerHTML = html;
+  renderTabBody();
+}
+
+document.getElementById('detail').addEventListener('click', e => {
+  const tabEl = e.target.closest('.tab');
+  if (tabEl) { curTab = tabEl.dataset.tab; renderDetail(); return; }
+  const coinEl = e.target.closest('.tp-coin');
+  if (coinEl) { tpCoin = coinEl.dataset.coin; renderTabBody(); return; }
+  const symEl = e.target.closest('.sym-row');
+  if (symEl) { expandedSym = expandedSym === symEl.dataset.sym ? null : symEl.dataset.sym; renderTabBody(); return; }
+});
+
+function actLabel(a) {
+  const m = {'open_long':'开多','open_short':'开空','close_long':'平多','close_short':'平空',
+             'increase_long':'加多','increase_short':'加空','decrease_long':'减多','decrease_short':'减空'};
+  return m[a] || a || '—';
+}
+
+function renderTabBody() {
+  const el = document.getElementById('tab-body');
+  const snap = curData.snapshot || {};
+  if (curTab === 'positions') {
+    const list = snap.positions || [];
+    if (!list.length) { el.innerHTML = '<div class="empty">当前没有持仓</div>'; return; }
+    let h = '<table><thead><tr><th>币种</th><th>方向</th><th class="right">数量</th><th class="right">开仓均价</th><th class="right">标记价</th><th class="right">名义价值</th><th class="right">未实现盈亏</th><th class="right">杠杆</th><th class="right">预估强平价</th><th>最后下单时间</th></tr></thead><tbody>';
+    for (const p of list) {
+      const cls = (p.unrealizedPnl||0) >= 0 ? 'green' : 'red';
+      h += '<tr><td style="font-weight:600;color:var(--accent)">' + (p.baseAsset||p.symbol) + '</td>' +
+        '<td>' + (p.side==='LONG' ? '<span class="tag-up">多</span>' : '<span class="tag-down">空</span>') + '</td>' +
+        '<td class="right">' + fmtNum(p.absQty) + '</td>' +
+        '<td class="right">' + fmtPrice(p.avgPrice) + '</td>' +
+        '<td class="right">' + fmtPrice(p.markPrice) + '</td>' +
+        '<td class="right">' + fmtUsd2(p.notional) + '</td>' +
+        '<td class="right ' + cls + '">' + fmtUsd2(p.unrealizedPnl) + '</td>' +
+        '<td class="right">' + (p.leverage||'—') + 'x</td>' +
+        '<td class="right">' + fmtPrice(p.estimatedLiqPrice) + '</td>' +
+        '<td>' + fmtMs(p.lastOrderTime) + '</td></tr>';
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  } else if (curTab === 'orders') {
+    const list = snap.latestOrders || [];
+    if (!list.length) { el.innerHTML = '<div class="empty">暂无流水</div>'; return; }
+    let h = '<table><thead><tr><th>时间</th><th>币种</th><th>动作</th><th>方向</th><th class="right">成交均价</th><th class="right">数量</th><th class="right">名义价值</th><th class="right">已实现盈亏</th></tr></thead><tbody>';
+    for (const o of list) {
+      const cls = (o.realizedPnl||0) >= 0 ? 'green' : 'red';
+      h += '<tr><td>' + fmtMs(o.time) + '</td>' +
+        '<td style="font-weight:600;color:var(--accent)">' + o.symbol + '</td>' +
+        '<td>' + actLabel(o.canonicalAction) + '</td>' +
+        '<td>' + (o.side==='BUY'?'买入':'卖出') + '</td>' +
+        '<td class="right">' + fmtPrice(o.avgPrice) + '</td>' +
+        '<td class="right">' + fmtNum(o.executedQty) + '</td>' +
+        '<td class="right">' + fmtUsd2(o.notional) + '</td>' +
+        '<td class="right ' + cls + '">' + fmtUsd2(o.realizedPnl) + '</td></tr>';
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  } else if (curTab === 'points') {
+    const tp = snap.tradePoints || {};
+    const coins = Object.keys(tp);
+    if (!coins.length) { el.innerHTML = '<div class="empty">暂无点位数据</div>'; return; }
+    if (!tpCoin || !tp[tpCoin]) tpCoin = coins[0];
+    let h = '<div class="tp-layout"><div class="tp-coins">';
+    h += coins.map(c => '<div class="tp-coin' + (c === tpCoin ? ' active' : '') + '" data-coin="' + c + '">' +
+      '<span style="font-weight:600">' + c + '</span><span class="muted">' + tp[c].length + ' 笔</span></div>').join('');
+    h += '</div><div class="tp-detail"><table><thead><tr><th>时间</th><th>动作</th><th>买卖</th><th class="right">价格</th><th class="right">数量</th><th class="right">名义价值</th></tr></thead><tbody>';
+    const pts = tp[tpCoin] || [];
+    for (const p of pts) {
+      h += '<tr><td>' + fmtMs(p.timeMs) + '</td>' +
+        '<td>' + (p.action === 'OPEN' ? '<span class="tag-open">开仓</span>' : '<span class="tag-close">平仓</span>') + '</td>' +
+        '<td>' + (p.side==='BUY'?'买入':'卖出') + '</td>' +
+        '<td class="right">' + fmtPrice(p.price) + '</td>' +
+        '<td class="right">' + fmtNum(p.quantity) + '</td>' +
+        '<td class="right">' + fmtUsd2(p.notional) + '</td></tr>';
+    }
+    h += '</tbody></table></div></div>';
+    el.innerHTML = h;
+  } else if (curTab === 'analysis') {
+    const dna = curData.dna || {};
+    const perf = dna.performance || {};
+    const prof = { description: dna.profile, profitSharingRate: dna.profitSharingRate };
+    const stats = curData.symbol_stats || [];
+    const charts = (dna.charts || []).filter(c => c.type === 'pnl');
+    let h = '';
+    if (prof.description) h += '<div class="desc">📝 交易员自述：' + esc(prof.description) + '</div>';
+    if (prof.profitSharingRate != null) h += '<div class="desc muted" style="white-space:normal">利润分成：' + prof.profitSharingRate + '%</div>';
+    if (charts.length > 1) h += renderCurve(charts);
+    h += '<div style="margin-top:12px"><b>币种盈亏汇总</b><span class="muted" style="font-size:11px;margin-left:6px">（点击币种展开周期明细）</span></div>';
+    if (!stats.length) { h += '<div class="empty">暂无分析数据</div>'; }
+    else {
+      h += '<div style="border:1px solid var(--border);border-radius:8px;margin-top:8px;overflow:hidden">';
+      for (const s of stats) {
+        const cls = s.pnl >= 0 ? 'green' : 'red';
+        h += '<div class="sym-row" data-sym="' + s.symbol + '">' +
+          '<span style="flex:1;font-weight:600;color:var(--accent)">' + s.symbol + '</span>' +
+          '<span style="flex:1" class="muted">仓位数 ' + s.count + '</span>' +
+          '<span style="flex:1.2;text-align:right" class="' + cls + '">' + fmtUsd2(s.pnl) + '</span>' +
+          '<span style="flex:0.8;text-align:right" class="muted">胜率 ' + s.win_rate + '%</span>' +
+          '<span style="flex:0.4;text-align:right" class="muted">' + (expandedSym === s.symbol ? '▴' : '▾') + '</span></div>';
+        if (expandedSym === s.symbol) {
+          h += '<div class="sym-detail"><table><thead><tr><th>开仓时间</th><th>平仓时间</th><th>方向</th><th class="right">开仓价</th><th class="right">平仓价</th><th class="right">数量</th><th class="right">杠杆</th><th class="right">盈亏</th></tr></thead><tbody>';
+          for (const it of s.items || []) {
+            const ic = (it.pnl||0) >= 0 ? 'green' : 'red';
+            h += '<tr><td>' + fmtMs(it.openTime) + '</td><td>' + fmtMs(it.closeTime) + '</td>' +
+              '<td>' + (it.side === 'LONG' ? '<span class="tag-up">多</span>' : '<span class="tag-down">空</span>') + '</td>' +
+              '<td class="right">' + fmtPrice(it.entryPrice) + '</td>' +
+              '<td class="right">' + fmtPrice(it.exitPrice) + '</td>' +
+              '<td class="right">' + fmtNum(it.size) + '</td>' +
+              '<td class="right">' + (it.leverage != null ? Number(it.leverage).toFixed(2) + 'x' : '—') + '</td>' +
+              '<td class="right ' + ic + '">' + fmtUsd2(it.pnl) + '</td></tr>';
+          }
+          h += '</tbody></table></div>';
+        }
+      }
+      h += '</div>';
+    }
+    el.innerHTML = h;
+  }
+}
+
+function renderCurve(charts) {
+  const W = 760, H = 180, P = 30;
+  const vals = charts.map(c => c.value);
+  const min = Math.min(0, ...vals), max = Math.max(...vals);
+  const span = (max - min) || 1;
+  const n = charts.length;
+  const pts = charts.map((c, i) => {
+    const x = P + (W - 2 * P) * i / (n - 1);
+    const y = P + (H - 2 * P) * (1 - (c.value - min) / span);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  const zeroY = P + (H - 2 * P) * (1 - (0 - min) / span);
+  return '<div style="margin-top:10px"><b>收益曲线</b><span class="muted" style="font-size:11px;margin-left:6px">近 ' + charts.length + ' 天每日盈亏</span></div>' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;background:#0a0e15;border:1px solid var(--border);border-radius:8px;margin-top:6px">' +
+    '<line x1="' + P + '" y1="' + zeroY + '" x2="' + (W - P) + '" y2="' + zeroY + '" stroke="#30363d" stroke-dasharray="4 3"/>' +
+    '<polyline points="' + pts + '" fill="none" stroke="#58a6ff" stroke-width="1.6"/>' +
+    '</svg>';
+}
+
+loadTraders();
+setInterval(loadTraders, 60000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/alphafox", response_class=HTMLResponse)
+def alphafox_page():
+    return HTMLResponse(
+        content=ALPHAFOX_HTML.replace("{NAV}", _nav_html("alphafox")),
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
 @app.get("/supertrend", response_class=HTMLResponse)
 def supertrend_page():
     return HTMLResponse(
-        content=SUPERTREND_HTML,
+        content=SUPERTREND_HTML.replace("{NAV}", _nav_html("supertrend")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -7234,7 +8319,7 @@ def supertrend_page():
 @app.get("/strategies", response_class=HTMLResponse)
 def strategies_page():
     return HTMLResponse(
-        content=STRATEGIES_HTML,
+        content=STRATEGIES_HTML.replace("{NAV}", _nav_html("strategies")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -7242,7 +8327,7 @@ def strategies_page():
 @app.get("/agent", response_class=HTMLResponse)
 def agent_monitor():
     return HTMLResponse(
-        content=AGENT_HTML,
+        content=AGENT_HTML.replace("{NAV}", _nav_html("agent")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -7254,19 +8339,31 @@ LIVE_ONCHAIN_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>链上实盘监控</title>
 <style>
-:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; }
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; }
-.nav-bar { display: flex; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
 .nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
 .nav-bar a:hover { color: var(--text); }
 .nav-bar a.active { color: var(--accent); font-weight: 600; }
 .nav-dropdown { position: relative; display: inline-block; }
-.nav-dropdown > a { cursor: pointer; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
 .nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
 .nav-dropdown:hover .nav-dropdown-content { display: block; }
 .nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
 .nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; }
+
+
+
+
+
+
+
+
+
+
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 h1 { font-size: 20px; margin-bottom: 20px; }
 h2 { font-size: 16px; margin-bottom: 12px; color: var(--accent); }
@@ -7288,28 +8385,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
 </head>
 <body>
 
-<div class="nav-bar">
-  <a href="/">📊 市场监控</a>
-  <a href="/strategies">📈 运行策略</a>
-  <div class="nav-dropdown">
-    <a href="#">🤖 Agent 面板 ▾</a>
-    <div class="nav-dropdown-content">
-      <a href="/agent">Agent-合约扫描</a>
-      <a href="/heat-agent">Agent-热度榜单</a>
-      <a href="/agent-heat-lessons">Agent-热度有教训</a>
-      <a href="/agent-nl">Agent-无教训</a>
-      <a href="/agent-short">Agent-做空</a>
-      <a href="/agent-kol">Agent-KOL 监控</a>
-      <a href="/agent-kol-snapshot">Agent-KOL 快照监控</a>
-    </div>
-  </div>
-  <a href="/dashboard">📊 市场全景</a>
-  <a href="/onchain">🔍 链上监控</a>
-  <a href="/alpha-cluster">🔬 Alpha 集群</a>
-  <a href="/live-onchain" class="active">💹 实盘监控</a>
-  <a href="/supertrend">📈 主流币趋势</a>
-  <a href="/settings">⚙ 系统设置</a>
-</div>
+{NAV}
 
 <h1>💹 链上实盘监控</h1>
 
@@ -7423,7 +8499,7 @@ setInterval(load, 30000);
 @app.get("/live-onchain", response_class=HTMLResponse)
 def live_onchain_page():
     return HTMLResponse(
-        content=LIVE_ONCHAIN_HTML,
+        content=LIVE_ONCHAIN_HTML.replace("{NAV}", _nav_html("live-onchain")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -7431,7 +8507,7 @@ def live_onchain_page():
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(
-        content=HTML,
+        content=HTML.replace("{NAV}", _nav_html("home")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 

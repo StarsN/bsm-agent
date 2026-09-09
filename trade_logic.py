@@ -769,7 +769,7 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
         if pos["status"] == "PENDING":
             storage.trade_position_update(conn, pos["id"], {
                 "status": "CANCELED",
-                "advice": "取消收藏触发：未成交挂单已取消",
+                "advice": "手动平仓：未成交挂单已取消",
                 "closed_at": "__CURRENT_TIMESTAMP__",
             })
             storage.trade_signal_lock_release(conn, token, pos["strategy"])
@@ -782,7 +782,9 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
         if not price or price <= 0:
             continue
         entry = float(pos.get("entry_price") or pos.get("limit_price") or price)
-        pnl = (price - entry) * open_qty
+        # 做空 PnL = (entry - price)，与多单方向相反
+        pnl = ((entry - price) if pos.get("side") == "SHORT"
+               else (price - entry)) * open_qty
         realized += pnl
         realized_delta += pnl
         storage.trade_position_update(conn, pos["id"], {
@@ -792,25 +794,33 @@ def manual_close_on_unwatch(conn, token: str) -> dict:
             "realized_pnl": realized,
             "unrealized_pnl": 0,
             "pnl_pct": (realized / float(pos.get("margin_amount") or 1)) * 100,
-            "advice": "取消收藏触发：按市价平仓",
+            "advice": "手动市价平仓",
             "closed_at": "__CURRENT_TIMESTAMP__",
         })
         storage.trade_signal_lock_release(conn, token, pos["strategy"])
         closed += 1
 
-        # 写平仓 journal
-        margin = float(pos.get("margin_amount") or 1)
-        pnl_pct_val = (realized / margin) * 100
-        _cs_snap = get_market_snapshot(token, heavy=True)
-        _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
-        close_snap = _build_close_snap(price, _cs_snap or {}, _cs_analysis)
-        storage.journal_add_close(
-            conn, order_id=pos["id"], token=token, price=price,
-            reason="取消收藏触发：按市价平仓",
-            pnl_pct=pnl_pct_val, close_reason="manual",
-            dimension_data=close_snap,
-            hold_duration=_calc_hold(pos.get("created_at")),
-        )
+        # 写平仓 journal（supertrend 跳过：不污染 agent 复盘数据，与扫损分支口径一致）
+        if pos.get("strategy") != "supertrend":
+            margin = float(pos.get("margin_amount") or 1)
+            pnl_pct_val = (realized / margin) * 100
+            _cs_snap = get_market_snapshot(token, heavy=True)
+            _cs_analysis = analyze_signals(_cs_snap, social_score=0) if _cs_snap else {}
+            close_snap = _build_close_snap(price, _cs_snap or {}, _cs_analysis)
+            storage.journal_add_close(
+                conn, order_id=pos["id"], token=token, price=price,
+                reason="手动市价平仓",
+                pnl_pct=pnl_pct_val, close_reason="manual",
+                dimension_data=close_snap,
+                hold_duration=_calc_hold(pos.get("created_at")),
+            )
+        else:
+            # supertrend：记录平仓时刻的 15m 趋势轨道快照（扫损重开历史展示）
+            try:
+                import supertrend_strategy
+                supertrend_strategy.record_close_snap(token, pos["id"])
+            except Exception:
+                pass
     return {
         "ok": closed > 0 or canceled > 0,
         "token": token,
@@ -1040,40 +1050,57 @@ def update_paper_positions(conn):
             age = (datetime.now(timezone.utc) - created_at).total_seconds()
             triggered = (price >= limit_price) if is_short else (price <= limit_price)
             expired = age >= limit_timeout
+            is_supertrend = pos.get("strategy") == "supertrend"
 
             if triggered:
-                # 补算 ATR 止损 + 止盈（挂单时没算，触发时补）
-                from market import get_klines_1h
-                klines = get_klines_1h(pos["token"], limit=30)
-                stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
-                actual_entry = round(min(limit_price, price) if side == "LONG" else max(limit_price, price), 8)
-                if is_short:
-                    sl = actual_entry * (1 - stop_pct / 100)
-                    risk_unit = sl - actual_entry
-                    tp1 = actual_entry - risk_unit * config.TRADING_TP1_R
-                    tp2 = actual_entry - risk_unit * config.TRADING_TP2_R
+                if is_supertrend:
+                    # 超势挂单：SL 已在挂单时按轨道写入，无 TP。
+                    # 成交价 = 挂单价（限价单 maker 语义，无论市价 gap 到多低/多高）
+                    actual_entry = limit_price
                     fields.update({
-                        "lowest_price": price,
-                        "highest_price": price,
+                        "status": "OPEN",
+                        "entry_price": actual_entry,
+                        "current_price": actual_entry,
+                        "highest_price": actual_entry if side == "LONG" else None,
+                        "lowest_price": actual_entry if side == "SHORT" else None,
+                        "advice": f"超势挂单成交 @ ${actual_entry:.6g}，止损 @ ${float(pos.get('stop_loss_price') or 0):.6g}",
                     })
                 else:
-                    sl = actual_entry * (1 + stop_pct / 100)
-                    risk_unit = actual_entry - sl
-                    tp1 = actual_entry + risk_unit * config.TRADING_TP1_R
-                    tp2 = actual_entry + risk_unit * config.TRADING_TP2_R
+                    # 补算 ATR 止损 + 止盈（挂单时没算，触发时补）
+                    from market import get_klines_1h
+                    klines = get_klines_1h(pos["token"], limit=30)
+                    stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
+                    actual_entry = round(min(limit_price, price) if side == "LONG" else max(limit_price, price), 8)
+                    if is_short:
+                        sl = actual_entry * (1 - stop_pct / 100)
+                        risk_unit = sl - actual_entry
+                        tp1 = actual_entry - risk_unit * config.TRADING_TP1_R
+                        tp2 = actual_entry - risk_unit * config.TRADING_TP2_R
+                        fields.update({
+                            "lowest_price": price,
+                            "highest_price": price,
+                        })
+                    else:
+                        sl = actual_entry * (1 + stop_pct / 100)
+                        risk_unit = actual_entry - sl
+                        tp1 = actual_entry + risk_unit * config.TRADING_TP1_R
+                        tp2 = actual_entry + risk_unit * config.TRADING_TP2_R
+                        fields.update({
+                            "highest_price": price,
+                            "lowest_price": price,
+                        })
                     fields.update({
-                        "highest_price": price,
-                        "lowest_price": price,
+                        "status": "OPEN",
+                        "entry_price": actual_entry,
+                        "stop_loss_price": round(sl, 8),
+                        "tp1_price": round(tp1, 8),
+                        "tp2_price": round(tp2, 8),
+                        "current_price": price,
+                        "advice": f"挂单触发 @ ${actual_entry:.6g}，止盈+{config.TRADING_TP1_R}R/+{config.TRADING_TP2_R}R 止损{stop_pct:+.2f}%",
                     })
-                fields.update({
-                    "status": "OPEN",
-                    "entry_price": actual_entry,
-                    "stop_loss_price": round(sl, 8),
-                    "tp1_price": round(tp1, 8),
-                    "tp2_price": round(tp2, 8),
-                    "current_price": price,
-                    "advice": f"挂单触发 @ ${actual_entry:.6g}，止盈+{config.TRADING_TP1_R}R/+{config.TRADING_TP2_R}R 止损{stop_pct:+.2f}%",
-                })
+            elif expired and is_supertrend:
+                # 超势挂单长期有效（等回调），不超时取消
+                fields["advice"] = f"超势挂单中：{'涨破' if is_short else '跌破'} ${limit_price:.6g} 成交"
             elif expired:
                 fields.update({
                     "status": "CANCELED",
@@ -1081,17 +1108,34 @@ def update_paper_positions(conn):
                     "closed_at": "__CURRENT_TIMESTAMP__",
                 })
                 storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
+            elif is_supertrend:
+                fields["advice"] = (f"超势挂单中：{'涨破' if is_short else '跌破'} "
+                                    f"${limit_price:.6g} 成交")
             else:
                 fields["advice"] = f"挂单中：{'涨破' if is_short else '跌破'} ${limit_price:.6g} 成交，剩余 {int(limit_timeout - age)}s"
 
-            storage.trade_position_update(conn, pos["id"], fields)
+            if is_supertrend and triggered:
+                # 超势挂单触发：带 status 条件（线程可能已并发转市价开仓，rowcount=0 则跳过防覆盖）
+                cur = conn.execute(
+                    "UPDATE trade_positions SET status=?, entry_price=?, "
+                    "current_price=?, highest_price=?, lowest_price=?, advice=?, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='PENDING'",
+                    (fields.get("status"), fields.get("entry_price"),
+                     fields.get("current_price"),
+                     fields.get("highest_price"), fields.get("lowest_price"),
+                     fields.get("advice"), pos["id"]),
+                )
+                fields_ok = cur.rowcount > 0
+            else:
+                storage.trade_position_update(conn, pos["id"], fields)
+                fields_ok = True
             pd_id = pos.get("pending_decision_id")
             if pd_id:
-                if triggered:
+                if triggered and fields_ok:
                     conn.execute("UPDATE pending_decisions SET status = 'consumed', consumed_at = datetime('now') WHERE id = ?", (pd_id,))
                 elif expired:
                     conn.execute("UPDATE pending_decisions SET status = 'expired' WHERE id = ?", (pd_id,))
-            if triggered:
+            if triggered and not is_supertrend:
                 _reason = pos.get("open_reason", "") or ""
                 _m = __import__("re").search(r"tier=(\w+)", _reason)
                 _tier = _m.group(1) if _m else "half"
@@ -1167,13 +1211,22 @@ def update_paper_positions(conn):
                 )
             if pos.get("strategy") == "onchain":
                 _archive_onchain_pool(pos["token"])
+            if is_supertrend:
+                # 记录平仓时刻的 15m 趋势轨道快照（扫损重开历史展示）
+                try:
+                    import supertrend_strategy
+                    supertrend_strategy.record_close_snap(pos["token"], pos["id"])
+                except Exception:
+                    pass
             continue
         tp1_pct = config.TRADING_TP1_CLOSE_PCT / 100
         tp2_pct = config.TRADING_TP2_CLOSE_PCT / 100
-        # 用"是否已触发过某档"而不是脆弱的数量比较
+        # 用"是否已触发过某档"而不是脆弱的数量比较。
+        # tp1/tp2 为空的仓位（如跟单策略，减仓来自跟随交易员而非TP锁利）
+        # 不得因 closed_ratio 高被误判"已触发TP档"而进入跟踪止盈
         closed_ratio = closed_qty / qty if qty > 0 else 0
-        tp1_done = closed_ratio >= tp1_pct - 1e-6
-        tp2_done = closed_ratio >= (tp1_pct + tp2_pct) - 1e-6
+        tp1_done = tp1 > 0 and closed_ratio >= tp1_pct - 1e-6
+        tp2_done = tp2 > 0 and closed_ratio >= (tp1_pct + tp2_pct) - 1e-6
 
         tp1_triggered = (tp1 > 0 and price <= tp1) if is_short else (tp1 > 0 and price >= tp1)
         if not tp1_done and tp1_triggered:

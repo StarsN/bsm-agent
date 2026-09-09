@@ -174,7 +174,9 @@ CREATE TABLE IF NOT EXISTS trade_positions (
 CREATE INDEX IF NOT EXISTS idx_trade_positions_status ON trade_positions(status, token);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_one_active_token
 ON trade_positions(token, side, strategy)
-WHERE status IN ('PENDING', 'OPEN', 'PARTIAL');
+WHERE status IN ('PENDING', 'OPEN', 'PARTIAL') AND strategy != 'supertrend';
+-- supertrend 豁免：反转市价开+挂单并存需要同币同向两笔活跃（OPEN+PENDING），
+-- 加仓合并后由策略线程归并为一笔，重复开仓防护走应用层 trade_has_active
 
 CREATE TABLE IF NOT EXISTS trade_signal_locks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -490,6 +492,18 @@ def _ensure_columns(conn, table: str, columns: list[tuple[str, str]]):
 
 def _migrate(conn):
     """老库迁移：加 first_seen_at 列 + 新表"""
+    # 一币一活跃仓唯一索引：supertrend 豁免（反转市价开+挂单并存）。
+    # 旧库索引含 supertrend → 条件重建一次（DROP IF EXISTS + CREATE IF NOT EXISTS 并发安全）
+    idx_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_trade_one_active_token'").fetchone()
+    if idx_row and "strategy != 'supertrend'" not in (idx_row["sql"] or ""):
+        conn.execute("DROP INDEX IF EXISTS idx_trade_one_active_token")
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_one_active_token
+            ON trade_positions(token, side, strategy)
+            WHERE status IN ('PENDING', 'OPEN', 'PARTIAL') AND strategy != 'supertrend'
+        """)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
     if "first_seen_at" not in cols:
         conn.execute("ALTER TABLE posts ADD COLUMN first_seen_at TIMESTAMP")
@@ -563,12 +577,12 @@ def _migrate(conn):
     if "order_type" not in tp_cols:
         conn.execute("ALTER TABLE trade_positions ADD COLUMN order_type TEXT DEFAULT 'market'")
         conn.execute("UPDATE trade_positions SET order_type = 'limit' WHERE status = 'PENDING'")
-    # 更新唯一索引为 (token, side, strategy) 实现策略级数据隔离
-    conn.execute("DROP INDEX IF EXISTS idx_trade_one_active_token")
+    # 老库首次迁移无索引时建新版（旧版→新版的条件重建已在前面的检查中处理，
+    # 此处绝不能无条件 DROP 重建，否则会把 supertrend 豁免版本覆盖回旧版）
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_one_active_token
         ON trade_positions(token, side, strategy)
-        WHERE status IN ('PENDING', 'OPEN', 'PARTIAL')
+        WHERE status IN ('PENDING', 'OPEN', 'PARTIAL') AND strategy != 'supertrend'
     """)
     # signal_lock 策略隔离：重建唯一约束为 (token, signal_key, strategy)
     sl_cols = [r[1] for r in conn.execute("PRAGMA table_info(trade_signal_locks)").fetchall()]
@@ -1728,9 +1742,17 @@ def trading_settings_defaults() -> dict:
         # 超级趋势策略
         "supertrend_enabled": getattr(config, "SUPERTREND_ENABLED", True),
         "supertrend_sl_tolerance_pct": getattr(config, "SUPERTREND_SL_TOLERANCE_PCT", 1.0),
+        "supertrend_order_tolerance_pct": getattr(config, "SUPERTREND_ORDER_TOLERANCE_PCT", 1.0),
         "supertrend_notional_usd": getattr(config, "SUPERTREND_NOTIONAL_USD", 50.0),
         "supertrend_leverage": getattr(config, "SUPERTREND_LEVERAGE", 3.0),
         "strategy_initial_supertrend": getattr(config, "STRATEGY_INITIAL_SUPERTREND", 1000),
+        # 跟单雷达
+        "alphafox_poll_seconds": getattr(config, "ALPHAFOX_POLL_SECONDS", 30),
+        "strategy_initial_alphafox": 1000,
+        "alphafox_trade_enabled": getattr(config, "ALPHAFOX_TRADE_ENABLED", True),
+        "alphafox_trade_budget": getattr(config, "ALPHAFOX_TRADE_BUDGET", 1000.0),
+        "alphafox_slippage_pct": getattr(config, "ALPHAFOX_SLIPPAGE_PCT", 0.05),
+        "alphafox_fee_pct": getattr(config, "ALPHAFOX_FEE_PCT", 0.04),
     }
 
 
@@ -1739,9 +1761,10 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "supertrend_enabled"}:
+        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "supertrend_enabled", "alphafox_trade_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
-        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "supertrend_sl_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend"}:
+        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds",
+            "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct"}:
             try:
                 settings[row["key"]] = float(raw)
             except (TypeError, ValueError):
@@ -1749,6 +1772,8 @@ def trading_settings_get(conn) -> dict:
         else:
             settings[row["key"]] = raw
     settings["leverage"] = int(settings.get("leverage") or config.TRADING_LEVERAGE)
+    settings["alphafox_poll_seconds"] = int(
+        settings.get("alphafox_poll_seconds") or getattr(config, "ALPHAFOX_POLL_SECONDS", 30))
     settings["kol_agent_min_confidence"] = int(settings.get("kol_agent_min_confidence") or 70)
     settings["kol_snapshot_min_confidence"] = int(settings.get("kol_snapshot_min_confidence") or 70)
     settings["kol_token_cooldown_minutes"] = int(settings.get("kol_token_cooldown_minutes") or 30)
@@ -1756,7 +1781,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -2116,6 +2141,14 @@ def trade_reset_strategy(conn, strategy: str, new_initial_balance: float | None 
             cand_del = ac.execute("DELETE FROM kol_candidates").rowcount or 0
             ac.execute("DELETE FROM kol_analyses WHERE strategy = 'kol_snapshot'")
             ac.execute("DELETE FROM kol_llm_logs")  # 无 strategy 列，物理隔离=过滤
+    elif strategy == "supertrend":
+        # 清策略自身 DB 的信号状态/平仓快照；监控币种列表（supertrend_tokens）保留
+        try:
+            with get_conn(config.SUPERTREND_DB) as sc:
+                sc.execute("DELETE FROM supertrend_status")
+                sc.execute("DELETE FROM supertrend_close_snaps")
+        except Exception:
+            pass
 
     settings = trading_settings_get(conn)
     return {

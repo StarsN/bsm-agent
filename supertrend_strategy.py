@@ -33,7 +33,15 @@ CREATE TABLE IF NOT EXISTS supertrend_tokens (
     token       TEXT PRIMARY KEY,
     status      TEXT NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE / REMOVED
     added_at    INTEGER,
-    removed_at  INTEGER
+    removed_at  INTEGER,
+    notional_usd        REAL,              -- NULL=用全局默认
+    sl_tolerance_pct    REAL,              -- NULL=用全局默认
+    order_tolerance_pct REAL,              -- NULL=用全局默认
+    leverage            REAL,              -- NULL=用全局默认
+    direction           TEXT DEFAULT 'BOTH',  -- BOTH / LONG_ONLY / SHORT_ONLY
+    flip_market_open    INTEGER DEFAULT 0,  -- 1=趋势反转到允许方向时立即市价开（仅方向限制生效）
+    paused              INTEGER DEFAULT 0,  -- 1=暂停监控（线程跳过；持仓/挂单不动，2s 循环仍管）
+    sort_order          INTEGER             -- 卡片拖拽排序（NULL 排最后）
 );
 
 CREATE TABLE IF NOT EXISTS supertrend_status (
@@ -44,12 +52,21 @@ CREATE TABLE IF NOT EXISTS supertrend_status (
     last_candle_ts  INTEGER,              -- 最新已闭合K线时间戳(ms)，SL 更新去重用
     last_sl         REAL,
     last_price      REAL,
-    state           TEXT,                 -- HOLDING / FLAT
+    state           TEXT,                 -- HOLDING / PENDING / WAITING / WAIT_DIR / FLAT
     fetch_error     TEXT,
     updated_at      INTEGER,
     forming_trend       TEXT,             -- 正在形成的K线趋势（仅页面参考，策略不用）
     forming_upper_band  REAL,
     forming_lower_band  REAL
+);
+
+CREATE TABLE IF NOT EXISTS supertrend_close_snaps (
+    position_id INTEGER PRIMARY KEY,      -- 关联主库 trade_positions.id
+    token       TEXT,
+    trend       TEXT,                     -- 平仓时刻的最新15m趋势（status 表快照）
+    upper_band  REAL,
+    lower_band  REAL,
+    created_at  INTEGER
 );
 """
 
@@ -65,6 +82,16 @@ def init_db():
             ("forming_trend", "TEXT"),
             ("forming_upper_band", "REAL"),
             ("forming_lower_band", "REAL"),
+        ])
+        storage._ensure_columns(conn, "supertrend_tokens", [
+            ("notional_usd", "REAL"),
+            ("sl_tolerance_pct", "REAL"),
+            ("order_tolerance_pct", "REAL"),
+            ("leverage", "REAL"),
+            ("direction", "TEXT DEFAULT 'BOTH'"),
+            ("flip_market_open", "INTEGER DEFAULT 0"),
+            ("paused", "INTEGER DEFAULT 0"),
+            ("sort_order", "INTEGER"),
         ])
         now = int(time.time())
         for token in getattr(config, "SUPERTREND_TOKENS", []) or []:
@@ -179,49 +206,203 @@ def _calc_sl(side: str, sig: dict, tol_pct: float) -> float:
     return round(sig["upper_band"] * (1 + tol_pct / 100), 8)
 
 
-def _open_position(conn, token: str, sig: dict, price: float,
-                   tol_pct: float, notional: float, leverage: float) -> bool:
-    """直接 INSERT 主库 trade_positions（不经 open_paper_position，避免风控/ATR 拦截）。
-    前置检查单币单仓（trade_has_active 无 side 过滤）。"""
-    if storage.trade_has_active(conn, token, "supertrend"):
+def _calc_order_price(side: str, sig: dict, tol_order_pct: float) -> float:
+    """挂单价：多 = 下轨道×(1+挂单容忍%)，空 = 上轨道×(1−挂单容忍%)"""
+    if side == "LONG":
+        return round(sig["lower_band"] * (1 + tol_order_pct / 100), 8)
+    return round(sig["upper_band"] * (1 - tol_order_pct / 100), 8)
+
+
+def _merge_positions(conn, token: str) -> None:
+    """同币同向多笔活跃仓位 → 合并成一笔（数量相加、开仓价加权、名义/保证金相加）。
+    后开仓并入最早一笔，被并入行标 CANCELED（不进平仓历史）。
+    由策略线程独占调用（挂单成交后 ≤60s 内并仓），无跨线程竞态。"""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM trade_positions WHERE token=? AND strategy='supertrend' "
+        "AND status IN ('OPEN','PARTIAL') ORDER BY id ASC", (token,))]
+    if len(rows) < 2:
+        return
+    keep = rows[0]
+    keep_qty = float(keep.get("quantity") or 0)
+    keep_entry = float(keep.get("entry_price") or 0)
+    keep_notional = float(keep.get("notional") or 0)
+    keep_margin = float(keep.get("margin_amount") or 0)
+    for extra in rows[1:]:
+        q = float(extra.get("quantity") or 0)
+        e = float(extra.get("entry_price") or 0)
+        tot_qty = keep_qty + q
+        if tot_qty > 0:
+            keep_entry = (keep_qty * keep_entry + q * e) / tot_qty
+        keep_qty = tot_qty
+        keep_notional += float(extra.get("notional") or 0)
+        keep_margin += float(extra.get("margin_amount") or 0)
+    # 先更新 keep 行（rowcount 检查：keep 若刚被 2s 循环扫损平仓则放弃本轮合并，
+    # extras 保持原状由 2s 循环继续管理，避免"keep 已平 + extras 已取消"双丢）
+    if keep.get("side") == "LONG":
+        keep_high = max([float(r.get("highest_price") or 0) or keep_entry
+                         for r in rows])
+        cur = conn.execute(
+            "UPDATE trade_positions SET quantity=?, entry_price=?, notional=?, "
+            "margin_amount=?, highest_price=?, updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status IN ('OPEN','PARTIAL')",
+            (keep_qty, keep_entry, keep_notional, keep_margin, keep_high, keep["id"]))
+    else:
+        keep_low = min([float(r.get("lowest_price") or 0) or keep_entry
+                        for r in rows])
+        cur = conn.execute(
+            "UPDATE trade_positions SET quantity=?, entry_price=?, notional=?, "
+            "margin_amount=?, lowest_price=?, updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status IN ('OPEN','PARTIAL')",
+            (keep_qty, keep_entry, keep_notional, keep_margin, keep_low, keep["id"]))
+    if cur.rowcount == 0:
+        return  # keep 已离场：本轮不合并，extras 不动（下轮再判或由 2s 循环管理）
+    for extra in rows[1:]:
+        conn.execute(
+            "UPDATE trade_positions SET status='CANCELED', advice=?, "
+            "closed_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('OPEN','PARTIAL')",
+            (f"加仓合并：已并入持仓 #{keep['id']}（数量相加）", extra["id"]))
+    print(f"[supertrend] {token} 合并仓位：{len(rows)} 笔 → #{keep['id']} 数量 {keep_qty:.8f}")
+
+
+def _place_order(conn, token: str, sig: dict, price: float, tol_order_pct: float,
+                 tol_sl_pct: float, notional: float, leverage: float,
+                 force_market: bool = False, allow_with_open: bool = False) -> bool:
+    """入场：挂单价在现价正确一侧 → 挂单（PENDING）；否则价格已到位 → 直接市价开仓（OPEN）。
+    force_market：跳过挂单价判定直接市价开（趋势反转选项）。
+    allow_with_open：已有持仓时也允许入场（反转流程：市价开 + 同轮挂单并存），
+    此时挂单价已到位则跳过（不挂第二笔，避免双市价单）。
+    成交由系统 2s 循环的 PENDING 分支处理（entry=挂单价，maker 语义无滑点）。"""
+    if not allow_with_open and storage.trade_has_active(conn, token, "supertrend"):
         return False
     side = "LONG" if sig["trend"] == "UP" else "SHORT"
-    sl = _calc_sl(side, sig, tol_pct)
+    limit_price = _calc_order_price(side, sig, tol_order_pct)
+    sl = _calc_sl(side, sig, tol_sl_pct)
+    snap_json = json.dumps({
+        "trend": sig["trend"],
+        "upper_band": sig["upper_band"],
+        "lower_band": sig["lower_band"],
+        "candle_ts": sig["ts"],
+    }, ensure_ascii=False)
+
+    # 挂单价在现价错误一侧 → 价格已到位，直接市价开仓
+    market_now = force_market or (side == "LONG" and limit_price >= price) \
+        or (side == "SHORT" and limit_price <= price)
+    if allow_with_open and not force_market and market_now:
+        return False  # 反转流程的挂单：价格已到位不再加第二笔
+
+    if market_now:
+        if force_market:
+            open_reason = (f"超级趋势 15m {sig['trend']} 趋势反转到允许方向，"
+                           f"市价开{'多' if side == 'LONG' else '空'}")
+            advice = (f"趋势反转：市价开{'多' if side == 'LONG' else '空'} @ ${price:.6g}，"
+                      f"止损 @ ${sl:.6g}（无止盈）")
+        else:
+            open_reason = f"超级趋势 15m {sig['trend']} 价格到位市价开{'多' if side == 'LONG' else '空'}"
+            advice = f"价格已到位：市价开仓 @ ${price:.6g}，止损 @ ${sl:.6g}（无止盈）"
+        position = {
+            "token": token,
+            "symbol": f"{token}USDT",
+            "side": side,
+            "status": "OPEN",
+            "mode": "paper",
+            "margin_amount": notional / leverage,
+            "leverage": leverage,
+            "notional": notional,
+            "quantity": notional / price,
+            "entry_price": price,
+            "limit_price": price,
+            "current_price": price,
+            "stop_loss_price": sl,
+            "tp1_price": None,
+            "tp2_price": None,
+            "highest_price": price if side == "LONG" else None,
+            "lowest_price": price if side == "SHORT" else None,
+            "trailing_stop_price": None,
+            "signal_snapshot": snap_json,
+            "open_reason": open_reason,
+            "advice": advice,
+            "strategy": "supertrend",
+        }
+        ok = storage.trade_position_insert(conn, position)
+        if ok:
+            print(f"[supertrend] {token} 市价开{side} @ {price} SL={sl}"
+                  + ("（趋势反转）" if force_market else "（价格到位）"))
+        return ok
+
     position = {
         "token": token,
         "symbol": f"{token}USDT",
         "side": side,
-        "status": "OPEN",
-        "mode": "paper",                       # 显式写死，与全局 TRADING_MODE 无关
+        "status": "PENDING",
+        "mode": "paper",
         "margin_amount": notional / leverage,
         "leverage": leverage,
         "notional": notional,
-        "quantity": notional / price,
-        "entry_price": price,
-        "limit_price": price,
-        "current_price": price,
+        "quantity": notional / limit_price,
+        "entry_price": None,
+        "limit_price": limit_price,
+        "current_price": limit_price,
         "stop_loss_price": sl,
         "tp1_price": None,
         "tp2_price": None,
-        "highest_price": price if side == "LONG" else None,
-        "lowest_price": price if side == "SHORT" else None,
+        "highest_price": None,
+        "lowest_price": None,
         "trailing_stop_price": None,
-        "signal_snapshot": json.dumps({
-            "trend": sig["trend"],
-            "upper_band": sig["upper_band"],
-            "lower_band": sig["lower_band"],
-            "candle_ts": sig["ts"],
-        }, ensure_ascii=False),
-        "open_reason": f"超级趋势 15m {sig['trend']} 开{'多' if side == 'LONG' else '空'}",
-        "advice": f"跟随15m超级趋势：止损 @ ${sl:.6g}（无止盈）",
+        "signal_snapshot": snap_json,
+        "open_reason": f"超级趋势 15m {sig['trend']} 挂{'多' if side == 'LONG' else '空'}单",
+        "advice": f"挂单中：{'多' if side == 'LONG' else '空'} @ ${limit_price:.6g}，止损 @ ${sl:.6g}",
         "strategy": "supertrend",
     }
     ok = storage.trade_position_insert(conn, position)
     if ok:
-        print(f"[supertrend] {token} 开{side} @ {price} SL={sl}（轨道±{tol_pct}%）")
+        print(f"[supertrend] {token} 挂{side}单 @ {limit_price} SL={sl}")
     else:
-        print(f"[supertrend] {token} 开仓 INSERT 失败（唯一索引冲突？）")
+        print(f"[supertrend] {token} 挂单 INSERT 失败（唯一索引冲突？）")
     return ok
+
+
+def _update_order(conn, pos: dict, sig: dict, price: float, tol_order_pct: float,
+                  tol_sl_pct: float) -> None:
+    """新闭合 K 线 → 挂单价 + SL 无条件跟随轨道（仅 PENDING 状态）。
+    新挂单价穿越现价（跑到错误一侧）→ 价格已到位 → 直接转市价开仓。"""
+    new_price = _calc_order_price(pos["side"], sig, tol_order_pct)
+    new_sl = _calc_sl(pos["side"], sig, tol_sl_pct)
+    market_now = (pos["side"] == "LONG" and new_price >= price) \
+        or (pos["side"] == "SHORT" and new_price <= price)
+
+    if market_now:
+        # 转市价开仓：entry 变现价，quantity 按现价重算（防名义金额漂移）
+        new_qty = float(pos.get("notional") or 0) / price
+        cur = conn.execute(
+            "UPDATE trade_positions SET status='OPEN', entry_price=?, "
+            "limit_price=?, current_price=?, quantity=?, "
+            "margin_amount=?, highest_price=?, lowest_price=?, "
+            "stop_loss_price=?, advice=?, updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status='PENDING'",
+            (price, price, price, new_qty,
+             float(pos.get("notional") or 0) / float(pos.get("leverage") or 1),
+             price if pos["side"] == "LONG" else None,
+             price if pos["side"] == "SHORT" else None,
+             new_sl,
+             f"价格已到位：市价开仓 @ ${price:.6g}，止损 @ ${new_sl:.6g}（无止盈）",
+             pos["id"]),
+        )
+        if cur.rowcount > 0:
+            print(f"[supertrend] {pos['token']} 挂单价穿越现价，市价开{pos['side']} @ {price} SL={new_sl}")
+        return
+
+    # 挂单价变化时 quantity 同步重算：成交价=挂单价（maker），保证名义金额不漂移
+    new_qty = float(pos.get("notional") or 0) / new_price
+    cur = conn.execute(
+        "UPDATE trade_positions SET limit_price=?, stop_loss_price=?, "
+        "quantity=?, current_price=?, advice=?, updated_at=CURRENT_TIMESTAMP "
+        "WHERE id=? AND status='PENDING'",
+        (new_price, new_sl, new_qty, new_price,
+         f"挂单中：{'多' if pos['side'] == 'LONG' else '空'} @ ${new_price:.6g}，止损 @ ${new_sl:.6g}",
+         pos["id"]),
+    )
+    if cur.rowcount > 0:
+        print(f"[supertrend] {pos['token']} 挂单更新 @ {new_price} SL={new_sl}")
 
 
 def _update_sl(conn, pos: dict, sig: dict, tol_pct: float) -> None:
@@ -254,16 +435,35 @@ def _update_sl(conn, pos: dict, sig: dict, tol_pct: float) -> None:
 def close_supertrend_position(token: str, reason: str = "REMOVED") -> bool:
     """幂等平仓唯一入口（web 移除 + 线程清理安全网共用）。
     口径对齐现有平仓路径：close 价写 current_price、realized/pnl_pct 同口径。
-    返回是否实际平掉（已被其他路径平掉返回 False，静默）。"""
+    挂单（PENDING）→ 取消。返回是否实际处理（已被处理返回 False，静默）。
+    并存场景（市价仓+挂单）：挂单取消后继续平持仓，不能提前 return。"""
     token = token.upper()
     with storage.get_conn() as conn:
+        handled = False
+        # 挂单 → 取消（并存时持仓还要继续平，不 return）
+        pend = conn.execute(
+            "SELECT * FROM trade_positions WHERE token=? AND strategy='supertrend' "
+            "AND status='PENDING' ORDER BY id DESC LIMIT 1",
+            (token,),
+        ).fetchone()
+        if pend:
+            pend = dict(pend)
+            conn.execute(
+                "UPDATE trade_positions SET status='CANCELED', "
+                "advice='移除监控：挂单已取消', closed_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status='PENDING'",
+                (pend["id"],),
+            )
+            storage.trade_signal_lock_release(conn, token, "supertrend")
+            print(f"[supertrend] {token} 挂单已取消（{reason}）")
+            handled = True
         row = conn.execute(
             "SELECT * FROM trade_positions WHERE token=? AND strategy='supertrend' "
             "AND status IN ('OPEN','PARTIAL') ORDER BY id DESC LIMIT 1",
             (token,),
         ).fetchone()
         if not row:
-            return False
+            return handled
         pos = dict(row)
         price = get_mark_price(token)
         if not price or price <= 0:
@@ -293,7 +493,31 @@ def close_supertrend_position(token: str, reason: str = "REMOVED") -> bool:
             return False
         storage.trade_signal_lock_release(conn, token, "supertrend")
         print(f"[supertrend] {token} 平仓（{reason}）@ {price} realized={realized:.4f}")
+        record_close_snap(token, pos["id"])
         return True
+
+
+def record_close_snap(token: str, position_id: int) -> None:
+    """平仓时记录当时的 15m 趋势轨道快照（status 表最近信号，≤60s 新鲜）。
+    页面"扫损重开历史"展示用。失败静默（展示数据，不影响主流程）。"""
+    try:
+        with storage.get_conn(config.SUPERTREND_DB) as conn_st:
+            row = conn_st.execute(
+                "SELECT trend, upper_band, lower_band FROM supertrend_status "
+                "WHERE token=?", (token,)).fetchone()
+            if not row:
+                return
+            conn_st.execute("""
+                INSERT INTO supertrend_close_snaps
+                (position_id, token, trend, upper_band, lower_band, created_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(position_id) DO UPDATE SET
+                    trend=excluded.trend, upper_band=excluded.upper_band,
+                    lower_band=excluded.lower_band, created_at=excluded.created_at
+            """, (position_id, token, row["trend"], row["upper_band"],
+                  row["lower_band"], int(time.time())))
+    except Exception as e:
+        print(f"[supertrend] 平仓快照记录失败 {token}: {e}")
 
 
 def _mark_error(conn_st, token: str, err: str) -> None:
@@ -310,7 +534,7 @@ def _mark_error(conn_st, token: str, err: str) -> None:
 def _write_status(conn_st, token: str, sig: dict, price: float, pos: dict | None) -> None:
     """写 supertrend_status：信号/价格/持仓状态，last_candle_ts 用于 SL 更新去重"""
     now = int(time.time())
-    state = "HOLDING" if pos else "FLAT"
+    state = pos.get("_state") if pos else "FLAT"
     forming = sig.get("forming") or {}
     conn_st.execute("""
         INSERT INTO supertrend_status
@@ -331,9 +555,16 @@ def _write_status(conn_st, token: str, sig: dict, price: float, pos: dict | None
           forming.get("trend"), forming.get("upper_band"), forming.get("lower_band")))
 
 
-def _process_token(conn, conn_st, token: str, tol_pct: float,
-                   notional: float, leverage: float) -> None:
-    """单币处理：拉信号 → 取价 → 有仓更新 SL / 无仓开仓。独立 try/except 由调用方保证。"""
+def _process_token(conn, conn_st, token: str, tol_sl_pct: float,
+                   tol_order_pct: float, notional: float, leverage: float,
+                   direction: str = "BOTH", flip_market_open: bool = False) -> None:
+    """单币处理：拉信号 → 取价 → 兜底合并同向多笔 →
+    有持仓 → 新K线更新 SL（只朝有利）；有挂单 → 方向受限且趋势反转则取消，
+    否则新K线更新挂单价+SL（无条件跟随）；持仓挂单并存时两者都处理；
+    无仓无单 → 等新闭合K线才挂单（首次加入先记基准，扫损后等下一根闭合，
+    期间 state=WAITING；方向受限且趋势不符 → state=WAIT_DIR；
+    flip_market_open=1 且受限方向反转到允许方向 → 市价开仓 + 同轮挂单）。
+    独立 try/except 由调用方保证。"""
     sig = _fetch_okx_supertrend(token)
     if sig is None:
         _mark_error(conn_st, token, "okx_fetch_failed")
@@ -343,38 +574,127 @@ def _process_token(conn, conn_st, token: str, tol_pct: float,
         _mark_error(conn_st, token, "mark_price_failed")
         return
 
+    # 兜底合并同向多笔（挂单成交/双市价开 → 数量相加并成一笔，≤60s 内完成）
+    _merge_positions(conn, token)
+
     pos = conn.execute(
         "SELECT * FROM trade_positions WHERE token=? AND strategy='supertrend' "
         "AND status IN ('OPEN','PARTIAL') ORDER BY id DESC LIMIT 1",
         (token,),
     ).fetchone()
     pos = dict(pos) if pos else None
+    pending = conn.execute(
+        "SELECT * FROM trade_positions WHERE token=? AND strategy='supertrend' "
+        "AND status='PENDING' ORDER BY id DESC LIMIT 1",
+        (token,),
+    ).fetchone()
+    pending = dict(pending) if pending else None
+
+    # 新闭合 K 线判定（轨道值变了才改，用 status 表 last_candle_ts 去重）
+    old_row = conn_st.execute(
+        "SELECT last_candle_ts, state, trend FROM supertrend_status WHERE token=?",
+        (token,),
+    ).fetchone()
+    old_ts = old_row["last_candle_ts"] if old_row else None
+    old_state = old_row["state"] if old_row else None
+    old_trend = old_row["trend"] if old_row else None
+    new_candle = old_ts != sig["ts"]
+
+    # 趋势反转 TG 通知（所有监控币 UP↔DOWN 翻转；首次无旧趋势不算反转）
+    if old_trend is not None and new_candle and old_trend != sig["trend"]:
+        try:
+            import tg_notify
+            tg_notify.send_supertrend_reversal(
+                token, old_trend, sig["trend"], sig["upper_band"],
+                sig["lower_band"], price, sig["ts"])
+        except Exception as e:
+            print(f"[supertrend] {token} 反转 TG 发送失败: {e}")
+
+    waiting = False
+    dir_wait = False
+    direction_ok = (direction == "BOTH"
+                    or (direction == "LONG_ONLY" and sig["trend"] == "UP")
+                    or (direction == "SHORT_ONLY" and sig["trend"] == "DOWN"))
+    dir_label = {"LONG_ONLY": "多", "SHORT_ONLY": "空"}.get(direction, "")
+    wait_trend = "上升" if direction == "LONG_ONLY" else "下降"
+    # 反转判定：上一轮趋势是受限方向，新K线翻到允许方向（仅方向限制的币）
+    allowed_trend = {"LONG_ONLY": "UP", "SHORT_ONLY": "DOWN"}.get(direction)
+    was_blocked = (allowed_trend is not None and old_trend is not None
+                   and old_trend != allowed_trend)
+    flip_open = (bool(flip_market_open) and direction_ok and was_blocked and new_candle)
 
     if pos:
-        # 新闭合 K 线才更新 SL（用 status 表 last_candle_ts 去重）
-        old_row = conn_st.execute(
-            "SELECT last_candle_ts FROM supertrend_status WHERE token=?",
-            (token,),
-        ).fetchone()
-        old_ts = old_row["last_candle_ts"] if old_row else None
-        if old_ts != sig["ts"]:
-            _update_sl(conn, pos, sig, tol_pct)
-    else:
-        # 数据新鲜才开仓（防止接口陈旧数据导致的错误方向开仓）
+        if new_candle:
+            _update_sl(conn, pos, sig, tol_sl_pct)
+    if pending:
+        if not direction_ok:
+            # 方向限制：趋势翻到受限方向 → 取消挂单（与 2s 循环成交竞态：rowcount 谁先谁赢）
+            cur = conn.execute(
+                "UPDATE trade_positions SET status='CANCELED', advice=?, "
+                "closed_at=CURRENT_TIMESTAMP WHERE id=? AND status='PENDING'",
+                (f"方向限制（只做{dir_label}）：趋势反转，挂单已取消，等待{wait_trend}趋势",
+                 pending["id"]),
+            )
+            if cur.rowcount > 0:
+                storage.trade_signal_lock_release(conn, token, "supertrend")
+                print(f"[supertrend] {token} 方向限制：趋势反转，挂单已取消（等{wait_trend}趋势）")
+            dir_wait = True
+        elif new_candle:
+            _update_order(conn, pending, sig, price, tol_order_pct, tol_sl_pct)
+    if not pos and not pending:
         now_ms = int(time.time() * 1000)
-        if now_ms - sig["ts"] <= DATA_FRESH_MAX_AGE_MS:
-            _open_position(conn, token, sig, price, tol_pct, notional, leverage)
-        else:
+        if now_ms - sig["ts"] > DATA_FRESH_MAX_AGE_MS:
             _mark_error(conn_st, token, "stale_data")
-            return  # 不开仓，保持旧状态（不写 _write_status 以免覆盖错误标记）
+            return  # 不挂单，保持旧状态（不写 _write_status 以免覆盖错误标记）
+        if flip_open:
+            # 趋势反转到允许方向：立即市价开一笔 + 同轮照常挂单（挂单价已到位则不挂）
+            ok = _place_order(conn, token, sig, price, tol_order_pct, tol_sl_pct,
+                              notional, leverage, force_market=True,
+                              allow_with_open=True)
+            if ok:
+                _place_order(conn, token, sig, price, tol_order_pct, tol_sl_pct,
+                             notional, leverage, allow_with_open=True)
+                print(f"[supertrend] {token} 趋势反转到允许方向：市价开仓 + 挂单（等回调加仓）")
+            else:
+                waiting = True
+        elif not direction_ok:
+            dir_wait = True
+            if old_state != "WAIT_DIR":  # 仅进入等待时打印一次
+                print(f"[supertrend] {token} 方向限制（只做{dir_label}）：等待{wait_trend}趋势后挂单")
+        elif old_ts is not None and new_candle:
+            ok = _place_order(conn, token, sig, price, tol_order_pct, tol_sl_pct,
+                              notional, leverage)
+            if not ok:
+                waiting = True
+        else:
+            # 必须等新闭合K线：首次加入先记基准，扫损后等下一根闭合（防插针后立即用旧轨道重挂）
+            waiting = True
+            if old_state != "WAITING":  # 仅进入等待时打印一次，避免每轮 60s 日志噪音
+                print(f"[supertrend] {token} 等待15m K线闭合后挂单（趋势 {sig['trend']}）")
 
+    # 持仓优先（并存时 state=HOLDING，与页面 position 字段口径一致）
     pos = conn.execute(
-        "SELECT stop_loss_price FROM trade_positions WHERE token=? AND "
+        "SELECT stop_loss_price, status FROM trade_positions WHERE token=? AND "
         "strategy='supertrend' AND status IN ('OPEN','PARTIAL') "
         "ORDER BY id DESC LIMIT 1",
         (token,),
     ).fetchone()
-    pos_ref = {"stop_loss_price": pos["stop_loss_price"]} if pos else None
+    if not pos:
+        pos = conn.execute(
+            "SELECT stop_loss_price, status FROM trade_positions WHERE token=? AND "
+            "strategy='supertrend' AND status='PENDING' "
+            "ORDER BY id DESC LIMIT 1",
+            (token,),
+        ).fetchone()
+    if pos:
+        pos_ref = {"stop_loss_price": pos["stop_loss_price"],
+                   "_state": "PENDING" if pos["status"] == "PENDING" else "HOLDING"}
+    elif waiting:
+        pos_ref = {"_state": "WAITING"}
+    elif dir_wait:
+        pos_ref = {"_state": "WAIT_DIR"}
+    else:
+        pos_ref = None
     _write_status(conn_st, token, sig, price, pos_ref)
 
 
@@ -386,6 +706,9 @@ def _run_round() -> None:
         # 容忍 0 是合法值（SL=轨道本身），不能用 `or` 默认（0 是 falsy 会被吞掉）
         raw_tol = settings.get("supertrend_sl_tolerance_pct")
         tol = float(raw_tol) if raw_tol is not None else config.SUPERTREND_SL_TOLERANCE_PCT
+        raw_order_tol = settings.get("supertrend_order_tolerance_pct")
+        order_tol = (float(raw_order_tol) if raw_order_tol is not None
+                     else config.SUPERTREND_ORDER_TOLERANCE_PCT)
         notional = float(settings.get("supertrend_notional_usd")
                          or config.SUPERTREND_NOTIONAL_USD)
         leverage = float(settings.get("supertrend_leverage")
@@ -393,6 +716,8 @@ def _run_round() -> None:
     # 防御异常值（DB 被直接改坏/历史脏数据）：容忍负数会让 SL 算到错误方向
     if not (0 <= tol <= 20):
         tol = config.SUPERTREND_SL_TOLERANCE_PCT
+    if not (0 <= order_tol <= 20):
+        order_tol = config.SUPERTREND_ORDER_TOLERANCE_PCT
     if notional <= 0:
         notional = config.SUPERTREND_NOTIONAL_USD
     if not (1 <= leverage <= 125):
@@ -415,11 +740,40 @@ def _run_round() -> None:
 
     # B. 遍历活跃币种（单币失败不拖累其他币）
     for t in active:
+        # per-token 覆盖（NULL=用全局），脏值/越界回退全局值（全局已防御过）。
+        # 不能用裸 float()：脏字符串抛异常会跳过整币，导致持仓 SL 停更
+        def _num(v, fallback):
+            if v is None:
+                return fallback
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return fallback
+
+        tok_dir = t.get("direction") or "BOTH"
+        if tok_dir not in ("BOTH", "LONG_ONLY", "SHORT_ONLY"):
+            tok_dir = "BOTH"  # 防 DB 手改非法值导致永不挂单
+        tok_notional = _num(t.get("notional_usd"), notional)
+        tok_tol = _num(t.get("sl_tolerance_pct"), tol)
+        tok_order_tol = _num(t.get("order_tolerance_pct"), order_tol)
+        tok_lev = _num(t.get("leverage"), leverage)
+        if not (0 <= tok_tol <= 20):
+            tok_tol = tol
+        if not (0 <= tok_order_tol <= 20):
+            tok_order_tol = order_tol
+        if tok_notional <= 0:
+            tok_notional = notional
+        if not (1 <= tok_lev <= 125):
+            tok_lev = leverage
+        tok_flip = t.get("flip_market_open") in (1, "1", True)
+        if t.get("paused") in (1, "1", True):
+            continue  # 暂停监控：不拉信号不处理；持仓/挂单由 2s 循环照常扫损/成交
         try:
             with storage.get_conn() as main_conn:
                 with storage.get_conn(config.SUPERTREND_DB) as conn_st:
                     _process_token(main_conn, conn_st, t["token"],
-                                   tol, notional, leverage)
+                                   tok_tol, tok_order_tol, tok_notional,
+                                   tok_lev, tok_dir, tok_flip)
         except Exception as e:
             print(f"[supertrend] {t['token']} 处理异常: {e}")
         # 币间间隔：平滑 OKX 调用峰值（限额 5次/秒，20币也仅 0.3次/秒，此为保险）

@@ -557,6 +557,7 @@ async def main():
         storage.status_update(conn, data_source="okx" if _OKX_MODE else "binance")
 
     if _OKX_MODE:
+        time.sleep(20)  # 错峰：等前序进程（web/auto_trader/market_realtime）启动高峰过去再进首轮 pipeline
         scraper = None
         round_timeout = 180  # OKX 轮无抓取，2 分钟足够
         console.print("[green]=== OKX 数据源 Worker 启动 ===[/green]")
@@ -565,6 +566,7 @@ async def main():
         console.print(f"   快照: Binance API (不变)")
         console.print(f"   Web 仪表盘：请另开一个终端运行 python web.py")
     else:
+        time.sleep(10)  # 错峰：等前序进程 import 高峰过去再拉起 Chromium
         scraper = SquareScraper()
         round_timeout = config.SCRAPE_ROUND_SECONDS + 120
         console.print("[green]=== 币安广场监控 Worker 启动 ===[/green]")
