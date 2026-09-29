@@ -59,6 +59,10 @@ def send_alphafox_signals(signals: list[dict]):
             continue  # SKIP/LEV 等不推
         if s.get("retry"):
             continue  # 执行失败待重试的信号不推（避免误导）
+        if not s.get("executed"):
+            # 没真执行成的不推：非归属仓（多交易员同币）、未跟随仓、已平仓等
+            # 都会返回 executed=False，推出去就是"幽灵加/减/平"
+            continue
         side_txt = "多" if s.get("side") == "LONG" else "空"
         price = s.get("price")
         price_txt = f" @{float(price):.6g}" if price else ""
@@ -81,6 +85,67 @@ def send_alphafox_signals(signals: list[dict]):
         )
     except Exception:
         pass
+
+
+def send_alphafox_trader_actions(signals: list[dict]):
+    """跟单**交易员动作流**（第二条推送，独立 bot/chat，留空则不生效）。
+
+    只答"交易员干了什么"，**与系统是否执行无关**——和 `send_alphafox_signals` 的
+    唯一区别就是**不过滤 executed**：交易员开/加/减/平一律推，纸盘跟没跟都不影响。
+    SKIP 也推（= 交易员开仓、我们跳过），对外仍报"开"。
+
+    `retry` 仍然不推：retry 信号**每轮都重发**（prev 不更新、下轮重试），推了会同一笔
+    刷屏；它执行成功那一轮会正常推一次，所以动作不会丢、只是晚一轮。
+
+    token 留空 → 退回用跟单 bot 的 token（只要建个新 chat 填 chat_id 即可）。"""
+    bot = (getattr(config, "ALPHAFOX_TRADER_TG_BOT_TOKEN", "")
+           or getattr(config, "ALPHAFOX_TG_BOT_TOKEN", ""))
+    chat_id = getattr(config, "ALPHAFOX_TRADER_TG_CHAT_ID", "")
+    if not bot or not chat_id or not signals:
+        return
+
+    def esc_html(s):
+        return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+    act_icon = {"OPEN": "🚀", "ADD": "➕", "REDUCE": "➖", "CLOSE": "✅",
+                "SKIP": "⏭️"}
+    act_name = {"OPEN": "开", "ADD": "加", "REDUCE": "减", "CLOSE": "平",
+                "SKIP": "开"}
+    lines = ["<b>🔔 交易员动作</b>"]
+    pushed = 0
+    for s in signals:
+        if s.get("action") not in act_icon:
+            continue          # LEV 等不推（不在"开/加/减/平"里）
+        if s.get("retry"):
+            continue          # 每轮重发 → 刷屏；执行成功那轮会正常推
+        side_txt = "多" if s.get("side") == "LONG" else "空"
+        price = s.get("price")
+        price_txt = f" @{float(price):.6g}" if price else ""
+        notional = s.get("trader_notional")
+        # alphofox 对 SHORT 仓的 notional 为负值，展示取绝对值
+        notional_txt = f"$ {abs(float(notional)):,.0f}" if notional else ""
+        lines.append(
+            f"{act_icon[s['action']]} {esc_html(s.get('label'))} "
+            f"{act_name[s['action']]}{side_txt} "
+            f"{esc_html(s.get('symbol'))}{price_txt}\n  名义 {notional_txt}")
+        pushed += 1
+    if pushed == 0:
+        return
+    try:
+        r = requests.post(
+            TG_API.format(token=bot),
+            json={"chat_id": chat_id, "text": "\n".join(lines),
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10,
+        )
+        # 失败要看得见：最常见的是 "chat not found"——**新 bot 还没被 /start 过**
+        # （机器人不能主动私聊），配置对了但一条都收不到，静默吞掉最难查
+        if getattr(r, "status_code", 200) >= 400:
+            print(f"[tg] 交易员动作流推送被拒 {getattr(r, 'status_code', '?')}: "
+                  f"{getattr(r, 'text', '')[:200]}")
+    except Exception as e:
+        print(f"[tg] 交易员动作流推送异常: {e}")
 
 
 def send_supertrend_reversal(token: str, old_trend: str, new_trend: str,

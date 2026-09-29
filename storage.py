@@ -577,6 +577,10 @@ def _migrate(conn):
     if "order_type" not in tp_cols:
         conn.execute("ALTER TABLE trade_positions ADD COLUMN order_type TEXT DEFAULT 'market'")
         conn.execute("UPDATE trade_positions SET order_type = 'limit' WHERE status = 'PENDING'")
+    # 跟单托管状态：1=托管中 0=已取消托管 2=恢复中(待追平) 3=已脱离(交易员已无此仓)
+    # 默认 1：存量行自动视为托管中，行为与加列前一致
+    if "managed" not in tp_cols:
+        conn.execute("ALTER TABLE trade_positions ADD COLUMN managed INTEGER DEFAULT 1")
     # 老库首次迁移无索引时建新版（旧版→新版的条件重建已在前面的检查中处理，
     # 此处绝不能无条件 DROP 重建，否则会把 supertrend 豁免版本覆盖回旧版）
     conn.execute("""
@@ -643,8 +647,13 @@ def _migrate(conn):
         conn.execute("ALTER TABLE kol_llm_logs ADD COLUMN user_prompt TEXT")
     if "raw_response" not in kll_cols:
         conn.execute("ALTER TABLE kol_llm_logs ADD COLUMN raw_response TEXT")
-    # round_candidates 遗留表，无人读写的弃用数据
-    conn.execute("DELETE FROM round_candidates")
+    # round_candidates 遗留表，无人读写的弃用数据（老库里有、**全新库没有** →
+    # 不加保护时全新部署/换库/从备份恢复会在 init_db 直接抛 no such table 崩掉，
+    # web 的 __main__ 里那次调用没兜底，进程起不来）
+    try:
+        conn.execute("DELETE FROM round_candidates")
+    except sqlite3.OperationalError:
+        pass
     # token_heat_history round_number 索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_heat_round ON token_heat_history(round_number)")
     # worker_status OKX 数据源列
@@ -984,6 +993,72 @@ CREATE TABLE IF NOT EXISTS live_trade_log (
 );
 """
 
+# ---- 加密事件（event_agent.py）：抓到的快讯 / AI 判定 / 事件驱动下单 ----
+_EVENT_DDL = """
+CREATE TABLE IF NOT EXISTS crypto_event_raw (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id        INTEGER UNIQUE NOT NULL,   -- 平台消息 id：去重键 + 翻页游标
+    ts            TEXT NOT NULL,             -- 原始 ISO（UTC）
+    text          TEXT NOT NULL,             -- 原文
+    coins         TEXT NOT NULL DEFAULT '[]',-- 识别出的币种（JSON 数组）
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_ce_raw_id ON crypto_event_raw(id DESC);
+
+CREATE TABLE IF NOT EXISTS crypto_event_ai (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id      INTEGER NOT NULL,          -- → crypto_event_raw.id
+    coin          TEXT NOT NULL,
+    impact        TEXT,                      -- 利多 / 利空 / 中性 / 无关
+    reason        TEXT,
+    confidence    INTEGER,
+    model         TEXT,
+    status        TEXT DEFAULT 'pending',    -- pending / ok / failed
+    attempts      INTEGER DEFAULT 0,
+    analyzed_at   TEXT,
+    traded        INTEGER DEFAULT 0,         -- 是否已被策略消费（防重复下单）
+    UNIQUE(event_id, coin)
+);
+CREATE INDEX IF NOT EXISTS idx_ce_ai_state ON crypto_event_ai(status, id);
+
+CREATE TABLE IF NOT EXISTS crypto_event_trade (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id      INTEGER NOT NULL,
+    coin          TEXT NOT NULL,
+    position_id   INTEGER,
+    side          TEXT,
+    ok            INTEGER,
+    reason        TEXT,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 水位 + 上次运行时间（页面要显示"上次抓取/上次分析"）
+CREATE TABLE IF NOT EXISTS crypto_event_meta (
+    key           TEXT PRIMARY KEY,
+    value         TEXT
+);
+"""
+
+
+def init_event_db():
+    """初始化加密事件独立 DB"""
+    with get_conn(config.EVENT_DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(_EVENT_DDL)
+
+
+def event_meta_get(conn, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM crypto_event_meta WHERE key=?",
+                       (key,)).fetchone()
+    return (row["value"] if row and row["value"] is not None else default)
+
+
+def event_meta_set(conn, key: str, value) -> None:
+    conn.execute("INSERT INTO crypto_event_meta (key, value) VALUES (?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, str(value)))
+
 
 def init_onchain_live_db():
     """初始化链上实盘独立 DB"""
@@ -994,8 +1069,14 @@ def init_onchain_live_db():
 
 
 def live_position_insert(conn, pos: dict) -> bool:
+    """插入 live 记录。返回**是否真的插入了**（靠 rowcount 判）：
+    `INSERT OR IGNORE` 在 paper_position_id 唯一键冲突时静默跳过，旧写法恒返 True
+    → 调用方以为建好了、其实一条记录都没有（下一轮又补建、每轮多挂一张 SL）。
+
+    保留 OR IGNORE（改成裸 INSERT 会让冲突抛异常，打断跟单/链上的补建路径）——
+    只是把"被忽略"如实告诉调用方。"""
     try:
-        conn.execute(
+        cur = conn.execute(
             """INSERT OR IGNORE INTO live_positions
                (paper_position_id, token, symbol, side, strategy,
                 entry_price, quantity, leverage, margin_usd,
@@ -1008,7 +1089,7 @@ def live_position_insert(conn, pos: dict) -> bool:
              pos.get("tp1_done", 0), pos.get("tp2_done", 0),
              pos.get("status", "OPEN")),
         )
-        return True
+        return cur.rowcount > 0
     except Exception:
         return False
 
@@ -1045,6 +1126,19 @@ def live_positions_open(conn, strategy: str = None) -> list[dict]:
     if strategy:
         sql += " AND strategy=?"
         params = (strategy,)
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def live_positions_closed(conn, limit: int = 50,
+                          strategy: str = None) -> list[dict]:
+    """已平仓实盘持仓历史（页面展示）。strategy 为空=全部策略"""
+    sql = "SELECT * FROM live_positions WHERE status='CLOSED'"
+    params: list = []
+    if strategy:
+        sql += " AND strategy=?"
+        params.append(strategy)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
@@ -1741,8 +1835,16 @@ def trading_settings_defaults() -> dict:
         "onchain_live_mode": getattr(config, "ONCHAIN_LIVE_MODE", "paper"),
         # 超级趋势策略
         "supertrend_enabled": getattr(config, "SUPERTREND_ENABLED", True),
+        # 加密事件（设置页可改，热生效）
+        "event_strategy_enabled": getattr(config, "EVENT_STRATEGY_ENABLED", True),
+        "event_min_confidence": getattr(config, "EVENT_MIN_CONFIDENCE", 70),
+        "event_fresh_minutes": getattr(config, "EVENT_FRESH_MINUTES", 10),
+        "event_cooldown_minutes": getattr(config, "EVENT_COOLDOWN_MINUTES", 30),
+        "event_daily_max": getattr(config, "EVENT_DAILY_MAX", 12),
+        "event_poll_seconds": getattr(config, "EVENT_POLL_SECONDS", 60),
         "supertrend_sl_tolerance_pct": getattr(config, "SUPERTREND_SL_TOLERANCE_PCT", 1.0),
         "supertrend_order_tolerance_pct": getattr(config, "SUPERTREND_ORDER_TOLERANCE_PCT", 1.0),
+        "supertrend_flip_tolerance_pct": getattr(config, "SUPERTREND_FLIP_TOLERANCE_PCT", 0.0),
         "supertrend_notional_usd": getattr(config, "SUPERTREND_NOTIONAL_USD", 50.0),
         "supertrend_leverage": getattr(config, "SUPERTREND_LEVERAGE", 3.0),
         "strategy_initial_supertrend": getattr(config, "STRATEGY_INITIAL_SUPERTREND", 1000),
@@ -1761,10 +1863,12 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "supertrend_enabled", "alphafox_trade_enabled"}:
+        if row["key"] in {"enabled", "event_strategy_enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "supertrend_enabled", "alphafox_trade_enabled", "alphafox_live_enabled", "event_strategy_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
-        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds",
-            "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct"}:
+        elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds",
+            "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_notional", "alphafox_live_leverage",
+            "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "strategy_initial_kol_snapshot",
+            "agent_collect_interval_minutes", "agent_trigger_interval", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_snapshot_interval_minutes"}:
             try:
                 settings[row["key"]] = float(raw)
             except (TypeError, ValueError):
@@ -1781,7 +1885,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_exempt_paper_ids", "alphafox_live_notional", "alphafox_live_ratio", "alphafox_live_max_notional", "alphafox_live_leverage", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -1955,7 +2059,11 @@ def trade_position_insert(conn, position: dict):
         return False
 
 
-def trade_position_update(conn, position_id: int, fields: dict):
+def trade_position_update(conn, position_id: int, fields: dict,
+                          status_in: tuple | None = None) -> int:
+    """按 id 更新持仓。status_in 给定时附加状态条件并返回受影响行数
+    （0=状态已变，调用方应放弃本次写入：防把 CANCELED/CLOSED 行改回活跃，
+    例如 1s 循环用旧快照把已合并(CANCELED)的行又按扫损平掉 → 数量/盈亏双计）。"""
     fields = {k: v for k, v in fields.items() if k != "id"}
     fields["updated_at"] = "__CURRENT_TIMESTAMP__"
     sets = []
@@ -1967,7 +2075,14 @@ def trade_position_update(conn, position_id: int, fields: dict):
             sets.append(f"{key}=?")
             params.append(value)
     params.append(position_id)
-    conn.execute(f"UPDATE trade_positions SET {', '.join(sets)} WHERE id=?", params)
+    where = "WHERE id=?"
+    if status_in:
+        ph = ",".join("?" for _ in status_in)
+        where += f" AND status IN ({ph})"
+        params.extend(status_in)
+    cur = conn.execute(
+        f"UPDATE trade_positions SET {', '.join(sets)} {where}", params)
+    return cur.rowcount
 
 
 def trade_loss_archive_add(conn, sample: dict):

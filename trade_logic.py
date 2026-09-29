@@ -986,45 +986,62 @@ def update_paper_positions(conn):
     limit_timeout = int(settings.get("limit_order_timeout_seconds", config.LIMIT_ORDER_TIMEOUT_SECONDS))
 
     # === 实盘：从 exchange 同步持仓状态 ===
+    # 注意：跟单(alphafox)/超势(supertrend)有自己的实盘镜像层，它们的纸盘仓在
+    # 本库永远是"纸盘"。全局 mode=live 是链上策略的实盘开关，不能拿交易所持仓
+    # 去比对这些策略的仓（会把被互斥/开关挡住的仓按"交易所已平仓"误平）
     if mode == "live" and positions:
         import exchange
-        live_positions = exchange.get_positions()
-        live_map = {lp["symbol"][:-4]: lp for lp in live_positions}
+        self_mirrored = ("alphafox", "supertrend")
+        synced = [p for p in positions if p.get("strategy") not in self_mirrored]
+        positions = [p for p in positions if p.get("strategy") in self_mirrored]
+        if synced:
+            live_positions = exchange.get_positions()
+            live_map = {lp["symbol"][:-4]: lp for lp in live_positions}
+            for pos in synced:
+                token = pos["token"]
+                lp = live_map.get(token.upper())
+                if not lp:
+                    # 交易所已平仓
+                    qty = float(pos.get("quantity") or 0)
+                    realized = float(pos.get("realized_pnl") or 0)
+                    margin = float(pos.get("margin_amount") or 1)
+                    # 未从交易所拿到数据时保持原样
+                    if any(t.upper() in live_map
+                           for t in [p["token"] for p in synced]):
+                        fields = {
+                            "status": "CLOSED",
+                            "unrealized_pnl": 0,
+                            "pnl_pct": (realized / margin) * 100 if margin else 0,
+                            "advice": "实盘已平仓（交易所无此持仓）",
+                            "closed_at": "__CURRENT_TIMESTAMP__",
+                        }
+                        storage.trade_position_update(
+                            conn, pos["id"], fields,
+                            status_in=("PENDING", "OPEN", "PARTIAL"))
+                        storage.trade_signal_lock_release(
+                            conn, pos["token"], pos["strategy"])
+                    continue
 
-        for pos in positions:
-            token = pos["token"]
-            lp = live_map.get(token.upper())
-            if not lp:
-                # 交易所已平仓
-                qty = float(pos.get("quantity") or 0)
-                realized = float(pos.get("realized_pnl") or 0)
-                margin = float(pos.get("margin_amount") or 1)
-                # 未从交易所拿到数据时保持原样
-                if any(t.upper() in live_map for t in [p["token"] for p in positions]):
-                    fields = {
-                        "status": "CLOSED",
-                        "unrealized_pnl": 0,
-                        "pnl_pct": (realized / margin) * 100 if margin else 0,
-                        "advice": "实盘已平仓（交易所无此持仓）",
-                        "closed_at": "__CURRENT_TIMESTAMP__",
-                    }
-                    storage.trade_position_update(conn, pos["id"], fields)
-                    storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
-                continue
-
-            # 同步交易所数据
-            fields = {
-                "current_price": lp["mark_price"],
-                "unrealized_pnl": lp["unrealized_pnl"],
-                "pnl_pct": (float(pos.get("realized_pnl") or 0) + lp["unrealized_pnl"])
-                           / float(pos.get("margin_amount") or 1) * 100,
-                "highest_price": max(
-                    float(pos.get("highest_price") or lp["mark_price"]),
-                    lp["mark_price"],
-                ),
-            }
-            storage.trade_position_update(conn, pos["id"], fields)
-        return  # 实盘不跑本地止盈止损逻辑
+                # 同步交易所数据
+                fields = {
+                    "current_price": lp["mark_price"],
+                    "unrealized_pnl": lp["unrealized_pnl"],
+                    "pnl_pct": (float(pos.get("realized_pnl") or 0)
+                                + lp["unrealized_pnl"])
+                               / float(pos.get("margin_amount") or 1) * 100,
+                    "highest_price": max(
+                        float(pos.get("highest_price") or lp["mark_price"]),
+                        lp["mark_price"],
+                    ),
+                }
+                storage.trade_position_update(
+                    conn, pos["id"], fields,
+                    status_in=("PENDING", "OPEN", "PARTIAL"))
+        if not positions:
+            return  # 实盘不跑本地止盈止损逻辑
+        # 自镜像策略（跟单/超势）的纸盘仓继续走下面的纸盘逻辑：它们有自己的
+        # 实盘镜像层，纸盘行必须照常刷新（价格/止损/updated_at），否则会被
+        # 镜像层的新鲜度闸门挡住 → 只减不增
 
     for pos in positions:
         market = _load_market(conn, pos["token"])
@@ -1127,8 +1144,8 @@ def update_paper_positions(conn):
                 )
                 fields_ok = cur.rowcount > 0
             else:
-                storage.trade_position_update(conn, pos["id"], fields)
-                fields_ok = True
+                fields_ok = storage.trade_position_update(
+                    conn, pos["id"], fields, status_in=("PENDING",)) > 0
             pd_id = pos.get("pending_decision_id")
             if pd_id:
                 if triggered and fields_ok:
@@ -1195,7 +1212,11 @@ def update_paper_positions(conn):
                 "advice": f"止损触发 @ ${fill_price:.6g}（含假设滑点），已平仓",
                 "closed_at": "__CURRENT_TIMESTAMP__",
             })
-            storage.trade_position_update(conn, pos["id"], fields)
+            # 状态条件：行可能已被策略线程合并(CANCELED)/平掉 → 不复活不双计
+            if storage.trade_position_update(
+                    conn, pos["id"], fields,
+                    status_in=("OPEN", "PARTIAL")) == 0:
+                continue
             storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
             # 写平仓 journal（supertrend 跳过：不污染 agent 复盘数据）
             if not is_supertrend:
@@ -1292,7 +1313,10 @@ def update_paper_positions(conn):
                     "advice": f"跟踪止盈触发 @ ${fill_price:.6g}，已平仓",
                     "closed_at": "__CURRENT_TIMESTAMP__",
                 })
-                storage.trade_position_update(conn, pos["id"], fields)
+                if storage.trade_position_update(
+                        conn, pos["id"], fields,
+                        status_in=("OPEN", "PARTIAL")) == 0:
+                    continue  # 行已非活跃（被合并/平掉）→ 不复活不双计
                 storage.trade_signal_lock_release(conn, pos["token"], pos["strategy"])
                 # 写平仓 journal
                 _cs_snap = get_market_snapshot(pos["token"], heavy=True)
@@ -1314,4 +1338,5 @@ def update_paper_positions(conn):
             "unrealized_pnl": unrealized,
             "pnl_pct": _margin_pnl_pct(realized, unrealized, float(pos.get("margin_amount") or 1)),
         })
-        storage.trade_position_update(conn, pos["id"], fields)
+        storage.trade_position_update(conn, pos["id"], fields,
+                                      status_in=("OPEN", "PARTIAL"))

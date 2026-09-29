@@ -26,6 +26,11 @@ FAPI_BASE = "https://fapi.binance.com"
 
 # 简单内存缓存：合约上市列表几小时才变一次，没必要每轮都请求
 _FUTURES_SYMBOLS_CACHE: dict = {"ts": 0.0, "symbols": set()}
+# 美股/商品类永续（contractType=TRADIFI_PERPETUAL：CL、NVDA、XAU…）。
+# **故意**不并进 _FUTURES_SYMBOLS_CACHE：那 200 多个股票/ETF 符号一旦进了
+# get_futures_symbols()，会涌进热度榜/自动交易/链上扫描。跟单这类接口单独用
+# has_tradable_perp() 认它们（同一个 exchangeInfo 响应里顺带收集，零额外请求）。
+_TRADIFI_SYMBOLS_CACHE: dict = {"ts": 0.0, "symbols": set()}
 _LISTING_CACHE: dict = {"ts": 0.0, "open_times": {}}  # token → openTime(ms)
 _CACHE_TTL = 3600  # 1 小时
 
@@ -120,7 +125,7 @@ def _http_get(url: str, params: dict = None, timeout: int = 15,
 
 def get_futures_symbols() -> set[str]:
     """返回币安 USDT 永续合约上市的所有 base 币种 set，比如 {'BTC', 'ETH', 'PEPE', ...}"""
-    global _FUTURES_SYMBOLS_CACHE, _LISTING_CACHE
+    global _FUTURES_SYMBOLS_CACHE, _LISTING_CACHE, _TRADIFI_SYMBOLS_CACHE
     now = time.time()
     if now - _FUTURES_SYMBOLS_CACHE["ts"] < _CACHE_TTL and _FUTURES_SYMBOLS_CACHE["symbols"]:
         return _FUTURES_SYMBOLS_CACHE["symbols"]
@@ -142,7 +147,14 @@ def get_futures_symbols() -> set[str]:
             if ot:
                 open_times[token] = int(ot)
 
+    tradifi = {s.get("baseAsset", "").upper()
+               for s in data.get("symbols", [])
+               if (s.get("contractType") == "TRADIFI_PERPETUAL"
+                   and s.get("quoteAsset") == "USDT"
+                   and s.get("status") == "TRADING")}
+
     _FUTURES_SYMBOLS_CACHE = {"ts": now, "symbols": symbols}
+    _TRADIFI_SYMBOLS_CACHE = {"ts": now, "symbols": tradifi}
     _LISTING_CACHE = {"ts": now, "open_times": open_times}
     return symbols
 
@@ -177,6 +189,25 @@ def has_spot(token: str) -> bool:
 
 def has_perpetual(token: str) -> bool:
     return token.upper() in get_futures_symbols()
+
+
+def get_tradifi_symbols() -> set[str]:
+    """美股/商品类永续（TRADIFI_PERPETUAL）的 base 币种集合，如 CL/NVDA/XAU。
+
+    零额外请求：与 get_futures_symbols() 共用一次 exchangeInfo 和同一个 TTL
+    （那个函数刷新时顺带填这份缓存，所以这里调它只为保证"已刷新过"）。"""
+    get_futures_symbols()
+    return _TRADIFI_SYMBOLS_CACHE["symbols"]
+
+
+def has_tradable_perp(token: str) -> bool:
+    """币安 USDT 永续能不能交易（**含**美股/商品类 TRADIFI_PERPETUAL）。
+
+    跟单链路用这个、不用 has_perpetual：交易员会开 CL（原油）/NVDA 这类仓，
+    它们不在 get_futures_symbols() 里（那是给热度榜/自动交易用的纯加密符号表），
+    拿 has_perpetual 判断会把能交易的仓当成"币安无该永续"静默跳过。"""
+    t = token.upper()
+    return t in get_futures_symbols() or t in get_tradifi_symbols()
 
 
 def _load_token_tags() -> dict:

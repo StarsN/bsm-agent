@@ -33,6 +33,9 @@ from analyzer import compute_composite_scores, get_current_heat_scores
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
 from signals import analyze as analyze_signals
 import kol_agent
+# 顶层导入：把跟单镜像层的"进程启动时刻"(_STARTED_AT) 定在 web 启动瞬间，
+# 早于任何信号处理——否则首个 poll 里 process() 先写出的新仓可能被判成"存量仓"
+import alphafox_live
 
 
 app = FastAPI(title="Binance Square Monitor")
@@ -47,14 +50,24 @@ _NAV_ITEMS = [
     ("/alphafox", "📡 跟单雷达", "alphafox"),
 ]
 _NAV_DROPDOWNS = [
+    # 真金白银的三个页面收在一个 TAG 下
+    ("💹 实盘", [
+        ("/live-binance", "币安实盘", "live-binance"),
+        ("/live-onchain", "实盘监控", "live-onchain"),
+        ("/alphafox-live", "跟单托管", "alphafox-live"),
+        ("/supertrend-live", "趋势实盘", "supertrend-live"),
+    ]),
     ("🔍 链上数据", [
         ("/onchain", "链上监控", "onchain"),
         ("/alpha-cluster", "Alpha 集群", "alpha-cluster"),
-        ("/live-onchain", "实盘监控", "live-onchain"),
     ]),
     ("📈 策略行情", [
         ("/dashboard", "市场全景", "dashboard"),
         ("/supertrend", "主流币趋势", "supertrend"),
+    ]),
+    ("⚡ 加密事件", [
+        ("/crypto-events", "事件展览", "crypto-events"),
+        ("/crypto-event-ai", "AI 判定", "crypto-event-ai"),
     ]),
     ("🤖 Agent 面板", [
         ("/agent", "Agent-合约扫描", "agent"),
@@ -700,15 +713,27 @@ class TradingSettingsBody(BaseModel):
     onchain_cluster_min_holding_pct: float | None = None
     onchain_cluster_keep_rounds: int | None = None
     onchain_live_mode: str | None = None
+    # 加密事件（设置页可改、热生效）
+    event_strategy_enabled: bool | None = None
+    event_min_confidence: int | None = None
+    event_fresh_minutes: float | None = None
+    event_cooldown_minutes: float | None = None
+    event_daily_max: int | None = None
+    event_poll_seconds: float | None = None
     supertrend_enabled: bool | None = None
     supertrend_sl_tolerance_pct: float | None = None
     supertrend_order_tolerance_pct: float | None = None
+    supertrend_flip_tolerance_pct: float | None = None
     supertrend_notional_usd: float | None = None
     supertrend_leverage: float | None = None
     strategy_initial_supertrend: float | None = None
     alphafox_poll_seconds: int | None = None
     alphafox_trade_enabled: bool | None = None
     alphafox_trade_budget: float | None = None
+    alphafox_live_enabled: bool | None = None
+    alphafox_live_max_notional: float | None = None
+    alphafox_live_ratio: float | None = None
+    alphafox_live_leverage: float | None = None
     alphafox_slippage_pct: float | None = None
     alphafox_fee_pct: float | None = None
 
@@ -1122,13 +1147,26 @@ def api_trading():
 @app.get("/api/settings")
 def api_settings():
     with storage.get_conn() as conn:
-        return storage.trading_settings_get(conn)
+        s = storage.trading_settings_get(conn)
+    # 超势三个容忍按**生效值**给：策略端 _run_round 会把越界/脏值回退到默认，
+    # 直接回显 DB 原始值会出现"设置页写 25%、策略实际按 1% 跑"。
+    # 回显生效值后，用户再保存一次就会把脏值覆盖掉（自愈）
+    for key, default in (
+            ("supertrend_sl_tolerance_pct",
+             getattr(config, "SUPERTREND_SL_TOLERANCE_PCT", 1.0)),
+            ("supertrend_order_tolerance_pct",
+             getattr(config, "SUPERTREND_ORDER_TOLERANCE_PCT", 1.0)),
+            ("supertrend_flip_tolerance_pct",
+             getattr(config, "SUPERTREND_FLIP_TOLERANCE_PCT", 0.0))):
+        if key in s:
+            s[key] = _st_tol(s.get(key), default)
+    return s
 
 
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_max_notional", "alphafox_live_ratio", "alphafox_live_leverage"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -1142,6 +1180,10 @@ def api_trading_settings(body: TradingSettingsBody):
         raise HTTPException(400, "initial_balance must be positive")
     if "supertrend_sl_tolerance_pct" in fields and not (0 <= fields["supertrend_sl_tolerance_pct"] <= 20):
         raise HTTPException(400, "supertrend 容忍%必须在 [0, 20] 之间")
+    if "supertrend_order_tolerance_pct" in fields and not (0 <= fields["supertrend_order_tolerance_pct"] <= 20):
+        raise HTTPException(400, "supertrend 挂单容忍%必须在 [0, 20] 之间")
+    if "supertrend_flip_tolerance_pct" in fields and not (0 <= fields["supertrend_flip_tolerance_pct"] <= 20):
+        raise HTTPException(400, "supertrend 反转市价容忍%必须在 [0, 20] 之间")
     if "supertrend_notional_usd" in fields and fields["supertrend_notional_usd"] <= 0:
         raise HTTPException(400, "supertrend 名义金额必须为正数")
     if "supertrend_leverage" in fields and not (1 <= fields["supertrend_leverage"] <= 125):
@@ -1156,10 +1198,19 @@ def api_trading_settings(body: TradingSettingsBody):
         raise HTTPException(400, "跟单滑点必须在 [0, 5] 之间")
     if "alphafox_fee_pct" in fields and not (0 <= fields["alphafox_fee_pct"] <= 5):
         raise HTTPException(400, "跟单手续费必须在 [0, 5] 之间")
+    if "alphafox_live_max_notional" in fields \
+            and fields["alphafox_live_max_notional"] < 0:
+        raise HTTPException(400, "实盘单笔上限不能为负数（0 = 不限）")
+    if "alphafox_live_ratio" in fields \
+            and not (0.01 <= fields["alphafox_live_ratio"] <= 1.0):
+        # 只允许"缩小"：>1 是放大实盘风险，与这个参数的目的相反
+        raise HTTPException(400, "实盘映射比例需在 0.01 ~ 1.0 之间（1 = 完全按比例跟）")
+    if "alphafox_live_leverage" in fields and not (1 <= fields["alphafox_live_leverage"] <= 125):
+        raise HTTPException(400, "实盘杠杆必须在 [1, 125] 之间")
     with storage.get_conn() as conn:
         storage.trading_settings_update(conn, fields)
         settings = storage.trading_settings_get(conn)
-    _cache_invalidate("trading")
+    _cache_invalidate("trading", "supertrend_overview")
     return {"ok": True, "settings": settings}
 
 
@@ -1332,6 +1383,290 @@ def api_live_onchain_trades(token: str = "", limit: int = 30):
             if isinstance(v, datetime):
                 r[k] = str(v + timedelta(hours=8))
     return rows
+
+
+# ---- 币安实盘监控（账户视角，不区分策略）----
+
+@app.get("/api/live-binance/overview")
+def api_live_binance_overview():
+    try:
+        import exchange
+        acc = exchange.get_account_info()
+        positions = exchange.get_positions()
+    except Exception:
+        # ok=False：页面据此区分"真的没仓"和"查询失败"（否则权益显示 $0 看不出是故障）
+        return {"equity": 0, "available_balance": 0, "margin_used": 0,
+                "unrealized_pnl": 0, "open_count": 0, "ok": False}
+    margin_used = 0.0
+    unrealized = 0.0
+    for p in positions:
+        margin_used += abs(float(p.get("quantity", 0))) * float(p.get("mark_price", 0))
+        unrealized += float(p.get("unrealized_pnl", 0))
+    if acc:
+        equity = acc.get("equity") or 0
+        available = acc.get("available_balance") or 0
+        unrealized = acc.get("unrealized_pnl") or unrealized
+        acct_ok = True
+    else:
+        try:
+            import exchange
+            bal = exchange.get_balance()
+        except Exception:
+            bal = 0
+        equity = bal + unrealized
+        available = bal
+        # 账户接口静默失败（返回 None 不抛）时只能靠余额兜底；余额也是 0 时无法
+        # 区分"真的没钱"和"查询失败"→ 标 ok=False 让页面提示，而不是显示 $0
+        acct_ok = bool(bal)
+    return {
+        "equity": round(equity, 2),
+        "available_balance": round(available, 2),
+        "margin_used": round(margin_used, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "open_count": len(positions),
+        "ok": acct_ok,
+    }
+
+
+@app.get("/api/live-binance/positions")
+def api_live_binance_positions():
+    try:
+        import exchange
+        ex_rows = exchange.get_positions()
+    except Exception:
+        ex_rows = []
+    # live 记录标注（open 状态的按 symbol 索引）
+    try:
+        storage.init_onchain_live_db()
+        with storage.get_conn(config.LIVE_DB_PATH) as lc:
+            live_map = {}
+            for r in storage.live_positions_open(lc):
+                key = (r["symbol"], r.get("side") or "LONG")
+                if key not in live_map:
+                    live_map[key] = r
+    except Exception:
+        live_map = {}
+    result = []
+    for p in ex_rows:
+        pside = p.get("position_side") or "BOTH"
+        key = (p["symbol"], pside if pside != "BOTH"
+               else ("LONG" if float(p["quantity"]) > 0 else "SHORT"))
+        live = live_map.get(key)
+        result.append({
+            "symbol": p["symbol"],
+            "token": p["symbol"].replace("USDT", ""),
+            "side": key[1],
+            "quantity": p["quantity"],
+            "entry_price": p["entry_price"],
+            "mark_price": p["mark_price"],
+            "unrealized_pnl": p["unrealized_pnl"],
+            "leverage": p["leverage"],
+            "strategy": (live or {}).get("strategy"),
+            "live_id": (live or {}).get("id"),
+        })
+    return result
+
+
+@app.get("/api/live-binance/orders")
+def api_live_binance_orders():
+    """当前挂单：普通单 + 条件单（各自独立取，一边失败不影响另一边）"""
+    import exchange
+    normal, algos = [], []
+    try:
+        normal = exchange.get_open_orders() or []
+    except Exception as e:
+        print(f"[live-binance] 普通挂单查询失败: {e}")
+    try:
+        algos = exchange.get_algo_orders() or []
+    except Exception as e:
+        print(f"[live-binance] 条件单查询失败: {e}")
+    out = {
+        "normal": [{"order_id": o.get("orderId") or o.get("algoId"),
+                    "symbol": o.get("symbol"), "side": o.get("side"),
+                    "type": o.get("type"),
+                    "price": o.get("price") or o.get("stopPrice"),
+                    "quantity": o.get("origQty") or o.get("quantity"),
+                    "position_side": o.get("positionSide")}
+                   for o in (normal if isinstance(normal, list) else [])],
+        "algos": [{"order_id": o.get("algoId") or o.get("orderId"),
+                   "symbol": o.get("symbol"), "side": o.get("side"),
+                   "type": o.get("type"),
+                   "price": o.get("triggerPrice") or o.get("stopPrice")
+                            or o.get("price"),
+                   "quantity": o.get("quantity") or o.get("origQty"),
+                   "position_side": o.get("positionSide")}
+                  for o in (algos if isinstance(algos, list) else [])],
+    }
+    # 条件单数量为 0 也打一行：排查"页面空"时一眼看出是真没单还是没查到
+    print(f"[live-binance] 挂单查询：普通 {len(out['normal'])} 条 / "
+          f"条件 {len(out['algos'])} 条")
+    return out
+
+
+def _af_local_ts(v):
+    """DB 时间戳 → 北京时间字符串。
+    sqlite3 没开 detect_types，TIMESTAMP 列读出来是 str（不是 datetime），
+    所以 isinstance(v, datetime) 那套 +8h 转换从来没生效过（时间一直按 UTC 显示）"""
+    if not v:
+        return v
+    try:
+        return str(datetime.fromisoformat(str(v).replace("Z", ""))
+                   + timedelta(hours=8))
+    except (ValueError, TypeError):
+        return v
+
+
+@app.get("/api/live-binance/history")
+def api_live_binance_history(limit: int = 50):
+    try:
+        storage.init_onchain_live_db()
+        with storage.get_conn(config.LIVE_DB_PATH) as lc:
+            rows = storage.live_positions_closed(lc, min(max(limit, 1), 200))
+    except Exception:
+        return []
+    for r in rows:
+        for k in ("created_at", "closed_at"):
+            if r.get(k):
+                r[k] = _af_local_ts(r[k])
+    return rows
+
+
+@app.get("/api/live-binance/trades")
+def api_live_binance_trades(limit: int = 60):
+    try:
+        storage.init_onchain_live_db()
+        with storage.get_conn(config.LIVE_DB_PATH) as lc:
+            rows = [dict(r) for r in lc.execute(
+                "SELECT * FROM live_trade_log ORDER BY id DESC LIMIT ?",
+                (min(max(limit, 1), 200),)).fetchall()]
+    except Exception:
+        return []
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = _af_local_ts(r["created_at"])
+    return rows
+
+
+@app.post("/api/live-binance/close")
+def api_live_binance_close(body: dict):
+    """实盘页手动平仓：先关纸盘（防镜像重开）→ 币安撤单市价平 → live 记录收敛。
+    supertrend 与 onchain 策略各自走原有收敛链路。"""
+    token = (body.get("token") or "").strip().upper()
+    if not token:
+        raise HTTPException(400, "token 必填")
+    handled = []
+    # 1. supertrend 实盘（close_live 内部：关纸盘 + 平交易所 + live 收敛 + 暂停监控）
+    try:
+        import supertrend_live
+        if supertrend_live.close_live(token):
+            handled.append("supertrend")
+    except Exception as e:
+        print(f"[live-binance] {token} supertrend 平仓异常: {e}")
+    # 1b. alphafox 跟单（close_live 内部：关纸盘 + 平交易所 + live 收敛）
+    try:
+        import alphafox_live
+        if alphafox_live.close_live(token):
+            handled.append("alphafox")
+    except Exception as e:
+        print(f"[live-binance] {token} alphafox 平仓异常: {e}")
+    # 2. onchain 纸盘仓 → 现有链路（纸盘平仓 + 池归档 + 实盘平仓）
+    try:
+        with storage.get_conn() as conn:
+            onchain_active = conn.execute(
+                "SELECT 1 FROM trade_positions WHERE token=? AND strategy='onchain' "
+                "AND status IN ('OPEN','PARTIAL','PENDING')", (token,)).fetchone()
+            if onchain_active:
+                result = trade_logic.manual_close_on_unwatch(conn, token)
+                if result.get("ok"):
+                    handled.append("onchain")
+                    try:
+                        with storage.get_conn(config.ONCHAIN_DB) as oc:
+                            storage.onchain_pool_archive(oc, token, "closed")
+                            storage.onchain_removed_add(oc, token, "closed")
+                    except Exception:
+                        pass
+                    try:
+                        import exchange_bridge
+                        exchange_bridge.close_live_position(token)
+                    except Exception as e:
+                        print(f"[live-binance] {token} onchain 实盘平仓异常: {e}")
+    except Exception as e:
+        print(f"[live-binance] {token} onchain 平仓异常: {e}")
+    # 3. 兜底：以交易所实际持仓为准（live 记录丢失/DB 重建场景也能平干净）→
+    #    撤全部挂单 + 平掉该币全部持仓；**确认成交后**才把 live 残留记录标 CLOSED
+    import exchange
+    # 先确认交易所查询可用：查询失败（get_positions 会静默返回 []）时不能撤单也
+    # 不能标平仓——否则会撤掉 SL、记录标平，交易所却留着裸仓且永不重试。
+    # 这个 raise 必须在下面 try 之外：HTTPException 也是 Exception，放进去会被
+    # 兜底 except 吞掉 → 接口仍返回 ok:true，页面以为已平（假平仓）
+    exchange._last_error_msg = ""
+    try:
+        ex_probe = exchange.get_positions()
+        api_ok = isinstance(ex_probe, list) and not exchange.get_last_error()
+    except Exception:
+        api_ok = False
+    if not api_ok:
+        print(f"[live-binance] {token} 兜底跳过：交易所持仓查询失败")
+        raise HTTPException(503, "交易所持仓查询失败，已跳过兜底平仓，请稍后重试")
+    closed_ok = True
+    mark_by_symbol = {}
+    try:
+        exchange.cancel_all_orders(token)
+        for p in exchange.get_positions():
+            if p["symbol"] != f"{token}USDT":
+                continue
+            qty = abs(float(p.get("quantity") or 0))
+            if qty <= 0:
+                continue
+            pside = p.get("position_side") or (
+                "LONG" if float(p["quantity"]) > 0 else "SHORT")
+            r = exchange.close_position_market(token, qty, position_side=pside)
+            # 与 alphafox 收敛同口径：看实际成交量，零成交/无返回不算已平
+            # （否则记录标 CLOSED 而实盘还在 = 无人对账的裸仓）
+            if float((r or {}).get("quantity") or 0) <= 0:
+                closed_ok = False
+                print(f"[live-binance] {token} 兜底平仓未成交（{pside} {qty}），"
+                      f"记录保持 OPEN，下轮对账重试")
+                continue
+            mark_by_symbol[p["symbol"]] = float(p.get("mark_price") or 0)
+            print(f"[live-binance] {token} 兜底平仓 {pside} {qty}")
+    except Exception as e:
+        closed_ok = False
+        print(f"[live-binance] {token} 兜底平仓异常: {e}")
+    if not closed_ok:
+        # 如实回报失败：ok:true 会让实盘页弹"已平仓"，而仓还在（下轮对账会继续收敛）
+        print(f"[live-binance] {token} 兜底未全部成交：live 记录保持 OPEN"
+              f"（下轮对账继续收敛）")
+        return {"ok": False, "token": token, "handled": handled,
+                "detail": "平仓单未全部成交（交易所已持仓查询正常），"
+                          "已跳过记录收敛，请稍后重试或在币安确认"}
+    try:
+        storage.init_onchain_live_db()
+        with storage.get_conn(config.LIVE_DB_PATH) as lc:
+            leftover = [dict(r) for r in lc.execute(
+                "SELECT * FROM live_positions WHERE token=? AND status IN "
+                "('OPEN','PARTIAL','PENDING')", (token,)).fetchall()]
+            for lr in leftover:
+                # 估算已实现盈亏（按兜底平仓时的交易所标记价）——不写的话这些
+                # 真实平仓在"实盘累计盈亏/胜率"里全按 0 算
+                _e = float(lr.get("entry_price") or 0)
+                _q = float(lr.get("quantity") or 0)
+                _px = float(mark_by_symbol.get(lr.get("symbol") or "") or 0)
+                _r = (((_e - _px) if (lr.get("side") or "LONG") == "SHORT"
+                       else (_px - _e)) * _q if (_e > 0 and _px > 0) else 0.0)
+                storage.live_position_update(lc, lr["id"], {
+                    "status": "CLOSED", "closed_at": "__CURRENT_TIMESTAMP__",
+                    "realized_pnl": round(float(lr.get("realized_pnl") or 0) + _r, 6),
+                })
+                storage.live_trade_log_insert(lc, {
+                    "token": token, "strategy": lr.get("strategy") or "unknown",
+                    "action": "close", "price": None, "quantity": lr.get("quantity"),
+                    "paper_position_id": lr.get("paper_position_id"),
+                    "details_json": json.dumps({"reason": "手动平仓（兜底）"}),
+                })
+    except Exception as e:
+        print(f"[live-binance] {token} 兜底收敛异常: {e}")
+    return {"ok": True, "token": token, "handled": handled}
 
 @app.get("/api/onchain/pool")
 def api_onchain_pool(stage: str = None):
@@ -2942,25 +3277,6 @@ async function openTrade(token) {
   await refreshAll();
 }
 
-async function closeTrade(token) {
-  try {
-    const resp = await fetch('/api/trade/market-close', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({token}),
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      showToast(`${token} 已平仓`, 'ok');
-    } else {
-      showToast(`${token} 平仓失败：${data.reason || '未知'}`, 'err');
-    }
-  } catch (e) {
-    showToast('操作失败：' + e.message, 'err');
-  }
-  await refreshAll();
-}
-
 async function toggleWatch(token, currentlyActive) {
   const url = currentlyActive ? '/api/watchlist/remove' : '/api/watchlist/add';
   document.querySelectorAll(`tr[data-token="${token}"] .star`).forEach(s => {
@@ -3200,106 +3516,6 @@ async function loadTradingPanel() {
   } catch (e) {
     document.getElementById('trade-candidates').innerHTML =
       `<div class="empty">交易面板加载失败：${e.message}</div>`;
-  }
-}
-
-function toggleDataSourceOpts() {
-  const src = document.getElementById('trade-data-source').value;
-  document.getElementById('ds-opt-candidates').style.display = src === 'agent_candidates' ? '' : 'none';
-  document.getElementById('ds-opt-heat').style.display = src === 'token_heat_history' ? '' : 'none';
-}
-
-async function restartSystem() {
-  if (!confirm('确定要重启系统吗？\\n\\n所有进程将被强制终止（kill -9），等待 11 分钟后自动重启。\\n\\n重启期间约 12 分钟不可用。')) return;
-  try {
-    showToast('正在重启系统...', 'ok');
-    const resp = await fetch('/api/system/restart', {method:'POST'});
-    const d = await resp.json();
-    showToast(d.msg || '已触发重启', 'ok');
-  } catch(e) {
-    showToast('重启指令发送失败，请手动重启', 'err');
-  }
-}
-
-async function saveTradingSettings() {
-  const body = {
-    enabled: document.getElementById('trade-enabled').value === 'true',
-    mode: document.getElementById('trade-mode').value,
-    initial_balance: Number(document.getElementById('trade-initial').value),
-    leverage: Number(document.getElementById('trade-leverage').value),
-    agent_collect_interval_minutes: Number(document.getElementById('trade-collect-interval').value),
-    agent_trigger_interval: Number(document.getElementById('trade-trigger-interval').value),
-    kol_agent_interval_minutes: Number(document.getElementById('trade-kol-interval').value),
-    kol_snapshot_interval_minutes: Number(document.getElementById('trade-kol-snapshot-interval').value),
-    agent_data_source: document.getElementById('trade-data-source').value,
-  };
-  try {
-    const resp = await fetch('/api/trading/settings', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    showToast('交易设置已保存', 'ok');
-    await loadTradingPanel();
-  } catch (e) {
-    showToast('保存交易设置失败：' + e.message, 'err');
-  }
-}
-
-async function resetTradingAccount() {
-  // 拿到当前初始金额作为默认值
-  const initialInput = document.getElementById('trade-initial');
-  const currentInitial = Number(initialInput.value) || 1000;
-
-  // 第一次确认：告知后果（全 ASCII 文本防编码问题）
-  const confirm1 = window.confirm(
-    '[警告] 重置账户将会清空:\\n\\n' +
-    '  - 所有持仓 (含挂单和已平仓历史)\\n' +
-    '  - 已实现盈亏 / 浮动盈亏\\n' +
-    '  - 占用保证金\\n' +
-    '  - 止损学习归档\\n' +
-    '  - signal_lock 去重表\\n\\n' +
-    '配置 (倍数/自动交易开关) 会保留。\\n\\n' +
-    '此操作不可撤销！确定继续吗？'
-  );
-  if (!confirm1) return;
-
-  // 第二次确认：让用户输入初始金额（顺便当作二次确认）
-  const newBalance = window.prompt(
-    '请输入重置后的账户初始金额 USDT (回车保持 ' + currentInitial + '):',
-    String(currentInitial)
-  );
-  if (newBalance === null) return;  // 用户点了取消
-  const parsed = Number(newBalance);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    showToast('金额必须为正数', 'err');
-    return;
-  }
-
-  try {
-    const resp = await fetch('/api/trading/reset', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        confirm: true,
-        new_initial_balance: parsed,
-      }),
-    });
-    if (!resp.ok) {
-      const err = await resp.text();
-      throw new Error(err || ('HTTP ' + resp.status));
-    }
-    const data = await resp.json();
-    showToast(
-      '账户已重置：清除 ' + data.positions_deleted + ' 条持仓 / ' +
-      data.locks_deleted + ' 条锁 / ' + data.loss_archive_deleted + ' 条归档',
-      'ok'
-    );
-    await loadTradingPanel();
-    await refreshAll({ silent: true });
-  } catch (e) {
-    showToast('重置失败：' + e.message, 'err');
   }
 }
 
@@ -3636,13 +3852,6 @@ function fmtPrice(v) {
   if (v == null) return '—';
   const n = Number(v);
   return n >= 1 ? n.toFixed(4) : n.toFixed(6);
-}
-function fmtTime(ts) {
-  if (!ts) return '';
-  try {
-    const d = new Date(ts.replace(' ', 'T') + 'Z');
-    return d.toLocaleTimeString('zh-CN', {hour12: false, timeZone: 'Asia/Shanghai'}).substr(0, 5);
-  } catch { return ts.substr(11, 5); }
 }
 function fmtDateTime(ts) {
   if (!ts) return '';
@@ -4701,6 +4910,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <input id="trade-supertrend-order-tolerance" type="number" min="0" max="20" step="0.1">
       </div>
       <div>
+        <label>反转市价容忍%（0=不设限直接市价进；现价超出则只挂单；**留空=不改动此项**）</label>
+        <input id="trade-supertrend-flip-tolerance" type="number" min="0" max="20" step="0.1">
+      </div>
+      <div>
         <label>每笔名义金额 USDT</label>
         <input id="trade-supertrend-notional" type="number" min="1" step="1">
       </div>
@@ -4710,6 +4923,40 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
       </div>
     </div>
     <div style="color:var(--muted);font-size:11px;margin-top:4px">修改后点击「保存设置」立即生效，无需重启（监控币种在 /supertrend 页面添加）</div>
+  </div>
+
+  <div class="strategy-block">
+    <div class="strategy-name">⚡ 加密事件驱动（金十快讯 + AI 判定）</div>
+    <div class="grid3">
+      <div>
+        <label>开关</label>
+        <select id="trade-event-switch">
+          <option value="true">启用</option>
+          <option value="false">停用</option>
+        </select>
+      </div>
+      <div>
+        <label>置信度门槛（低于不开仓）</label>
+        <input id="trade-event-min-confidence" type="number" min="0" max="100" step="1">
+      </div>
+      <div>
+        <label>事件新鲜度（分钟，超过不开）</label>
+        <input id="trade-event-fresh-minutes" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>同币冷却（分钟）</label>
+        <input id="trade-event-cooldown-minutes" type="number" min="0" step="1">
+      </div>
+      <div>
+        <label>每日上限（笔）</label>
+        <input id="trade-event-daily-max" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>抓取间隔（秒，≥10）</label>
+        <input id="trade-event-poll-seconds" type="number" min="10" step="5">
+      </div>
+    </div>
+    <div style="color:var(--muted);font-size:11px;margin-top:4px">改完点「保存设置」立即生效，无需重启。AI 模型/key 在 config.py（EVENT_AI_*）；事件页面见 /crypto-events 与 /crypto-event-ai</div>
   </div>
 
   <div class="strategy-block">
@@ -4738,8 +4985,27 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
         <label>手续费 %</label>
         <input id="trade-alphafox-fee" type="number" min="0" max="5" step="0.01">
       </div>
+      <div>
+        <label>实盘开关</label>
+        <select id="trade-alphafox-live-switch">
+          <option value="false">纸盘</option>
+          <option value="true">实盘（同步币安）</option>
+        </select>
+      </div>
+      <div>
+        <label>实盘单笔上限 USDT（0 / 留空 = 不限；比例模型下规模由"我的可用余额 ÷ 交易员保证金"决定）</label>
+        <input id="trade-alphafox-live-notional" type="number" min="0" step="1">
+      </div>
+      <div>
+        <label>实盘杠杆</label>
+        <input id="trade-alphafox-live-leverage" type="number" min="1" max="125" step="1">
+      </div>
+      <div>
+        <label>实盘映射比例（1 = 完全按比例跟，0.5 = 只跟他一半的名义/盈亏）</label>
+        <input id="trade-alphafox-live-ratio" type="number" min="0.01" max="1" step="0.01">
+      </div>
     </div>
-    <div style="color:var(--muted);font-size:11px;margin-top:4px">跟单开关为总开关（每交易员的跟单在 /alphafox 页面按钮控制）；参数修改后立即生效</div>
+    <div style="color:var(--muted);font-size:11px;margin-top:4px">跟单开关为总开关（每交易员的跟单在 /alphafox 页面按钮控制）；参数修改后立即生效。实盘关闭=不再新开实盘仓，已有实盘仓继续跟随交易员平仓；映射比例只影响之后新开的仓</div>
     <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
       <button type="button" onclick="syncAlphofoxSymbols()" style="background:var(--accent);color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer;font-size:13px;font-weight:600">同步跟单交易对映射</button>
       <span class="muted" id="alphafox-sync-result" style="font-size:12px">从 Hyperliquid 拉取全部 HIP-3 合约符号入库（已存在的映射不覆盖）</span>
@@ -4881,10 +5147,22 @@ async function loadSettings() {
     document.getElementById('trade-strategy-supertrend').value = s.strategy_initial_supertrend ?? 1000;
     document.getElementById('trade-supertrend-tolerance').value = s.supertrend_sl_tolerance_pct ?? 1.0;
     document.getElementById('trade-supertrend-order-tolerance').value = s.supertrend_order_tolerance_pct ?? 1.0;
+    document.getElementById('trade-supertrend-flip-tolerance').value = s.supertrend_flip_tolerance_pct ?? 0;
     document.getElementById('trade-supertrend-notional').value = s.supertrend_notional_usd ?? 50;
     document.getElementById('trade-supertrend-leverage').value = s.supertrend_leverage ?? 3;
-    document.getElementById('trade-alphafox-poll').value = s.alphafox_poll_seconds ?? 30;
+    document.getElementById('trade-event-switch').value =
+      (s.event_strategy_enabled ?? true) ? 'true' : 'false';
+    document.getElementById('trade-event-min-confidence').value = s.event_min_confidence ?? 70;
+    document.getElementById('trade-event-fresh-minutes').value = s.event_fresh_minutes ?? 10;
+    document.getElementById('trade-event-cooldown-minutes').value = s.event_cooldown_minutes ?? 30;
+    document.getElementById('trade-event-daily-max').value = s.event_daily_max ?? 12;
+    document.getElementById('trade-event-poll-seconds').value = s.event_poll_seconds ?? 60;
+    document.getElementById('trade-alphafox-poll').value = s.alphafox_poll_seconds ?? 15;
     document.getElementById('trade-alphafox-trade-switch').value = s.alphafox_trade_enabled ?? true;
+    document.getElementById('trade-alphafox-live-switch').value = s.alphafox_live_enabled ?? false;
+    document.getElementById('trade-alphafox-live-notional').value = s.alphafox_live_max_notional ?? 0;
+    document.getElementById('trade-alphafox-live-ratio').value = s.alphafox_live_ratio ?? 1;
+    document.getElementById('trade-alphafox-live-leverage').value = s.alphafox_live_leverage ?? 5;
     document.getElementById('trade-alphafox-budget').value = s.alphafox_trade_budget ?? 1000;
     document.getElementById('trade-alphafox-slip').value = s.alphafox_slippage_pct ?? 0.05;
     document.getElementById('trade-alphafox-fee').value = s.alphafox_fee_pct ?? 0.04;
@@ -4908,6 +5186,13 @@ async function syncAlphofoxSymbols() {
         : ('同步失败：' + (d.detail || '未知'));
     })
     .catch(e => { if (el) el.textContent = '同步失败：' + e.message; });
+}
+// 空输入框 → undefined（JSON.stringify 会把该键丢掉）→ 后端 Pydantic 收 None → 不写库，
+// 等价于"这一项没改"。不能直接用 Number('')：那是 0，会把已设的容忍值静默改成 0
+// （而容忍 0 是"不设限"，语义完全反了）
+function numOrUndef(id) {
+  const v = document.getElementById(id).value;
+  return v === '' || v == null ? undefined : Number(v);
 }
 async function saveTradingSettings() {
   const body = {
@@ -4962,13 +5247,25 @@ async function saveTradingSettings() {
     onchain_cluster_keep_rounds: Number(document.getElementById('trade-cluster-keep-rounds').value),
     onchain_live_mode: document.getElementById('trade-onchain-live-mode').value,
     supertrend_enabled: document.getElementById('trade-supertrend-switch').value === 'true',
-    supertrend_sl_tolerance_pct: Number(document.getElementById('trade-supertrend-tolerance').value),
-    supertrend_order_tolerance_pct: Number(document.getElementById('trade-supertrend-order-tolerance').value),
+    supertrend_sl_tolerance_pct: numOrUndef('trade-supertrend-tolerance'),
+    supertrend_order_tolerance_pct: numOrUndef('trade-supertrend-order-tolerance'),
+    supertrend_flip_tolerance_pct: numOrUndef('trade-supertrend-flip-tolerance'),
     supertrend_notional_usd: Number(document.getElementById('trade-supertrend-notional').value),
+    event_strategy_enabled: document.getElementById('trade-event-switch').value === 'true',
+    // 用 numOrUndef：输入框清空时 Number('') = 0 会把"置信度门槛"存成 0（门槛消失、全都开仓）
+    event_min_confidence: numOrUndef('trade-event-min-confidence'),
+    event_fresh_minutes: numOrUndef('trade-event-fresh-minutes'),
+    event_cooldown_minutes: numOrUndef('trade-event-cooldown-minutes'),
+    event_daily_max: numOrUndef('trade-event-daily-max'),
+    event_poll_seconds: numOrUndef('trade-event-poll-seconds'),
     supertrend_leverage: Number(document.getElementById('trade-supertrend-leverage').value),
     strategy_initial_supertrend: Number(document.getElementById('trade-strategy-supertrend').value),
     alphafox_poll_seconds: Number(document.getElementById('trade-alphafox-poll').value),
     alphafox_trade_enabled: document.getElementById('trade-alphafox-trade-switch').value === 'true',
+    alphafox_live_enabled: document.getElementById('trade-alphafox-live-switch').value === 'true',
+    alphafox_live_max_notional: Number(document.getElementById('trade-alphafox-live-notional').value || 0),
+    alphafox_live_ratio: Number(document.getElementById('trade-alphafox-live-ratio').value || 1),
+    alphafox_live_leverage: Number(document.getElementById('trade-alphafox-live-leverage').value),
     alphafox_trade_budget: Number(document.getElementById('trade-alphafox-budget').value),
     alphafox_slippage_pct: Number(document.getElementById('trade-alphafox-slip').value),
     alphafox_fee_pct: Number(document.getElementById('trade-alphafox-fee').value),
@@ -6982,6 +7279,10 @@ AF_HEADERS = {
 }
 
 _af_latest = {}    # sourceId -> {"version": int, "payload": {"snapshot","dna","symbol_stats"}}
+_af_polled = {}    # sourceId -> 已处理过的 polledAt（数据源未更新就不重复处理）
+# sourceId -> 最近一次探测到的交易员持仓（托管页"跟单交易员持仓"卡片直接读它）
+# 与雷达页共用同一份探测快照 → 卡片不产生任何额外请求
+_af_last_snap: dict = {}
 _af_watchers = {}  # sourceId -> SSE 订阅计数（探测线程只探测有订阅的交易员）
 _af_lock = threading.Lock()
 
@@ -7000,6 +7301,16 @@ def _af_request(path: str, method: str = "GET", body: dict | None = None) -> dic
         resp = requests.get(AF_BASE + path, headers=headers, timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+def _af_num(v, default: float = 0.0) -> float:
+    """上游字段可能是字符串/None/脏值 → 统一转 float。
+    `or 0` 挡不住字符串（"12.5" 是真值），Float+str 会抛 TypeError，
+    而这里抛异常 = 页面版本号永不递增 → 页面静默定格（无任何报错）"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _af_build_payload(snapshot: dict, prev_dna: dict | None = None) -> dict:
@@ -7041,13 +7352,16 @@ def _af_build_payload(snapshot: dict, prev_dna: dict | None = None) -> dict:
         items = slim_dna["cycleItems"]
         agg: dict = {}
         for it in items:
+            if not isinstance(it, dict):
+                continue
             a = agg.setdefault(it.get("symbol"), {
                 "count": 0, "pnl": 0.0, "wins": 0, "losses": 0, "items": []})
             a["count"] += 1
-            a["pnl"] += it.get("pnl") or 0
-            if (it.get("pnl") or 0) > 0:
+            _p = _af_num(it.get("pnl"))
+            a["pnl"] += _p
+            if _p > 0:
                 a["wins"] += 1
-            elif (it.get("pnl") or 0) < 0:
+            elif _p < 0:
                 a["losses"] += 1
             a["items"].append(it)
         for sym, a in agg.items():
@@ -7056,7 +7370,9 @@ def _af_build_payload(snapshot: dict, prev_dna: dict | None = None) -> dict:
                 "count": a["count"],
                 "pnl": round(a["pnl"], 4),
                 "win_rate": round(a["wins"] / max(a["wins"] + a["losses"], 1) * 100, 1),
-                "items": sorted(a["items"], key=lambda x: x.get("openTime") or 0, reverse=True),
+                "items": sorted(a["items"],
+                                key=lambda x: _af_num(x.get("openTime")),
+                                reverse=True),
             })
         symbol_stats.sort(key=lambda x: -x["pnl"])
     return {"snapshot": slim_snap, "dna": slim_dna, "symbol_stats": symbol_stats}
@@ -7068,14 +7384,21 @@ def _af_poll_loop():
     页面通过 SSE 收到完整数据直接渲染，无缓存。"""
     import alphafox_trade
     import tg_notify
-    alphafox_trade.init_db()
+    _inited = False
+    prev_live = None  # 实盘开关上轮状态（检测 0→1 转变 → 记录存量仓豁免清单）
     while True:
         try:
             with storage.get_conn() as conn:
                 ts = storage.trading_settings_get(conn)
                 poll = int(ts.get("alphafox_poll_seconds")
-                           or getattr(config, "ALPHAFOX_POLL_SECONDS", 30))
+                           or getattr(config, "ALPHAFOX_POLL_SECONDS", 15))
                 trade_enabled = bool(ts.get("alphafox_trade_enabled", True))
+                live_enabled = bool(ts.get("alphafox_live_enabled", False))
+                # 比例模型（2026-09-17）：规模 = 交易员持仓 × k（k=我的可用余额/交易员
+                # 保证金，开仓冻结）；这里传的是**单笔上限**（0/空 = 不限）
+                live_notional = float(ts.get("alphafox_live_max_notional") or 0)
+                live_leverage = float(ts.get("alphafox_live_leverage")
+                                      or getattr(config, "ALPHAFOX_LIVE_LEVERAGE", 5.0))
                 raw_budget = ts.get("alphafox_trade_budget")
                 raw_slip = ts.get("alphafox_slippage_pct")
                 raw_fee = ts.get("alphafox_fee_pct")
@@ -7086,21 +7409,90 @@ def _af_poll_loop():
                     if raw_slip is not None else getattr(config, "ALPHAFOX_SLIPPAGE_PCT", 0.05),
                     "fee": float(raw_fee)
                     if raw_fee is not None else getattr(config, "ALPHAFOX_FEE_PCT", 0.04),
+                    # 开关关闭 = 不跟新仓；已有仓位的平仓/对齐仍继续跟随
+                    # （否则旧仓退出路径消失，交易员平仓系统不知，仓位冻结）
+                    "allow_open": trade_enabled,
                 }
         except Exception:
-            poll = getattr(config, "ALPHAFOX_POLL_SECONDS", 30)
+            poll = getattr(config, "ALPHAFOX_POLL_SECONDS", 15)
             trade_enabled = getattr(config, "ALPHAFOX_TRADE_ENABLED", True)
-            trade_params = {"budget": 1000.0, "slip": 0.05, "fee": 0.04}
-        with _af_lock:
-            ids = list(_af_watchers.keys())
-        following = set(alphafox_trade.following_ids()) if trade_enabled else set()
-        ids = list(dict.fromkeys(ids + list(following)))  # 去重保序
+            live_enabled = getattr(config, "ALPHAFOX_LIVE_ENABLED", False)
+            live_notional = getattr(config, "ALPHAFOX_LIVE_MAX_NOTIONAL", 0.0)
+            live_leverage = getattr(config, "ALPHAFOX_LIVE_LEVERAGE", 5.0)
+            trade_params = {"budget": 1000.0, "slip": 0.05, "fee": 0.04,
+                            "allow_open": trade_enabled}
+        # 实盘开关 0→1：记录存量纸盘仓为豁免（token|side#纸盘仓id 键——带 id
+        # 才能保证"新仓不继承豁免"）。
+        # 豁免仓的所有动作（加/减/平）实盘都不处理，只镜像开关开启后全新开的仓
+        if prev_live is not None and live_enabled and not prev_live:
+            try:
+                with storage.get_conn() as conn:
+                    rows = [dict(r) for r in conn.execute(
+                        "SELECT id, token, side FROM trade_positions "
+                        "WHERE strategy='alphafox' "
+                        "AND status IN ('OPEN','PARTIAL')")]
+                # 已有实盘镜像的仓**不能**进豁免：豁免 = 实盘侧完全不处理（加仓不跟、
+                # 漂移不对齐），对已有镜像的仓等于单方面停掉跟单 → 纸盘涨、实盘不动，
+                # 且每轮对账都不会自愈（用户"关一下再开"就会踩到）
+                mirrored = set()
+                try:
+                    storage.init_onchain_live_db()
+                    with storage.get_conn(config.LIVE_DB_PATH) as lc:
+                        mirrored = {r["paper_position_id"] for r in lc.execute(
+                            "SELECT paper_position_id FROM live_positions "
+                            "WHERE strategy='alphafox' "
+                            "AND status IN ('OPEN','PARTIAL','PENDING')")}
+                except Exception as e:
+                    print(f"[alphafox] 查已有实盘镜像失败（保守：沿用旧行为）: {e}")
+                keys = [f"{r['token']}|{r['side']}#{r['id']}" for r in rows
+                        if r["id"] not in mirrored]
+                if mirrored:
+                    print(f"[alphafox] 实盘开关开启：{len(mirrored)} 个已有实盘镜像的仓"
+                          f"不进豁免（继续跟随加减仓）")
+                with storage.get_conn() as conn2:
+                    storage.trading_settings_update(
+                        conn2, {"alphafox_live_exempt_paper_ids": json.dumps(keys)})
+                print(f"[alphafox] 实盘开关开启：{len(keys)} 个存量纸盘仓豁免镜像"
+                      f"（只跟新开仓）")
+            except Exception as e:
+                print(f"[alphafox] 豁免清单记录失败: {e}")
+        prev_live = live_enabled
+        # 这一段在旧的 try 之外：SQLite 锁/IO 抖一下就会把探测线程整个打死
+        # （跟单、SSE、实盘对账全停，交易员平仓不再触发退出 → 实盘裸仓）
+        try:
+            if not _inited:
+                alphafox_trade.init_db()   # 失败时每轮重试，DB 恢复后自动继续
+                _inited = True
+            with _af_lock:
+                ids = list(_af_watchers.keys())
+            following = set(alphafox_trade.following_ids())
+            ids = list(dict.fromkeys(ids + list(following)))  # 去重保序
+        except Exception as e:
+            # 置回未初始化：alphafox.db 被删/换/损坏时下一轮会重新建表自愈
+            # （否则 _inited 恒真 → init_db 再不被调用 → 跟单/SSE/TG/实盘对账全停）
+            _inited = False
+            print(f"[alphafox] 探测轮次准备失败（跳过本轮，下轮重建）: {e}")
+            time.sleep(max(5, poll))
+            continue
         for sid in ids:
             try:
                 snap = _af_request(f"/api/radar/snapshot?sourceId={sid}")
+                # 托管页的"跟单交易员持仓"卡片读这份缓存（跟单交易员本来每轮都探，
+                # 这里只挑几个字段，零额外请求；雷达页看到的是同一个快照）
+                if sid in following:
+                    _d = snap.get("data") or {}
+                    _af_last_snap[sid] = {
+                        "positions": _d.get("positions") or [],
+                        "polledAt": _d.get("polledAt"),
+                        "name": _d.get("traderName"),
+                        # 比例 k 的分母（快速跟随 / 镜像开仓算 k 用）→ 一起缓存，零额外请求
+                        "margin_balance": _d.get("marginBalance"),
+                    }
                 prev = _af_latest.get(sid) or {}
-                prev_polled = (((prev.get("payload") or {}).get("snapshot") or {})
-                               .get("data") or {}).get("polledAt")
+                # 用独立的 _af_polled 记录，不能借道 _af_latest：后者只在有页面
+                # 订阅时才写 → 只跟单不看页面的交易员 prev_polled 恒为 None，
+                # 门形同虚设，每 15s 就重复跑一遍 process（异常确认窗口被压短）
+                prev_polled = _af_polled.get(sid)
                 cur_polled = (snap.get("data") or {}).get("polledAt")
                 if cur_polled and cur_polled != prev_polled:
                     # ① 系统跟单处理（同步，先开平仓）
@@ -7108,6 +7500,15 @@ def _af_poll_loop():
                     if sid in following:
                         try:
                             tg_signals = alphafox_trade.process(sid, snap, trade_params)
+                            # 实盘镜像：executed 信号同步币安（开关/互斥在镜像层判定）
+                            try:
+                                import alphafox_live
+                                for sg in tg_signals:
+                                    alphafox_live.apply_signal(
+                                        sg, live_enabled, live_notional,
+                                        live_leverage)
+                            except Exception as e:
+                                print(f"[alphafox] 实盘镜像 {sid} 异常: {e}")
                         except Exception as e:
                             print(f"[alphafox] 跟单处理 {sid} 异常: {e}")
                     # ② 更新页面推送载荷（仅当有页面订阅时构建，避免无谓的 dna 调用）
@@ -7120,13 +7521,28 @@ def _af_poll_loop():
                             "version": (prev.get("version") or 0) + 1,
                             "payload": payload,
                         }
-                    # ③ TG 异步推送（不阻塞）
+                    # ③ TG 异步推送（不阻塞）：两条流各自独立
+                    #   · send_alphafox_signals      —— 我们**执行成**的开/加/减/平
+                    #   · send_alphafox_trader_actions —— **交易员**开/加/减/平（不看我们跟没跟）
                     if tg_signals:
                         threading.Thread(
                             target=tg_notify.send_alphafox_signals,
                             args=(tg_signals,), daemon=True).start()
+                        threading.Thread(
+                            target=tg_notify.send_alphafox_trader_actions,
+                            args=(tg_signals,), daemon=True).start()
+                    # 走到这里才算"这份快照处理完了"→ 消费 polledAt。
+                    # 放在开头消费的话，上面任何一步抛异常都会让这份快照永不重试
+                    _af_polled[sid] = cur_polled
             except Exception as e:
                 print(f"[alphafox] 探测 {sid} 异常: {e}")
+        # ④ 实盘对账兜底（补开/收敛/数量对齐；镜像失败/重启后自愈）
+        try:
+            import alphafox_live
+            alphafox_live.sync_alphafox_live(live_enabled, live_notional,
+                                             live_leverage)
+        except Exception as e:
+            print(f"[alphafox] 实盘对账异常: {e}")
         time.sleep(max(5, poll))
 
 
@@ -7164,7 +7580,8 @@ def api_alphafox_traders():
 
 @app.post("/api/alphafox/follow")
 def api_alphafox_follow(body: dict):
-    """跟单按钮：启用/移除某交易员的跟单（写 alphafox.db）"""
+    """跟单按钮：启用/移除某交易员的跟单（写 alphafox.db）。
+    取消跟单 = 名下持仓批量取消托管（不平仓）；重新跟单 = 批量恢复托管（下轮追平）"""
     trader_id = (body.get("trader_id") or "").strip()
     follow = bool(body.get("follow"))
     label = (body.get("label") or "").strip()
@@ -7172,8 +7589,373 @@ def api_alphafox_follow(body: dict):
     if not trader_id:
         raise HTTPException(400, "trader_id 必填")
     import alphafox_trade
-    alphafox_trade.set_follow(trader_id, label, signal_type, follow)
-    return {"ok": True, "trader_id": trader_id, "follow": follow}
+    res = alphafox_trade.set_follow(trader_id, label, signal_type, follow)
+    return {"ok": True, "trader_id": trader_id, "follow": follow, **(res or {})}
+
+
+def _af_trader_labels() -> dict:
+    """trader_id → 页面显示名（alphafox.db；缺失则回落到 id）"""
+    try:
+        with storage.get_conn(config.ALPHAFOX_DB) as conn:
+            return {r["trader_id"]: (r["label"] or r["trader_id"])
+                    for r in conn.execute(
+                        "SELECT trader_id, label FROM alphafox_traders")}
+    except Exception:
+        return {}
+
+
+def _af_managed_state(managed: int, following: bool, snap, key) -> list:
+    """托管列状态 + 警示文案（判断全在后端，前端只渲染）。
+    snap=该交易员上一轮快照（None=没在跟单/无数据），key=(symbol, side)"""
+    if managed == 3:
+        return ["已脱离", "red",
+                "交易员已无此仓，系统不再跟随其信号（无退出信号，请自行处理）"]
+    if managed == 2:
+        return ["恢复中", "yellow", "下一轮将按交易员当前仓位对齐数量"]
+    if managed == 0:
+        if not following:
+            return ["已取消托管", "muted",
+                    "该交易员跟单已关闭，仓位保留但不再跟随（无退出信号，请盯盘）"]
+        if snap is not None and key not in snap:
+            return ["已取消托管", "red", "交易员已平该仓，我们仍持仓（无退出信号）"]
+        return ["已取消托管", "muted", "不再跟随该交易员的加减仓/平仓"]
+    if not following:
+        return ["托管中", "yellow", "该交易员跟单已关闭（无信号源）"]
+    return ["托管中", "green", ""]
+
+
+@app.get("/api/alphafox/board")
+def api_alphafox_board(limit: int = 40):
+    """跟单托管页聚合数据：账户概览 + 盈亏统计 + 持仓 + 历史 + 交易日志（全部带跟单员）"""
+    import alphafox_trade
+    import alphafox_live
+    limit = min(max(int(limit or 40), 1), 200)
+    _acct = api_live_binance_overview()
+    out = {"account": _acct, "account_ok": _acct.get("ok", True),
+           "stats": {"live": {}, "paper": {}, "open": {}},
+           "positions": [], "history": [], "trades": [],
+           "traders": [], "token_options": [], "token_settings": {}}
+    labels = _af_trader_labels()
+    try:
+        following = set(alphafox_trade.following_ids())
+    except Exception:
+        following = set()
+    try:
+        ex_rows = api_live_binance_positions()
+    except Exception:
+        ex_rows = []
+    # 交易所快照按 symbol（BTCUSDT）索引：纸盘行历史上有 BTC / BTCUSDT / XYZ:SKHX
+    # 多种拼写，必须走 _pos_key 归一，否则实盘数量/盈亏列永远显示"—"
+    ex_map = {(p.get("symbol"), p.get("side")): p for p in (ex_rows or [])}
+
+    with storage.get_conn() as conn:
+        open_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM trade_positions WHERE strategy='alphafox' "
+            "AND status IN ('OPEN','PARTIAL') ORDER BY id DESC").fetchall()]
+        closed_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM trade_positions WHERE strategy='alphafox' "
+            "AND status='CLOSED' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+        # 纸盘口径盈亏（全部已平跟单仓）
+        row = conn.execute(
+            "SELECT COUNT(*) n, SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END) wins, "
+            "ROUND(SUM(realized_pnl),2) pnl FROM trade_positions "
+            "WHERE strategy='alphafox' AND status='CLOSED'").fetchone()
+        out["stats"]["paper"] = {"closed": row["n"] or 0, "wins": row["wins"] or 0,
+                                 "pnl": row["pnl"] or 0}
+        # 纸盘 id → 交易员（历史/日志的归属来源：signal_snapshot 平仓不改写）
+        pid_trader = {r["id"]: alphafox_trade._trader_of(dict(r))
+                      for r in conn.execute(
+                          "SELECT id, signal_snapshot FROM trade_positions "
+                          "WHERE strategy='alphafox'").fetchall()}
+
+    # 实盘那一腿建没建起来：纸盘可以"托管中"而实盘根本没建（例如交易所有手动仓、
+    # 杠杆不符被闸门挡下），以前页面只显示"托管中"，用户以为实盘在跟。原因由
+    # alphafox_live 每轮跳过时记在内存里（见 _note_skip）。
+    live_active_pids = None      # None = 查不到 → **不提示**（空集会把"读不到"误报成"没建"）
+    try:
+        storage.init_onchain_live_db()
+        with storage.get_conn(config.LIVE_DB_PATH) as lc:
+            live_active_pids = {r["paper_position_id"] for r in lc.execute(
+                "SELECT paper_position_id FROM live_positions "
+                "WHERE strategy='alphafox' AND status IN ('OPEN','PARTIAL')")}
+    except Exception as e:
+        print(f"[alphafox-board] live 库读取异常（本轮不判实盘状态）: {e}")
+
+    for pos in open_rows:
+        tid = alphafox_trade._trader_of(pos)
+        managed = alphafox_trade._managed(pos)
+        key = alphafox_trade._pos_key(pos)      # 归一化：老行 symbol 拼写不一
+        ex = ex_map.get(key) or {}
+        state, cls, warn = _af_managed_state(
+            managed, tid in following, alphafox_trade._prev_snap.get(tid), key)
+        pos.update({
+            "trader_id": tid,
+            "trader_label": labels.get(tid) or tid or "—",
+            "managed": managed, "state": state, "state_cls": cls, "warn": warn,
+            # 数量取绝对值：交易所空单 positionAmt 带负号，展示成负数会被读成
+            # "卖出去了"，同一张表两个数量列一正一负也容易误读
+            "ex_quantity": (abs(float(ex["quantity"]))
+                            if ex.get("quantity") is not None else None),
+            "ex_pnl": ex.get("unrealized_pnl"),
+            # 实盘开仓价：页面把"开仓价/浮动盈亏"按 **纸盘 / 实盘** 两列并排显示
+            "ex_entry": ex.get("entry_price"),
+            "ex_leverage": ex.get("leverage"), "live_id": ex.get("live_id"),
+        })
+        # 托管中却没有活跃实盘记录 → 页面必须提示（否则"托管中"会被读成"实盘在跟"）。
+        # 恢复中(2)/取消托管(0)/已脱离(3) 本来就不该有实盘动作，不提示。
+        if (managed == 1 and live_active_pids is not None
+                and pos["id"] not in live_active_pids):
+            pos["live_warn"] = (alphafox_live.live_skip_reason(
+                pos.get("token") or "", pos.get("side") or "LONG")
+                or "对账尚未跑到该币")
+        else:
+            pos["live_warn"] = ""
+        out["positions"].append(pos)
+
+    # 实盘口径盈亏（真实成交）+ 当前浮盈（两条口径各自汇总）
+    live_stats = {"closed": 0, "wins": 0, "pnl": 0.0}
+    live_pnl_by_pid = {}
+    try:
+        storage.init_onchain_live_db()
+        with storage.get_conn(config.LIVE_DB_PATH) as lc:
+            row = lc.execute(
+                "SELECT COUNT(*) n, SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END) wins, "
+                "ROUND(SUM(realized_pnl),2) pnl FROM live_positions "
+                "WHERE strategy='alphafox' AND status='CLOSED'").fetchone()
+            if row:
+                live_stats = {"closed": row["n"] or 0, "wins": row["wins"] or 0,
+                              "pnl": row["pnl"] or 0}
+            for r in lc.execute(
+                    "SELECT paper_position_id, realized_pnl, status, entry_price "
+                    "FROM live_positions WHERE strategy='alphafox'"):
+                live_pnl_by_pid[r["paper_position_id"]] = {
+                    "pnl": r["realized_pnl"], "status": r["status"],
+                    "entry": r["entry_price"]}
+            trade_rows = [dict(r) for r in lc.execute(
+                "SELECT * FROM live_trade_log WHERE strategy='alphafox' "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+    except Exception:
+        trade_rows = []
+    out["stats"]["live"] = live_stats
+    # 交易所取数失败（ok=False）时，实盘口径一律给 None → 页面显示"—"，
+    # 而不是把"查不到"显示成 0（账户区已经在提示失败了，两处别互相矛盾）
+    _ex_ok = bool(_acct.get("ok", True))
+    out["stats"]["open"] = {
+        "paper_pnl": round(sum(float(p.get("unrealized_pnl") or 0)
+                               for p in open_rows), 2),
+        "ex_pnl": (round(sum(float((ex_map.get(alphafox_trade._pos_key(p))
+                                   or {}).get("unrealized_pnl") or 0)
+                            for p in open_rows), 2) if _ex_ok else None),
+        "open_paper": len(open_rows),
+        "open_ex": (sum(1 for p in open_rows
+                        if ex_map.get(alphafox_trade._pos_key(p)))
+                    if _ex_ok else None),
+    }
+
+    for pos in closed_rows:
+        tid = alphafox_trade._trader_of(pos)
+        lv = live_pnl_by_pid.get(pos["id"]) or {}
+        pos.update({"trader_id": tid,
+                    "trader_label": labels.get(tid) or tid or "—",
+                    "live_pnl": lv.get("pnl"), "live_status": lv.get("status"),
+                    "live_entry": lv.get("entry")})
+        for k in ("created_at", "closed_at"):
+            if pos.get(k):
+                pos[k] = _af_local_ts(pos[k])
+        out["history"].append(pos)
+
+    for t in trade_rows:
+        tid = pid_trader.get(t.get("paper_position_id")) or ""
+        t["trader_id"] = tid
+        t["trader_label"] = labels.get(tid) or tid or "—"
+        if t.get("created_at"):
+            t["created_at"] = _af_local_ts(t["created_at"])
+        out["trades"].append(t)
+
+    # ---- 跟单交易员持仓卡片：直接读探测缓存（与雷达页同一个快照，零额外请求）----
+    for tid in sorted(following):
+        c = _af_last_snap.get(tid) or {}
+        raw = c.get("positions")
+        items = []
+        for p in (raw or []):
+            if not isinstance(p, dict):
+                continue
+            items.append({
+                "symbol": p.get("symbol"), "side": p.get("side"),
+                "qty": _af_num(p.get("absQty")),
+                "avg_price": _af_num(p.get("avgPrice")),
+                "mark_price": _af_num(p.get("markPrice")),
+                # 名义取绝对值：上游对空头给过负数（-3636278.98），页面显示成负数
+                # 会被读成"负仓位"
+                "notional": abs(_af_num(p.get("notional"))),
+                "leverage": p.get("leverage"),
+                "unrealized_pnl": _af_num(p.get("unrealizedPnl")),
+                "liq_price": _af_num(p.get("estimatedLiqPrice")),
+                "last_order_time": p.get("lastOrderTime"),
+            })
+        out["traders"].append({
+            "trader_id": tid, "label": labels.get(tid) or tid or "—",
+            # 缓存还没有这份快照（刚跟单/探测还没跑）→ positions=None，页面显示
+            # "等待探测"，不谎报成"空仓"
+            "stale": raw is None,
+            "polled_at": c.get("polledAt"),
+            "pos_count": len(items),
+            "positions": None if raw is None else items,
+            "notional_sum": round(sum(x["notional"] or 0 for x in items), 2),
+            "upnl_sum": round(sum(x["unrealized_pnl"] or 0 for x in items), 2),
+        })
+
+    # ---- 币种设置（实盘每份名义/杠杆的每币覆盖，留空 = 用全局）----
+    try:
+        with storage.get_conn() as _c:
+            _ts = storage.trading_settings_get(_c)
+        _gn = float(_ts.get("alphafox_live_max_notional") or 0)
+        _gr = float(_ts.get("alphafox_live_ratio") or 1.0)
+        _gl = float(_ts.get("alphafox_live_leverage")
+                    or getattr(config, "ALPHAFOX_LIVE_LEVERAGE", 5.0))
+    except Exception:
+        _gr = 1.0
+        _gn = float(getattr(config, "ALPHAFOX_LIVE_MAX_NOTIONAL", 0.0))
+        _gl = float(getattr(config, "ALPHAFOX_LIVE_LEVERAGE", 5.0))
+    _toks = set()
+    try:
+        with storage.get_conn(config.ALPHAFOX_DB) as _c:
+            for r in _c.execute("SELECT token FROM alphafox_symbol_map"):
+                if r["token"]:
+                    _toks.add(str(r["token"]).upper())
+            _ovr = [dict(r) for r in _c.execute(
+                "SELECT token, live_notional, live_leverage "
+                "FROM alphafox_token_settings ORDER BY token")]
+    except Exception:
+        _ovr = []
+    _with_pos = {str(p.get("token") or "").upper() for p in open_rows}
+    _toks |= _with_pos
+    _toks |= {str(p.get("token") or "").upper() for p in closed_rows}
+    out["token_options"] = sorted(t for t in _toks if t)
+    out["token_settings"] = {
+        # 比例模型（2026-09-17）：规模不再来自"每份名义"（= 我的可用余额 ÷ 交易员
+        # 保证金，开仓冻结）；每币覆盖只剩**杠杆**，全局另有一个"单笔上限"
+        "globals": {"live_leverage": _gl, "max_notional": _gn,
+                    "live_ratio": _gr},
+        "items": [{
+            "token": r["token"],
+            "live_leverage": r["live_leverage"],
+            "eff_leverage": (float(r["live_leverage"])
+                             if float(r["live_leverage"] or 0) > 0 else _gl),
+            "has_position": str(r["token"]).upper() in _with_pos,
+        } for r in _ovr],
+    }
+    return out
+
+
+@app.post("/api/alphafox/token-settings")
+def api_alphafox_token_settings(body: dict):
+    """跟单币种设置：**实盘杠杆**的每币覆盖（留空 = 用全局）。
+
+    比例模型（2026-09-17）：规模与"每份名义"无关（= 我的可用余额 ÷ 交易员
+    保证金余额，开仓那一刻冻结进记录），所以每币只剩杠杆一项可覆盖。
+    只对**之后新开的**跟单仓生效：已有仓用开仓时冻结的杠杆。"""
+    import alphafox_live
+    import alphafox_trade
+    token = str(body.get("token") or "").strip().upper()
+    if not token or not token.isalnum():
+        raise HTTPException(400, "币种非法（只允许字母数字）")
+    v = body.get("live_leverage")
+    if v is None or str(v).strip() == "":
+        lv = None                      # 留空 = 不设覆盖（用全局）→ 整行删掉
+    else:
+        try:
+            lv = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "杠杆格式无效")
+        if not (1 <= lv <= 125):
+            raise HTTPException(400, "杠杆需在 1~125 之间")
+    try:
+        alphafox_trade.init_db()
+        with storage.get_conn(config.ALPHAFOX_DB) as c:
+            if lv is None:
+                c.execute("DELETE FROM alphafox_token_settings WHERE token=?",
+                          (token,))
+            else:
+                c.execute(
+                    "INSERT INTO alphafox_token_settings "
+                    "(token, live_notional, live_leverage, updated_at) "
+                    "VALUES (?,?,?,?) ON CONFLICT(token) DO UPDATE SET "
+                    "live_notional=excluded.live_notional, "
+                    "live_leverage=excluded.live_leverage, "
+                    "updated_at=excluded.updated_at",
+                    (token, None, lv, int(time.time())))
+    except Exception as e:
+        raise HTTPException(500, f"保存失败: {e}")
+    with storage.get_conn() as _c:
+        _ts = storage.trading_settings_get(_c)
+    gl = float(_ts.get("alphafox_live_leverage")
+               or getattr(config, "ALPHAFOX_LIVE_LEVERAGE", 5.0))
+    return {"ok": True, "token": token, "live_leverage": lv,
+            "eff_leverage": alphafox_live._eff_live_params(token, gl)}
+
+
+@app.post("/api/alphafox/manage")
+def api_alphafox_manage(body: dict):
+    """持仓行的托管开关：取消托管（不平仓）/ 恢复托管（下轮追平）"""
+    try:
+        position_id = int(body.get("position_id") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "position_id 非法")
+    if not position_id:
+        raise HTTPException(400, "position_id 必填")
+    if "managed" not in body:
+        # 缺省必须报错：bool(None)=False 会把少传字段的请求静默当成"取消托管"
+        raise HTTPException(400, "managed 必填（true=恢复托管 / false=取消托管）")
+    import alphafox_trade
+    res = alphafox_trade.set_position_managed(position_id, bool(body.get("managed")))
+    if not res.get("ok"):
+        raise HTTPException(409, res.get("msg") or "操作失败")
+    return {"ok": True, "position_id": position_id, **(res or {})}
+
+
+def _af_trade_params() -> dict:
+    """跟单参数（与探测线程同一口径；快速跟随接口复用）"""
+    with storage.get_conn() as conn:
+        ts = storage.trading_settings_get(conn)
+    return {
+        "budget": float(ts.get("alphafox_trade_budget") or 1000.0),
+        "slip": float(ts.get("alphafox_slippage_pct") or 0.05),
+        "fee": float(ts.get("alphafox_fee_pct") or 0.04),
+        "allow_open": bool(ts.get("alphafox_trade_enabled", True)),
+        "live_notional": float(ts.get("alphafox_live_max_notional") or 0),
+    }
+
+
+@app.post("/api/alphafox/quick-follow")
+def api_alphafox_quick_follow(body: dict):
+    """「⚡ 快速跟随」（2026-09-17）：把该交易员**当前全部持仓**按比例跟进来。
+
+    纸盘建/补齐 + 托管；实盘过闸门（**交易所杠杆≠设置杠杆 → 该币失败并记日志**）
+    后交给一轮对账补到目标量。`dry_run=true` → 只预览（不写库不下单）。"""
+    import alphafox_trade
+    trader_id = str(body.get("trader_id") or "").strip()
+    if not trader_id:
+        raise HTTPException(400, "trader_id 必填")
+    dry = bool(body.get("dry_run"))
+    snap = _af_last_snap.get(trader_id)
+    if snap and snap.get("positions") is not None:
+        # 探测缓存（每 15s 一份，与雷达页同一个快照）→ 零额外平台请求
+        snapshot = {"data": {
+            "positions": snap.get("positions") or [],
+            "marginBalance": snap.get("margin_balance"),
+            "traderName": snap.get("name"),
+        }}
+    else:
+        try:
+            snapshot = _af_request(f"/api/radar/snapshot?sourceId={trader_id}")
+        except Exception as e:
+            raise HTTPException(502, f"拉取交易员快照失败（稍后重试）: {e}")
+    res = alphafox_trade.quick_follow(trader_id, snapshot, _af_trade_params(),
+                                      dry_run=dry)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("msg") or "快速跟随失败")
+    return res
 
 
 @app.get("/api/alphafox/detail")
@@ -7237,8 +8019,46 @@ async def api_alphafox_stream(request: Request, sourceId: str = ""):
 
 # ---- 超级趋势策略（主流币趋势交易）----
 
+def _st_effective_tol(tok_v, global_v) -> float:
+    """每币反转容忍的**生效值**：每币值合法则用它，否则用全局（与 _run_round 口径一致：
+    越界/脏值回退全局，NULL = 用全局）。卡片按这个显示，才不会出现"每币填 25 却按全局跑"）。"""
+    g = _st_tol(global_v, getattr(config, "SUPERTREND_FLIP_TOLERANCE_PCT", 0.0))
+    try:
+        f = float(tok_v)
+    except (TypeError, ValueError):
+        return g
+    return f if 0 <= f <= 20 else g
+
+
+def _st_tol(v, default: float) -> float:
+    """超势容忍类参数的**生效值**：与 supertrend_strategy._run_round 的防御一致
+    （越界/脏值回退默认）。页面按这个显示，才不会出现"填 25% 显示 25%、实际跑 1%"）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return float(default)
+    return f if 0 <= f <= 20 else float(default)
+
+
+# 扫损重开历史的分页：前端"加载更多"每次 +_ST_HIS_STEP，上限 _ST_HIS_MAX
+# （与跟单托管页同一套语义：步长 20，封顶 200）
+_ST_HIS_STEP = 20
+_ST_HIS_MAX = 200
+
+
 @app.get("/api/supertrend/overview")
-def api_supertrend_overview():
+def api_supertrend_overview(history_limit: int = _ST_HIS_STEP):
+    """监控页与趋势实盘页**共用同一份计算**（TTL 与两页刷新间隔一致）：暂停且无
+    持仓的币会实调币安标记价（见下面 compute），两个页面各自轮询会让它翻倍。
+
+    history_limit 是**在缓存之外切片**的——监控页点"加载更多"只改这一个数，
+    不能让它生成第二份计算（那会让上面的标记价调用翻倍）。"""
+    ov = _cached("supertrend_overview", 30, _supertrend_overview_compute)
+    n = max(_ST_HIS_STEP, min(int(history_limit or _ST_HIS_STEP), _ST_HIS_MAX))
+    return {**ov, "history": (ov.get("history") or [])[:n]}
+
+
+def _supertrend_overview_compute():
     import supertrend_strategy
     supertrend_strategy.init_db()  # 幂等迁移：web 可能先于 worker 启动，确保新列已加
     with storage.get_conn() as main_conn:
@@ -7247,7 +8067,11 @@ def api_supertrend_overview():
             "SELECT * FROM trade_positions WHERE strategy='supertrend' "
             "ORDER BY id DESC LIMIT 100")]
         open_pos = [p for p in positions if p["status"] in ("OPEN", "PARTIAL", "PENDING")]
-        closed = [p for p in positions if p["status"] == "CLOSED"][:20]
+        # 历史单独查、单独限制：不能被上面那个"最近 100 条持仓窗口"截断
+        # （持仓多的时候历史会被挤没）——它要能一路翻到 _ST_HIS_MAX 条
+        closed = [dict(r) for r in main_conn.execute(
+            "SELECT * FROM trade_positions WHERE strategy='supertrend' "
+            "AND status='CLOSED' ORDER BY id DESC LIMIT ?", (_ST_HIS_MAX,))]
     with storage.get_conn(config.SUPERTREND_DB) as st_conn:
         tokens = [dict(r) for r in st_conn.execute(
             "SELECT * FROM supertrend_tokens ORDER BY "
@@ -7262,6 +8086,7 @@ def api_supertrend_overview():
     for p in closed:
         p["close_snap"] = snap_map.get(p["id"])
     cards = []
+    _af_occupied_cache = None   # 本次请求内缓存跟单实盘占用币集合
     for t in tokens:
         if t["status"] != "ACTIVE":
             continue
@@ -7280,9 +8105,26 @@ def api_supertrend_overview():
                     last_price = live
             except Exception:
                 pass
+        live_mode = t.get("live_mode") in (1, "1", True)
+        # 实盘被跟单（alphafox）占用 → 页面提示（镜像层会跳过，等待释放）。
+        # 占用币集合整页只查一次（每个卡片单独查会重复建表+查询）
+        if _af_occupied_cache is None:
+            _af_occupied_cache = set()
+            try:
+                storage.init_onchain_live_db()
+                with storage.get_conn(config.LIVE_DB_PATH) as _lc:
+                    _af_occupied_cache = {
+                        r[0] for r in _lc.execute(
+                            "SELECT DISTINCT token FROM live_positions "
+                            "WHERE strategy='alphafox' AND status IN ('OPEN','PARTIAL')")}
+            except Exception:
+                _af_occupied_cache = set()
+        live_blocked_by = ("alphafox"
+                           if live_mode and t["token"] in _af_occupied_cache else None)
         cards.append({
             "token": t["token"],
             "token_status": t["status"],
+            "live_blocked_by": live_blocked_by,
             "trend": st.get("trend"),
             "upper_band": st.get("upper_band"),
             "lower_band": st.get("lower_band"),
@@ -7300,21 +8142,197 @@ def api_supertrend_overview():
             "leverage": t.get("leverage"),
             "direction": t.get("direction") or "BOTH",
             "flip_market_open": t.get("flip_market_open") in (1, "1", True),
+            # 每币**原始值**（弹窗回填要用它）+ **生效值**（卡片显示用）
+            "flip_market_tolerance_pct": t.get("flip_market_tolerance_pct"),
+            "flip_tolerance_effective": _st_effective_tol(
+                t.get("flip_market_tolerance_pct"),
+                settings.get("supertrend_flip_tolerance_pct")),
             "paused": t.get("paused") in (1, "1", True),
+            "live_mode": t.get("live_mode") in (1, "1", True),
             "position": pos,
             "pending": pend,
         })
     return {
         "enabled": bool(settings.get("supertrend_enabled", True)),
         "params": {
-            "tolerance_pct": settings.get("supertrend_sl_tolerance_pct", 1.0),
-            "order_tolerance_pct": settings.get("supertrend_order_tolerance_pct", 1.0),
+            # 口径按**策略端实际生效值**给（越界/脏值会被 _run_round 回退到默认）——
+            # 直接回显 DB 原始值会出现"页面写 25%、实际按 1% 跑"的不一致
+            "tolerance_pct": _st_tol(
+                settings.get("supertrend_sl_tolerance_pct"),
+                getattr(config, "SUPERTREND_SL_TOLERANCE_PCT", 1.0)),
+            "order_tolerance_pct": _st_tol(
+                settings.get("supertrend_order_tolerance_pct"),
+                getattr(config, "SUPERTREND_ORDER_TOLERANCE_PCT", 1.0)),
+            "flip_tolerance_pct": _st_tol(
+                settings.get("supertrend_flip_tolerance_pct"),
+                getattr(config, "SUPERTREND_FLIP_TOLERANCE_PCT", 0.0)),
             "notional_usd": settings.get("supertrend_notional_usd", 50.0),
             "leverage": settings.get("supertrend_leverage", 3.0),
         },
         "cards": cards,
         "history": closed,
     }
+
+
+@app.get("/api/supertrend/board")
+def api_supertrend_board(limit: int = 50):
+    """主流趋势实盘页聚合：账户概览 + 盈亏统计 + 监控币种 + 持仓 + 历史 + 交易日志。
+
+    数据全部与既有页面同源（api_live_binance_overview / api_supertrend_overview /
+    exchange.get_positions / live 库），不新增采集、不新增表；账户是**全局共享**的，
+    "趋势归属"另算（占用保证金 / 实盘笔数 / 浮盈）。"""
+    import supertrend_live as stl
+    limit = min(max(int(limit or 50), 1), 200)
+    acct = api_live_binance_overview()
+    ov = api_supertrend_overview()          # 与监控页共享同一份计算（含缓存）
+    cards = ov.get("cards") or []
+    # 交易所取数失败（ok=False）时实盘口径一律给 None → 页面显示"—"，
+    # 而不是把"查不到"显示成 0
+    ex_ok = bool(acct.get("ok", True))
+    out = {
+        "account": acct, "account_ok": ex_ok,
+        "params": ov.get("params") or {},
+        "stats": {"paper": {}, "live": {}, "open": {}},
+        "cards": cards, "positions": [], "history": [], "trades": [],
+    }
+    try:
+        import exchange
+        ex_rows = exchange.get_positions()
+    except Exception:
+        ex_rows = []
+    card_by_token = {c.get("token"): c for c in cards}
+
+    with storage.get_conn() as conn:
+        open_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM trade_positions WHERE strategy='supertrend' "
+            "AND status IN ('OPEN','PARTIAL','PENDING') ORDER BY id DESC").fetchall()]
+        closed_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM trade_positions WHERE strategy='supertrend' "
+            "AND status='CLOSED' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+        row = conn.execute(
+            "SELECT COUNT(*) n, SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END) wins, "
+            "ROUND(SUM(realized_pnl),2) pnl FROM trade_positions "
+            "WHERE strategy='supertrend' AND status='CLOSED'").fetchone()
+        out["stats"]["paper"] = {"closed": row["n"] or 0, "wins": row["wins"] or 0,
+                                 "pnl": row["pnl"] or 0}
+        out["stats"]["account"] = trade_logic.strategy_account_summary(conn, "supertrend")
+
+    snaps = {}
+    try:
+        with storage.get_conn(config.SUPERTREND_DB) as st_conn:
+            snaps = {r["position_id"]: dict(r) for r in st_conn.execute(
+                "SELECT * FROM supertrend_close_snaps")}
+    except Exception:
+        snaps = {}      # 新表尚未建出（web 先于 worker 启动）时兜底
+
+    live_open, trades = [], []
+    live_stats = {"closed": 0, "wins": 0, "pnl": 0.0, "margin_used": 0.0,
+                  "open_count": 0}
+    live_by_pid = {}
+    try:
+        storage.init_onchain_live_db()
+        with storage.get_conn(config.LIVE_DB_PATH) as lc:
+            # 含 PENDING（挂单腿：交易所已挂限价单 + 预挂 SL，尚未成交）——
+            # storage.live_positions_open 只返回 OPEN/PARTIAL，挂单腿会整行消失
+            live_open = [dict(r) for r in lc.execute(
+                "SELECT * FROM live_positions WHERE strategy='supertrend' "
+                "AND status IN ('OPEN','PARTIAL','PENDING')").fetchall()]
+            row = lc.execute(
+                "SELECT COUNT(*) n, SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END) wins, "
+                "ROUND(SUM(realized_pnl),2) pnl FROM live_positions "
+                "WHERE strategy='supertrend' AND status='CLOSED'").fetchone()
+            if row:
+                live_stats.update({"closed": row["n"] or 0, "wins": row["wins"] or 0,
+                                   "pnl": row["pnl"] or 0})
+            for r in lc.execute(
+                    "SELECT paper_position_id, realized_pnl, entry_price, status, "
+                    "quantity FROM live_positions WHERE strategy='supertrend'"):
+                live_by_pid[r["paper_position_id"]] = dict(r)
+            trades = [dict(r) for r in lc.execute(
+                "SELECT * FROM live_trade_log WHERE strategy='supertrend' "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+    except Exception as e:
+        print(f"[supertrend-board] live 库读取异常: {e}")
+    # 挂单腿（PENDING）的保证金还没在交易所占用（限价单未成交、无持仓）→
+    # 占用保证金只算已成交的；笔数分开给，页面显示"持仓 N（挂单 M）"
+    live_stats["margin_used"] = round(
+        sum(float(r.get("margin_usd") or 0) for r in live_open
+            if r.get("status") != "PENDING"), 2)
+    live_stats["open_count"] = sum(1 for r in live_open
+                                   if r.get("status") != "PENDING")
+    live_stats["pending_count"] = sum(1 for r in live_open
+                                      if r.get("status") == "PENDING")
+    # 实盘有记录、纸盘却没有活跃行 = 收敛没走完（撤单失败/平仓失败会卡在这个状态，
+    # 卡住时交易所还挂着单或持有仓）。持仓面板是按纸盘行走的 → 不给提示就完全看不见
+    _active_pids = {p["id"] for p in open_rows}
+    _orphan_live = [r for r in live_open
+                    if r.get("paper_position_id") not in _active_pids]
+    live_stats["orphan_count"] = len(_orphan_live)
+    live_stats["orphan_tokens"] = sorted(
+        {str(r.get("token") or "") for r in _orphan_live if r.get("token")})
+    out["stats"]["live"] = live_stats
+
+    # 按 **paper_position_id** 配对（不是 token+side）：反转市价开并存时，同一
+    # 币同方向会同时有市价腿（OPEN）和挂单腿（PENDING）两条 live 记录，按币配
+    # 会让挂单腿那行显示成持仓腿的数据
+    live_active_by_pid = {r.get("paper_position_id"): r for r in live_open}
+    ex_pnl_sum = 0.0
+    ex_open_cnt = 0
+    for p in open_rows:
+        tok = str(p.get("token") or "").upper()
+        side = p.get("side") or "LONG"
+        lr = live_active_by_pid.get(p["id"]) or {}
+        orders = stl._load_orders(lr)
+        # 交易所那个位置的量可能是"手动仓 + 我们的仓"合并值（合约持仓按 symbol
+        # 合并）—— 与镜像层对账用的是同一套匹配规则，页面显示口径才一致
+        ex = stl._ex_match(ex_rows, tok, side) if ex_ok else None
+        p.update({
+            "state": (card_by_token.get(tok) or {}).get("state"),
+            "live_id": lr.get("id"), "live_status": lr.get("status"),
+            "live_entry": lr.get("entry_price"), "live_qty": lr.get("quantity"),
+            "live_sl": orders.get("sl_price"), "live_sl_qty": orders.get("sl_qty"),
+            "live_sl_order": orders.get("sl"),
+            "live_limit_price": orders.get("limit_price"),
+            "live_limit_order": orders.get("limit"),
+            "ex_qty": (abs(float(ex["quantity"]))
+                       if (ex and ex.get("quantity") is not None) else None),
+            "ex_entry": (ex or {}).get("entry_price"),
+            "ex_pnl": (ex or {}).get("unrealized_pnl"),
+            "ex_leverage": (ex or {}).get("leverage"),
+        })
+        if ex:
+            ex_open_cnt += 1
+            ex_pnl_sum += float(ex.get("unrealized_pnl") or 0)
+        if p.get("created_at"):
+            p["created_at"] = _af_local_ts(p["created_at"])
+        out["positions"].append(p)
+
+    out["stats"]["open"] = {
+        "paper_pnl": round(sum(float(p.get("unrealized_pnl") or 0)
+                               for p in open_rows), 2),
+        "ex_pnl": round(ex_pnl_sum, 2) if ex_ok else None,
+        "open_paper": sum(1 for p in open_rows if p["status"] in ("OPEN", "PARTIAL")),
+        "open_pending": sum(1 for p in open_rows if p["status"] == "PENDING"),
+        "open_live": len(live_open),
+        "open_ex": ex_open_cnt if ex_ok else None,
+    }
+
+    for p in closed_rows:
+        p["close_snap"] = snaps.get(p["id"])
+        lv = live_by_pid.get(p["id"]) or {}
+        p["live_pnl"] = lv.get("realized_pnl")
+        p["live_entry"] = lv.get("entry_price")
+        p["live_status"] = lv.get("status")
+        for k in ("created_at", "closed_at"):
+            if p.get(k):
+                p[k] = _af_local_ts(p[k])
+        out["history"].append(p)
+
+    for t in trades:
+        if t.get("created_at"):
+            t["created_at"] = _af_local_ts(t["created_at"])
+    out["trades"] = trades
+    return out
 
 
 @app.post("/api/supertrend/tokens")
@@ -7329,14 +8347,21 @@ def api_supertrend_add(body: TokenBody):
         raise HTTPException(400, "该币种无币安标记价（扫损检测依赖）")
     now = int(time.time())
     with storage.get_conn(config.SUPERTREND_DB) as conn:
+        # 重新加入（此前被移除）：重置为纸盘 + 暂停（用户语义：曾实盘的币重加后从纸盘开始）
         conn.execute(
-            "INSERT INTO supertrend_tokens (token, status, added_at) VALUES (?, 'ACTIVE', ?) "
-            "ON CONFLICT(token) DO UPDATE SET status='ACTIVE', removed_at=NULL, added_at=?",
+            "INSERT INTO supertrend_tokens (token, status, added_at, paused) "
+            "VALUES (?, 'ACTIVE', ?, 1) "
+            "ON CONFLICT(token) DO UPDATE SET status='ACTIVE', removed_at=NULL, added_at=?, "
+            "live_mode=CASE WHEN supertrend_tokens.status='REMOVED' THEN 0 "
+            "ELSE supertrend_tokens.live_mode END, "
+            "paused=CASE WHEN supertrend_tokens.status='REMOVED' THEN 1 "
+            "ELSE supertrend_tokens.paused END",
             (token, now, now),
         )
         # 清除旧信号状态：重新激活走首次流程（记基准→等闭合），
         # 不带移除前的旧 trend（否则可能误判"反转"立即市价开）
         conn.execute("DELETE FROM supertrend_status WHERE token=?", (token,))
+    _cache_invalidate("supertrend_overview")
     return {"ok": True, "token": token}
 
 
@@ -7368,17 +8393,31 @@ def api_supertrend_set_token(body: dict):
     if direction not in ("BOTH", "LONG_ONLY", "SHORT_ONLY"):
         raise HTTPException(400, "方向只能是 BOTH / LONG_ONLY / SHORT_ONLY")
     flip = 1 if str(body.get("flip_market_open")).strip() in ("1", "true", "True") else 0
+    flip_tol = _num(body.get("flip_market_tolerance_pct"), 0, 20, "反转市价容忍")
     if direction == "BOTH":
         flip = 0  # 反转市价开仅对方向限制的币有意义
     with storage.get_conn(config.SUPERTREND_DB) as conn:
         cur = conn.execute(
             "UPDATE supertrend_tokens SET notional_usd=?, sl_tolerance_pct=?, "
-            "order_tolerance_pct=?, leverage=?, direction=?, flip_market_open=? "
+            "order_tolerance_pct=?, leverage=?, direction=?, flip_market_open=?, "
+            "flip_market_tolerance_pct=? "
             "WHERE token=?",
-            (notional, sl_tol, order_tol, lev, direction, flip, token),
+            (notional, sl_tol, order_tol, lev, direction, flip, flip_tol, token),
         )
         if cur.rowcount == 0:
             raise HTTPException(404, "该币种未在监控列表中")
+    # 实盘开关：仅当请求带 live_mode 且与当前值不同才切换（切换=重新监控，清持仓清状态）
+    if "live_mode" in body:
+        want_live = 1 if str(body.get("live_mode")).strip() in ("1", "true", "True") else 0
+        with storage.get_conn(config.SUPERTREND_DB) as conn:
+            row = conn.execute(
+                "SELECT live_mode FROM supertrend_tokens WHERE token=?", (token,)
+            ).fetchone()
+        cur_live = row["live_mode"] if row else 0
+        if want_live != cur_live:
+            import supertrend_live
+            supertrend_live.switch_live_mode(token, bool(want_live))
+    _cache_invalidate("supertrend_overview")
     return {"ok": True, "token": token}
 
 
@@ -7402,6 +8441,7 @@ def api_supertrend_pause(body: dict):
                 "UPDATE supertrend_status SET state='PAUSED' WHERE token=?", (token,))
         else:
             conn.execute("DELETE FROM supertrend_status WHERE token=?", (token,))
+    _cache_invalidate("supertrend_overview")
     return {"ok": True, "token": token, "paused": bool(paused)}
 
 
@@ -7418,6 +8458,7 @@ def api_supertrend_reorder(body: dict):
             conn.execute(
                 "UPDATE supertrend_tokens SET sort_order=? WHERE token=?",
                 (i, str(tk).strip().upper()))
+    _cache_invalidate("supertrend_overview")
     return {"ok": True}
 
 
@@ -7435,6 +8476,13 @@ def api_supertrend_remove(token: str):
         if cur.rowcount == 0:
             raise HTTPException(404, "该币种未在监控列表中")
     closed = supertrend_strategy.close_supertrend_position(token, "REMOVED")
+    # 实盘币：平币安持仓 + 撤挂单 + live 收敛（sync 不再管 REMOVED 币之外的安全网）
+    try:
+        import supertrend_live
+        supertrend_live.close_live(token)
+    except Exception as e:
+        print(f"[supertrend] {token} 移除时实盘收敛异常: {e}")
+    _cache_invalidate("supertrend_overview")
     return {"ok": True, "token": token, "closed": closed}
 
 
@@ -7562,9 +8610,19 @@ tr:hover { background: rgba(88,166,255,0.04); }
       <option value="SHORT_ONLY">只做空</option>
     </select>
     <label>趋势反转到允许方向时立即市价开仓（仅只做多/只做空生效）</label>
-    <select id="set-flip">
+    <select id="set-flip" onchange="toggleFlip()">
       <option value="0">否（反转时正常挂单）</option>
       <option value="1">是（反转时市价开仓 + 挂单）</option>
+    </select>
+    <label>反转市价容忍 %（留空=全局 <span id="ph-flip-tol"></span>；0=不设限，反转后直接市价进）</label>
+    <input id="set-flip-tol" type="number" step="0.1" min="0" max="20">
+    <div style="color:var(--muted);font-size:11px;margin-top:-4px">
+      &gt;0 时：现价超出「反转前趋势线 ×(1±容忍%)」→ 只挂单等回调，不追反转后的高点/低点
+    </div>
+    <label>交易模式</label>
+    <select id="set-live">
+      <option value="0">纸盘（模拟）</option>
+      <option value="1">实盘（同步币安，切换会清仓并重新监控）</option>
     </select>
     <div class="modal-btns">
       <button class="btn-ghost" onclick="closeTokenModal()">取消</button>
@@ -7574,7 +8632,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
 </div>
 
 <div class="panel">
-  <b>扫损重开历史</b><span class="muted" style="margin-left:8px;font-size:11px">（最近 20 条）</span>
+  <b>扫损重开历史</b><span id="hist-cnt" class="muted" style="margin-left:8px;font-size:11px"></span>
   <div id="history-table" style="margin-top:8px"><span class="muted">加载中...</span></div>
 </div>
 
@@ -7640,8 +8698,11 @@ function togglePause(token, paused) {
 function toggleFlip() {
   const d = document.getElementById('set-direction').value;
   const flip = document.getElementById('set-flip');
+  const fTol = document.getElementById('set-flip-tol');
   flip.disabled = (d === 'BOTH');
   if (d === 'BOTH') flip.value = '0';
+  // 容忍只在「反转市价开」开启时才有意义；这里只置灰不清值（关掉再开不该丢设置）
+  fTol.disabled = (d === 'BOTH') || flip.value !== '1';
 }
 
 function openTokenModal(token) {
@@ -7655,6 +8716,8 @@ function openTokenModal(token) {
   document.getElementById('set-lev').value = c.leverage != null ? c.leverage : '';
   document.getElementById('set-direction').value = c.direction || 'BOTH';
   document.getElementById('set-flip').value = c.flip_market_open ? '1' : '0';
+  document.getElementById('set-flip-tol').value = c.flip_market_tolerance_pct != null ? c.flip_market_tolerance_pct : '';
+  document.getElementById('set-live').value = c.live_mode ? '1' : '0';
   toggleFlip();
   document.getElementById('tok-modal').classList.add('show');
 }
@@ -7662,6 +8725,26 @@ function openTokenModal(token) {
 function closeTokenModal() { document.getElementById('tok-modal').classList.remove('show'); }
 
 function saveTokenSettings() {
+  const c = _lastCards.find(x => x.token === _editToken);
+  const wantLive = document.getElementById('set-live').value === '1';
+  const curLive = !!c.live_mode;
+  if (wantLive !== curLive) {
+    const items = wantLive
+      ? '切换【纸盘 → 实盘】将执行以下清理：\\n\\n' +
+        '• 平掉当前纸盘持仓、取消纸盘挂单\\n' +
+        '• 清空监控状态（趋势/轨道基线）\\n' +
+        '• 撤销币安侧该币全部挂单（限价/止损条件单）\\n' +
+        '• 市价平掉币安该币全部持仓（含手动/残留仓）\\n\\n' +
+        '切换后重新监控：等 15m K线闭合后挂限价单（同时预挂止损条件单）。\\n\\n' +
+        '确认切换到实盘？'
+      : '切换【实盘 → 纸盘】将执行以下清理：\\n\\n' +
+        '• 撤销币安该币全部挂单（限价/止损条件单）\\n' +
+        '• 市价平掉币安实盘持仓\\n' +
+        '• 清空监控状态\\n\\n' +
+        '切换后纸盘重新监控（挂单成交、扫损均在模拟账户）。\\n\\n' +
+        '确认切换回纸盘？';
+    if (!confirm(items)) return;
+  }
   const body = {
     token: _editToken,
     notional_usd: document.getElementById('set-notional').value,
@@ -7670,6 +8753,8 @@ function saveTokenSettings() {
     leverage: document.getElementById('set-lev').value,
     direction: document.getElementById('set-direction').value,
     flip_market_open: document.getElementById('set-flip').value,
+    flip_market_tolerance_pct: document.getElementById('set-flip-tol').value,
+    live_mode: document.getElementById('set-live').value,
   };
   fetch('/api/supertrend/set-token', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -7809,19 +8894,32 @@ function renderCards(cards) {
     if (c.paused) {
       posHtml = '<div class="kv"><span class="k">状态</span><span class="yellow">已暂停监控（持仓/挂单不受影响）</span></div>' + posHtml;
     }
+    // 反转市价被容忍度拦下时，原因写在挂单 open_reason 末尾（形如 "…，反转市价跳过（现价 X 超出容忍线 Y=Z）"）。
+    // 不读 advice：那个字段被 1s 循环和 _update_order 反复重写，留痕会秒没
+    const skipIdx = pend && pend.open_reason ? pend.open_reason.indexOf('反转市价跳过') : -1;
+    const flipSkip = skipIdx >= 0
+      ? '<div class="kv"><span class="k">⚠ 反转</span><span class="yellow">'
+        + pend.open_reason.slice(skipIdx) + '</span></div>' : '';
     // 反转市价开场景：持仓与挂单并存，挂单单独一行显示
     const pendHtml = pend ? '<div class="kv"><span class="k">挂单</span><span class="yellow">'
         + (pend.side==='LONG'?'多':'空') + ' @' + fmtPrice(pend.limit_price)
         + ' · SL ' + fmtPrice(pend.stop_loss_price) + '</span></div>'
-        + '<div class="kv"><span class="k">挂单时间</span><span>' + fmtTime(pend.created_at) + '</span></div>' : '';
+        + '<div class="kv"><span class="k">挂单时间</span><span>' + fmtTime(pend.created_at) + '</span></div>'
+        + flipSkip : '';
     const fetchErr = c.fetch_error ? '<div class="kv"><span class="k">⚠ 数据</span><span class="red">' + c.fetch_error + '</span></div>' : '';
+    const liveBlocked = c.live_blocked_by
+      ? '<div class="kv"><span class="k">⚠ 实盘</span><span class="yellow">该币实盘被跟单策略占用，镜像已暂停（跟单平仓后自动接管）</span></div>' : '';
     const cust = [];
     if (c.notional_usd != null) cust.push('$' + c.notional_usd);
     if (c.sl_tolerance_pct != null) cust.push('SL' + c.sl_tolerance_pct + '%');
     if (c.order_tolerance_pct != null) cust.push('挂单' + c.order_tolerance_pct + '%');
     if (c.leverage != null) cust.push(c.leverage + 'x');
-    if (c.flip_market_open && (c.direction === 'LONG_ONLY' || c.direction === 'SHORT_ONLY'))
+    if (c.flip_market_open && (c.direction === 'LONG_ONLY' || c.direction === 'SHORT_ONLY')) {
       cust.push('反转市价开');
+      // 显示**生效值**（每币有效值优先、否则全局）：只显示每币覆盖值时，用全局
+      // 容忍的币在卡片上完全看不出闸门开着；越界脏值也会被显示成一个不存在的口径
+      if (c.flip_tolerance_effective > 0) cust.push('反转容忍' + c.flip_tolerance_effective + '%');
+    }
     const custParams = cust.length
       ? '<div class="kv"><span class="k">自定义参数</span><span class="muted">' + cust.join(' · ') + '</span></div>' : '';
     const sigAge = c.updated_at ? '<div class="kv"><span class="k">信号更新</span><span>' + Math.floor((Date.now()/1000 - c.updated_at)) + ' 秒前</span></div>' : '';
@@ -7840,22 +8938,30 @@ function renderCards(cards) {
       + '<button onclick="openTokenModal(\\'' + c.token + '\\')">设置</button>'
       + '<button class="danger" onclick="removeToken(\\'' + c.token + '\\')">移除监控</button>'
       + '</div></span>';
+    const liveBadge = c.live_mode
+      ? '<span style="font-size:11px;background:rgba(14,203,129,0.15);color:#0ECB81;padding:2px 6px;border-radius:6px">💹 实盘</span>' : '';
     h += '<div class="card' + (c.paused ? ' paused' : '') + '" data-token="' + c.token
       + '" onmousedown="startDrag(event, this)">'
-      + '<div class="card-head"><span class="token">' + c.token + '</span><span>' + trendBadge + dirBadge + '</span>'
+      + '<div class="card-head"><span class="token">' + c.token + '</span><span>' + liveBadge + trendBadge + dirBadge + '</span>'
       + menuHtml + '</div>'
       + '<div class="kv"><span class="k">上轨道（已闭合）</span><span>' + fmtPrice(c.upper_band) + '</span></div>'
       + '<div class="kv"><span class="k">下轨道（已闭合）</span><span>' + fmtPrice(c.lower_band) + '</span></div>'
       + formingHtml
       + '<div class="kv"><span class="k">最新价</span><span>' + fmtPrice(showPrice) + '</span></div>'
-      + posHtml + pendHtml + custParams + fetchErr + sigAge + klineTime
+      + posHtml + pendHtml + custParams + liveBlocked + fetchErr + sigAge + klineTime
       + '</div>';
   }
   el.innerHTML = h;
 }
 
+// 扫损重开历史分页：点"加载更多" 每次 +HIST_STEP 条（与后端 _ST_HIS_* 对齐）
+const HIST_STEP = 20, HIST_MAX = 200;
+let histLimit = HIST_STEP;
+
 function renderHistory(list) {
   const el = document.getElementById('history-table');
+  const cnt = document.getElementById('hist-cnt');
+  if (cnt) cnt.textContent = list.length ? '（已显示 ' + list.length + ' 条）' : '';
   if (!list.length) { el.innerHTML = '<span class="muted">暂无平仓记录</span>'; return; }
   let h = '<table><thead><tr><th>时间</th><th>币种</th><th>方向</th><th class="right">开仓价</th><th class="right">平仓价</th><th>平仓时15m</th><th class="right">盈亏%</th><th class="right">盈亏$</th><th>结果</th></tr></thead><tbody>';
   for (const p of list) {
@@ -7874,22 +8980,39 @@ function renderHistory(list) {
       + '<td>' + result + '</td></tr>';
   }
   h += '</tbody></table>';
+  // 服务端按 histLimit 截断：回来正好装满一页 → 后面可能还有
+  if (list.length >= histLimit && histLimit < HIST_MAX) {
+    h += '<div style="margin-top:8px;text-align:center">'
+      + '<button class="btn-ghost" onclick="loadMoreHistory()">加载更多（+'
+      + HIST_STEP + '）</button></div>';
+  }
   el.innerHTML = h;
 }
 
+function loadMoreHistory() {
+  histLimit = Math.min(HIST_MAX, histLimit + HIST_STEP);
+  load();
+}
+
 async function load() {
+  const _lim = histLimit;   // 本次请求用的页数
   try {
-    const r = await fetch('/api/supertrend/overview');
+    const r = await fetch('/api/supertrend/overview?history_limit=' + _lim);
     const d = await r.json();
+    // 期间用户点了"加载更多" → 丢弃这次旧结果：否则在飞的旧小页会晚到，
+    // 把刚翻出来的大页覆盖回去（表格缩回去、按钮消失），要等下一轮轮询才恢复
+    if (_lim !== histLimit) return;
     document.getElementById('strategy-state').innerHTML = d.enabled
       ? '● 运行中 · 每 60s 跟随 15m 超势更新止损 · 扫损后按趋势重开'
       : '<span class="red">○ 已暂停（设置页开关关闭）——已有持仓仍受系统 2s 扫损保护</span>';
     document.getElementById('params-line').textContent =
       '全局默认：SL容忍 ' + d.params.tolerance_pct + '% · 挂单容忍 ' + d.params.order_tolerance_pct
-      + '% · 名义 $' + d.params.notional_usd + ' · 杠杆 ' + d.params.leverage + 'x（设置页可改，热生效）';
+      + '% · 反转市价容忍 ' + d.params.flip_tolerance_pct + '% · 名义 $' + d.params.notional_usd
+      + ' · 杠杆 ' + d.params.leverage + 'x（设置页可改，热生效）';
     document.getElementById('ph-notional').textContent = '$' + d.params.notional_usd;
     document.getElementById('ph-sl').textContent = d.params.tolerance_pct + '%';
     document.getElementById('ph-order').textContent = d.params.order_tolerance_pct + '%';
+    document.getElementById('ph-flip-tol').textContent = d.params.flip_tolerance_pct + '%';
     document.getElementById('ph-lev').textContent = d.params.leverage + 'x';
     renderCards(d.cards);
     renderHistory(d.history);
@@ -8069,6 +9192,16 @@ async function toggleFollow(tid) {
   const t = traders.find(x => x.id === tid);
   if (!t) return;
   const follow = !t.following;
+  if (!follow && !confirm('取消跟单 ' + (t.label || tid) + '？\\n\\n'
+      + 'TA 名下的持仓将全部"取消托管"：\\n'
+      + '• 不再跟随 TA 的加减仓/平仓\\n'
+      + '• 仓位保留（纸盘和币安实盘都不平）\\n\\n'
+      + '注意：跟单仓没有止损，取消后失去唯一退出信号，\\n'
+      + '需要你自己盯盘，或在「跟单托管」页手动平仓。')) return;
+  if (follow && !confirm('重新跟单 ' + (t.label || tid) + '？\\n\\n'
+      + 'TA 名下已取消托管的持仓将恢复托管：\\n'
+      + '• 按 TA 当前仓位对齐数量（会按现价成交）\\n'
+      + '• TA 已平掉的仓标记"已脱离"（不交易，你自行处理）')) return;
   try {
     const r = await fetch('/api/alphafox/follow', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -8076,7 +9209,14 @@ async function toggleFollow(tid) {
                             label: t.label, signal_type: t.signalType})
     });
     const d = await r.json();
-    if (d.ok) { t.following = follow; renderTraderList(); }
+    if (d.ok) {
+      t.following = follow; renderTraderList();
+      if (!follow && d.managed_off) alert('已取消跟单：' + d.managed_off
+        + ' 笔持仓转为"已取消托管"（仓位保留，不再跟随）。\\n\\n'
+        + '跟单仓没有止损，请到「💼 跟单托管」页盯盘或手动平仓。');
+      if (follow && d.reattach) alert('已重新跟单：' + d.reattach
+        + ' 笔持仓恢复托管，下一轮按 TA 当前仓位对齐。');
+    }
     else { alert('跟单设置失败：' + (d.detail || '未知错误')); }
   } catch(e) { alert('跟单设置失败：' + e.message); }
 }
@@ -8308,10 +9448,1269 @@ def alphafox_page():
     )
 
 
+# ============================================================
+# 加密事件（event_agent.py）：/crypto-events 事件展览 + /crypto-event-ai AI 判定
+# ============================================================
+_EV_META_KEYS = ("ai_state", "last_poll_at", "last_ai_at", "watermark_msg_id")
+
+
+def _ev_local_ts(iso: str) -> str:
+    """ISO(UTC) → 北京时间字符串（页面显示用；解析不了就原样返回）"""
+    try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        t = _dt.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_tz.utc)
+        return (t + _td(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(iso or "")
+
+
+@app.get("/api/crypto-events")
+def api_crypto_events(limit: int = 20, offset: int = 0):
+    """事件展览：抓到的原始快讯（分页）+ 运行状态（AI 状态/上次抓取/上次分析）"""
+    import json as _json
+    limit = min(max(int(limit or 20), 1), 200)
+    offset = max(int(offset or 0), 0)
+    storage.init_event_db()
+    with storage.get_conn(config.EVENT_DB_PATH) as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, msg_id, ts, text, coins FROM crypto_event_raw "
+            "ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))]
+        total = c.execute("SELECT COUNT(*) n FROM crypto_event_raw").fetchone()["n"]
+        meta = {k: storage.event_meta_get(c, k) for k in _EV_META_KEYS}
+    for r in rows:
+        try:
+            r["coins"] = _json.loads(r["coins"] or "[]")
+        except Exception:
+            r["coins"] = []
+        r["ts_local"] = _ev_local_ts(r["ts"])
+    return {"ok": True, "total": total, "list": rows, "meta": meta,
+            "ai_configured": bool(getattr(config, "EVENT_AI_API_KEY", ""))}
+
+
+@app.get("/api/crypto-event-ai")
+def api_crypto_event_ai(limit: int = 20, offset: int = 0, impact: str = ""):
+    """AI 判定卡片：原文 + 判定 + 依据 + **该判定开的仓（含平仓用得到的信息）**。
+
+    事件库和主库是两个文件 → 不能 SQL join：先取判定，再拿 position_id 回主库查仓位。"""
+    import json as _json
+    limit = min(max(int(limit or 20), 1), 200)
+    offset = max(int(offset or 0), 0)
+    where, args = "", []
+    if impact in ("利多", "利空", "中性", "无关"):
+        where = " AND ai.impact=?"
+        args.append(impact)
+    storage.init_event_db()
+    with storage.get_conn(config.EVENT_DB_PATH) as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT ai.id, ai.event_id, ai.coin, ai.impact, ai.reason, ai.confidence, "
+            "ai.status, ai.attempts, ai.analyzed_at, ai.traded, raw.ts, raw.text, "
+            "t.position_id, t.side trade_side, t.ok trade_ok, t.reason trade_reason "
+            "FROM crypto_event_ai ai JOIN crypto_event_raw raw ON raw.id=ai.event_id "
+            "LEFT JOIN crypto_event_trade t ON t.event_id=ai.event_id AND t.coin=ai.coin "
+            "WHERE 1=1" + where + " ORDER BY raw.id DESC, ai.coin LIMIT ? OFFSET ?",
+            (*args, limit, offset))]
+        total = c.execute("SELECT COUNT(*) n FROM crypto_event_ai ai WHERE 1=1" + where,
+                          args).fetchone()["n"]
+        meta = {k: storage.event_meta_get(c, k) for k in _EV_META_KEYS}
+    pids = [r["position_id"] for r in rows if r.get("position_id")]
+    pos_map = {}
+    if pids:
+        marks = ",".join("?" * len(pids))
+        with storage.get_conn() as conn:
+            for r in conn.execute(
+                    f"SELECT id, token, side, status, quantity, entry_price, "
+                    f"current_price, unrealized_pnl FROM trade_positions "
+                    f"WHERE id IN ({marks})", pids):
+                pos_map[r["id"]] = dict(r)
+    for r in rows:
+        r["ts_local"] = _ev_local_ts(r["ts"])
+        r["position"] = pos_map.get(r.get("position_id"))
+    return {"ok": True, "total": total, "list": rows, "meta": meta,
+            "ai_configured": bool(getattr(config, "EVENT_AI_API_KEY", ""))}
+
+
+_EV_CSS = """
+:root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3;
+        --muted:#8b949e; --accent:#1f6feb; --green:#3fb950; --red:#f85149; --yellow:#d29922; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       padding:20px; max-width:1100px; margin:0 auto; font-size:13px; }
+a { color:var(--accent); }
+/* 导航栏样式：每个页面各自带一份（{NAV} 只给 HTML，样式不在里面），漏了导航就没样式 */
+.nav-bar { display:flex; justify-content:center; gap:16px; align-items:center; margin-bottom:20px; flex-wrap:wrap; padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+.nav-bar a { color:var(--muted); text-decoration:none; font-size:14px; }
+.nav-bar a:hover { color:var(--text); }
+.nav-bar a.active { color:var(--accent); font-weight:600; }
+.nav-dropdown { position:relative; display:inline-block; }
+.nav-dropdown > a { cursor:pointer; color:var(--muted); text-decoration:none; font-size:14px; }
+.nav-dropdown > a:hover { color:var(--text); }
+.nav-dropdown-content { display:none; position:absolute; top:100%; left:0; background:var(--panel); border:1px solid var(--border); border-radius:8px; min-width:200px; z-index:10; padding:8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display:block; }
+.nav-dropdown-content a { display:block; padding:6px 16px; color:var(--muted); font-size:13px; white-space:nowrap; }
+.nav-dropdown-content a:hover { color:var(--text); background:rgba(88,166,255,0.08); }
+.panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; }
+.banner { padding:8px 12px; border-radius:6px; margin-bottom:12px; font-size:12px; }
+.banner.warn { background:rgba(210,153,34,.12); border:1px solid rgba(210,153,34,.4); color:var(--yellow); }
+.banner.ok { background:rgba(63,185,80,.10); border:1px solid rgba(63,185,80,.35); color:var(--green); }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+th { color:var(--muted); font-weight:500; font-size:12px; }
+.muted { color:var(--muted); }
+.tag { display:inline-block; padding:1px 6px; border-radius:4px; font-size:11px; margin-right:4px;
+       background:rgba(31,111,235,.15); color:#79b8ff; }
+.tag.bull { background:rgba(63,185,80,.15); color:var(--green); }
+.tag.bear { background:rgba(248,81,73,.15); color:var(--red); }
+.tag.flat { background:rgba(139,148,158,.15); color:var(--muted); }
+.tag.void { background:rgba(139,148,158,.10); color:var(--muted); }
+.card { border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px; }
+.btn { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px;
+       padding:4px 10px; cursor:pointer; font-size:12px; }
+.btn:hover { border-color:var(--accent); }
+.btn.danger:hover { border-color:var(--red); color:var(--red); }
+.more { text-align:center; margin-top:10px; }
+"""
+
+
+# 页面做成模块级常量（`_check_pages_js.py` 只自动发现 `XXX_HTML = """` 这种形态，
+# 写成函数会被漏检）；路由只是薄薄一层返回常量
+CRYPTO_EVENTS_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>加密事件展览 - BSM Agent</title>
+<style>{EV_CSS}</style></head><body>
+{NAV}
+<div class="panel">
+  <b>⚡ 加密事件（金十快讯）</b>
+  <span class="muted" style="margin-left:8px;font-size:11px">只收录**明确指向某个币种**的消息</span>
+  <div id="ev-banner"></div>
+  <div id="ev-meta" class="muted" style="font-size:11px;margin:8px 0"></div>
+  <div id="ev-table"><span class="muted">加载中...</span></div>
+  <div class="more" id="ev-more"></div>
+</div>
+<script>
+""" """
+const EV_STEP = 20;
+let evLimit = EV_STEP, evTotal = 0;
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function evBanner(d) {
+  const b = document.getElementById('ev-banner');
+  if (!d.ai_configured) { b.innerHTML = '<div class="banner warn">⚠ AI 未配置（EVENT_AI_API_KEY 为空）：只抓取入库，不做判定</div>'; return; }
+  const st = (d.meta && d.meta.ai_state) || '';
+  b.innerHTML = st && st.indexOf('失败') >= 0
+    ? '<div class="banner warn">⚠ ' + esc(st) + '</div>' : '';
+}
+function evMeta(d) {
+  const m = d.meta || {};
+  const ts = s => s ? String(s).replace('T',' ').replace('Z','') : '—';
+  document.getElementById('ev-meta').textContent =
+    '水位消息 id ' + (m.watermark_msg_id || '—') + ' ｜ 上次抓取 ' + ts(m.last_poll_at)
+    + ' ｜ 上次 AI 分析 ' + ts(m.last_ai_at) + ' ｜ 共 ' + d.total + ' 条';
+}
+async function loadEvents() {
+  const r = await fetch('/api/crypto-events?limit=' + evLimit);
+  const d = await r.json();
+  evTotal = d.total; evBanner(d); evMeta(d);
+  const el = document.getElementById('ev-table');
+  if (!d.list.length) { el.innerHTML = '<span class="muted">还没有事件（等 event_agent 抓到含币种的消息）</span>'; return; }
+  el.innerHTML = '<table><thead><tr><th style="width:130px">时间</th><th style="width:150px">币种</th><th>原文</th></tr></thead><tbody>'
+    + d.list.map(e => '<tr><td class="muted">' + esc(e.ts_local) + '</td>'
+        + '<td>' + (e.coins.length ? e.coins.map(c => '<span class="tag">' + esc(c) + '</span>').join('') : '<span class="muted">—</span>') + '</td>'
+        + '<td>' + esc(e.text) + '</td></tr>').join('')
+    + '</tbody></table>';
+  document.getElementById('ev-more').innerHTML = d.list.length < evTotal
+    ? '<button class="btn" onclick="evMore()">加载更多（+' + EV_STEP + '）</button>' : '';
+}
+function evMore() { evLimit += EV_STEP; loadEvents(); }
+loadEvents(); setInterval(loadEvents, 60000);
+</script>
+</body></html>"""
+
+
+@app.get("/crypto-events", response_class=HTMLResponse)
+def page_crypto_events():
+    """事件展览：抓到的金十快讯里，**明确指向某个币种**的那些"""
+    return (CRYPTO_EVENTS_HTML.replace("{NAV}", _nav_html("crypto-events"))
+            .replace("{EV_CSS}", _EV_CSS))
+
+
+CRYPTO_EVENT_AI_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 事件判定 - BSM Agent</title>
+<style>{EV_CSS}</style></head><body>
+{NAV}
+<div class="panel">
+  <b>🤖 AI 事件判定</b>
+  <div id="ai-banner"></div>
+  <div id="ai-meta" class="muted" style="font-size:11px;margin:8px 0"></div>
+  <div style="margin:8px 0">
+    <button class="btn" onclick="setImp('')">全部</button>
+    <button class="btn" onclick="setImp('利多')">🟢 利多</button>
+    <button class="btn" onclick="setImp('利空')">🔴 利空</button>
+    <button class="btn" onclick="setImp('中性')">⚪ 中性</button>
+  </div>
+  <div id="ai-list"><span class="muted">加载中...</span></div>
+  <div class="more" id="ai-more"></div>
+</div>
+<script>
+""" """
+const AI_STEP = 20;
+let aiLimit = AI_STEP, aiTotal = 0, aiImpact = '';
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const IMP_CLS = {'利多':'bull','利空':'bear','中性':'flat','无关':'void'};
+function setImp(v) { aiImpact = v; aiLimit = AI_STEP; loadAI(); }
+function aiBanner(d) {
+  const b = document.getElementById('ai-banner');
+  if (!d.ai_configured) { b.innerHTML = '<div class="banner warn">⚠ AI 未配置（EVENT_AI_API_KEY 为空）：事件只入库，不做判定、不下单</div>'; return; }
+  const st = (d.meta && d.meta.ai_state) || '';
+  b.innerHTML = st && st.indexOf('失败') >= 0 ? '<div class="banner warn">⚠ ' + esc(st) + '</div>' : '';
+}
+function aiMeta(d) {
+  const m = d.meta || {};
+  const ts = s => s ? String(s).replace('T',' ').replace('Z','') : '—';
+  document.getElementById('ai-meta').textContent =
+    '上次 AI 分析 ' + ts(m.last_ai_at) + ' ｜ 上一批状态 ' + (m.ai_state || '—') + ' ｜ 共 ' + d.total + ' 条判定';
+}
+function posHtml(p) {
+  if (!p) return '';
+  const up = (p.unrealized_pnl || 0) >= 0;
+  return '<div style="margin-top:6px;padding-top:6px;border-top:1px dashed var(--border)">'
+    + '<span class="tag">持仓 #' + p.id + '</span> ' + esc(p.side) + ' ' + esc(p.quantity)
+    + ' @ ' + esc(p.entry_price) + ' ｜ 现价 ' + esc(p.current_price)
+    + ' ｜ 浮盈 <span style="color:' + (up ? 'var(--green)' : 'var(--red)') + '">' + esc(p.unrealized_pnl) + '</span>'
+    + ' <button class="btn danger" onclick="closePos(\\'' + esc(p.token) + '\\')">平仓</button></div>';
+}
+async function loadAI() {
+  const u = '/api/crypto-event-ai?limit=' + aiLimit + (aiImpact ? '&impact=' + encodeURIComponent(aiImpact) : '');
+  const r = await fetch(u);
+  const d = await r.json();
+  aiTotal = d.total; aiBanner(d); aiMeta(d);
+  const el = document.getElementById('ai-list');
+  if (!d.list.length) { el.innerHTML = '<span class="muted">还没有判定结果</span>'; return; }
+  el.innerHTML = d.list.map(x => {
+    const imp = x.impact || (x.status === 'failed' ? '分析失败' : '分析中');
+    const cls = IMP_CLS[x.impact] || 'void';
+    const conf = x.confidence != null ? ' 置信度 ' + x.confidence : '';
+    return '<div class="card"><div>'
+      + '<span class="tag ' + cls + '">' + esc(imp) + '</span>'
+      + '<b>' + esc(x.coin) + '</b><span class="muted" style="margin-left:8px;font-size:11px">'
+      + esc(x.ts_local) + conf + '</span></div>'
+      + '<div style="margin:6px 0">' + esc(x.text) + '</div>'
+      + (x.reason ? '<div class="muted" style="font-size:12px">依据：' + esc(x.reason) + '</div>' : '')
+      + (x.trade_reason ? '<div class="muted" style="font-size:11px">未下单：' + esc(x.trade_reason) + '</div>' : '')
+      + posHtml(x.position)
+      + '</div>';
+  }).join('');
+  document.getElementById('ai-more').innerHTML = d.list.length < aiTotal
+    ? '<button class="btn" onclick="aiMore()">加载更多（+' + AI_STEP + '）</button>' : '';
+}
+function aiMore() { aiLimit += AI_STEP; loadAI(); }
+async function closePos(tok) {
+  if (!confirm('按市价平掉 ' + tok + ' 的持仓？')) return;
+  const r = await fetch('/api/trade/market-close', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: tok})});
+  if (!r.ok) alert('平仓失败：' + (await r.text()).slice(0,120));
+  loadAI();
+}
+loadAI(); setInterval(loadAI, 60000);
+</script>
+</body></html>"""
+
+
+@app.get("/crypto-event-ai", response_class=HTMLResponse)
+def page_crypto_event_ai():
+    """AI 判定卡片：原文 + 利多/利空 + 依据 + 该事件开的仓（可平仓）"""
+    return (CRYPTO_EVENT_AI_HTML.replace("{NAV}", _nav_html("crypto-event-ai"))
+            .replace("{EV_CSS}", _EV_CSS))
+
+
+ALPHAFOX_LIVE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>跟单托管 - BSM Agent</title>
+<style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; max-width: 1400px; margin: 0 auto; font-size: 13px; }
+h2 { font-size: 18px; margin-bottom: 12px; }
+.sec { font-size: 12px; color: var(--muted); margin: 16px 0 8px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+.panel h3 { font-size: 14px; margin-bottom: 10px; }
+.metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.metric { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.metric .lbl { font-size: 11px; color: var(--muted); }
+.metric .val { font-size: 17px; font-weight: 700; margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 7px 8px; border-bottom: 1px solid var(--border); font-size: 11px; }
+td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+tr:hover { background: rgba(88,166,255,0.04); }
+.right { text-align: right; }
+.green { color: var(--green); } .red { color: var(--red); } .yellow { color: var(--yellow); } .muted { color: var(--muted); }
+.tag { padding: 1px 7px; border-radius: 8px; font-size: 11px; font-weight: 600; }
+.tag-long { background: #1a3a2a; color: var(--green); }
+.tag-short { background: #3a1a1a; color: var(--red); }
+.btn { border: 1px solid var(--border); background: #0a0e15; color: var(--muted); border-radius: 4px; padding: 3px 9px; cursor: pointer; font-size: 11px; white-space: nowrap; }
+.btn:hover { color: var(--text); border-color: var(--accent); }
+.btn-danger:hover { border-color: var(--red); color: var(--red); }
+.warn { color: var(--red); font-size: 11px; margin-top: 3px; max-width: 260px; }
+.empty { color: var(--muted); text-align: center; padding: 24px; }
+</style>
+</head>
+<body>
+
+{NAV}
+
+<h2>💼 跟单托管</h2>
+
+<div class="sec">① 币安账户概览</div>
+<div class="metrics" id="acct"><div class="empty">加载中...</div></div>
+
+<div class="sec">② 跟单盈亏</div>
+<div class="metrics" id="stats"><div class="empty">加载中...</div></div>
+
+<style>
+/* 交易员持仓卡片：**正方形**，信息不截断（多了就在卡片内滚动） */
+.trd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:10px}
+.trd-card{aspect-ratio:1/1;display:flex;flex-direction:column;border:1px solid #2a2f3a;
+          border-radius:6px;padding:10px;cursor:pointer;overflow:hidden}
+.trd-card:hover{border-color:var(--accent,#4a9eff)}
+.trd-name{font-weight:600;margin-bottom:2px}
+.trd-sum{font-size:11px;color:var(--muted);margin-bottom:6px}
+.trd-body{flex:1;overflow-y:auto}
+.trd-pos{font-size:11px;line-height:1.6;border-top:1px solid #21262d;padding:6px 0;
+         white-space:normal;overflow-wrap:anywhere}
+.trd-pos:first-child{border-top:none;padding-top:0}
+.trd-tok{font-size:11px;margin:2px 3px 0 0}
+/* 历史持仓 / 交易日志 的"加载更多"行 */
+.more-row{text-align:center;margin-top:8px}
+</style>
+<div class="panel"><h3>③ 跟单交易员持仓 <span class="muted" id="trd-cnt"></span></h3>
+  <div class="muted" style="font-size:11px;margin-bottom:6px">与「📡 跟单雷达」同一份探测数据（每 15s 一轮）；点卡片进雷达页</div>
+  <div id="trd-wrap" class="trd-grid"><div class="empty">加载中...</div></div></div>
+
+<div class="panel"><h3>④ 跟单持仓 <span class="muted" id="pos-cnt"></span></h3>
+  <div id="pos-wrap"><div class="empty">加载中...</div></div></div>
+
+<div class="panel"><h3>⑤ 历史持仓 <span class="muted" id="his-cnt"></span></h3>
+  <div id="his-wrap"><div class="empty">加载中...</div></div>
+  <div id="his-more" class="more-row"></div></div>
+
+<div class="panel"><h3>⑥ 交易日志 <span class="muted" id="log-cnt"></span></h3>
+  <div id="log-wrap"><div class="empty">加载中...</div></div>
+  <div id="log-more" class="more-row"></div></div>
+
+<div class="panel"><h3>⑦ 币种设置 <span class="muted">实盘杠杆（留空 = 用全局）</span></h3>
+  <div class="muted" style="font-size:11px;margin-bottom:6px">
+    ⚠ 只对<b>之后新开的</b>跟单仓生效：已有仓保持开仓那一刻冻结的杠杆，改设置不会回头改它<br>
+    📐 规模由「我的可用余额 ÷ 交易员保证金余额」在<b>开仓那一刻冻结</b>，之后该交易员加减多少、
+    我们就按同一比例跟多少 —— 不再按"每份名义"下单
+  </div>
+  <div id="ts-wrap"><div class="empty">加载中...</div></div>
+  <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+    <input id="ts-token" list="ts-tokens" placeholder="币种（点下面的按钮或手输）" style="width:200px">
+    <datalist id="ts-tokens"></datalist>
+    <input id="ts-lev" type="number" min="1" max="125" step="1" placeholder="杠杆（空=全局）" style="width:140px">
+    <button class="btn" onclick="saveTokenSetting()">添加 / 保存</button>
+  </div>
+  <div style="margin-top:6px">
+    <span class="muted" style="font-size:11px">已交易过的币（点一下填入）：</span>
+    <span id="ts-chips"></span>
+  </div>
+  <div style="margin-top:10px;border-top:1px dashed #2a2f3a;padding-top:8px;
+              display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+    <span class="muted" style="font-size:11px">全局：</span>
+    <span class="muted" style="font-size:11px">实盘杠杆</span>
+    <input id="g-lev" type="number" min="1" max="125" step="1" style="width:90px">
+    <span class="muted" style="font-size:11px">x</span>
+    <span class="muted" style="font-size:11px;margin-left:8px">单笔上限</span>
+    <input id="g-maxn" type="number" min="0" step="1" placeholder="0 = 不限" style="width:110px">
+    <span class="muted" style="font-size:11px">USDT</span>
+    <span class="muted" style="font-size:11px;margin-left:8px">映射比例</span>
+    <input id="g-ratio" type="number" min="0.01" max="1" step="0.01"
+           placeholder="1 = 全跟" style="width:110px">
+    <button class="btn" onclick="saveGlobalLive()">保存全局</button>
+  </div>
+</div>
+
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (v,d) => (v==null||isNaN(Number(v)))?'—':Number(v).toFixed(d==null?6:d);
+const usd = v => (v==null||isNaN(Number(v)))?'—':'$'+Number(v).toLocaleString('en-US',{maximumFractionDigits:2});
+const pnlCls = v => (Number(v)>0?'green':(Number(v)<0?'red':'muted'));
+const sign = v => (Number(v)>=0?'+':'')+num(v,2);
+// 后端已转成北京时间的字符串，直接截断显示
+const fmtDb = ts => ts ? String(ts).slice(5,16).replace('T',' ') : '—';
+// 毫秒时间戳（雷达快照里的 lastOrderTime 等）→ 北京时间
+const fmtMs = ms => { if (!ms) return '—'; try { const d = new Date(Number(ms)); return d.toLocaleString('zh-CN', {hour12:false, timeZone:'Asia/Shanghai', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).replace(/\//g,'-'); } catch { return String(ms); } };
+
+const ACT_CN = {quick_follow:'快速跟随', quick_follow_blocked:'快速跟随被拒',
+                ratio_capped:'到上限停加',
+                open:'开仓', add:'加一份', reduce:'减一份', close:'平仓',
+                rebalance_add:'对账补仓', rebalance_reduce:'对账减仓'};
+
+function metric(lbl, val, cls) {
+  return '<div class="metric"><div class="lbl">' + lbl + '</div>'
+       + '<div class="val ' + (cls||'') + '">' + val + '</div></div>';
+}
+
+function renderAcct(a) {
+  if (a.ok === false) {
+    document.getElementById('acct').innerHTML =
+      '<div class="empty red">⚠ 币安账户查询失败（权益/持仓数据暂不可用），自动重试中…</div>';
+    return;
+  }
+  document.getElementById('acct').innerHTML =
+      metric('账户权益', usd(a.equity))
+    + metric('可用余额', usd(a.available_balance))
+    + metric('占用保证金', usd(a.margin_used))
+    + metric('未实现盈亏', usd(a.unrealized_pnl), pnlCls(a.unrealized_pnl))
+    + metric('交易所持仓数', a.open_count == null ? '—' : a.open_count);
+}
+
+function rate(w, n) { return n > 0 ? (w / n * 100).toFixed(0) + '%' : '—'; }
+
+function renderStats(s) {
+  const live = s.live || {}, paper = s.paper || {}, open = s.open || {};
+  document.getElementById('stats').innerHTML =
+      metric('实盘已平仓（笔）', live.closed == null ? '—' : live.closed)
+    + metric('实盘胜率', rate(live.wins, live.closed))
+    + metric('实盘累计盈亏', sign(live.pnl), pnlCls(live.pnl))
+    + metric('纸盘已平仓（笔）', paper.closed == null ? '—' : paper.closed)
+    + metric('纸盘胜率', rate(paper.wins, paper.closed))
+    + metric('纸盘累计盈亏', sign(paper.pnl), pnlCls(paper.pnl))
+    + metric('当前浮盈·实盘',
+             open.ex_pnl == null ? '—' : sign(open.ex_pnl), pnlCls(open.ex_pnl))
+    + metric('当前浮盈·纸盘', sign(open.paper_pnl), pnlCls(open.paper_pnl))
+    + metric('未平仓·实盘', open.open_ex == null ? '—' : open.open_ex)
+    + metric('未平仓·纸盘', open.open_paper == null ? '—' : open.open_paper);
+}
+
+function renderPositions(rows) {
+  const w = document.getElementById('pos-wrap');
+  document.getElementById('pos-cnt').textContent = '(' + rows.length + ')';
+  if (!rows.length) { w.innerHTML = '<div class="empty">暂无跟单持仓</div>'; return; }
+  w.innerHTML = '<table><thead><tr>'
+    + '<th>币种</th><th>跟单员</th><th class="right">纸盘数量</th>'
+    + '<th class="right">实盘数量</th>'
+    + '<th class="right">开仓价<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th class="right">现价</th>'
+    + '<th class="right">浮动盈亏<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th>杠杆</th><th>托管状态</th><th>操作</th>'
+    + '</tr></thead><tbody>'
+    + rows.map(p => {
+        const up = p.side === 'LONG';
+        const pnl = Number(p.unrealized_pnl || 0);
+        // 恢复中(2) 也给"取消托管"：它的正常出路是下一轮追平，万一追平条件永不
+        // 满足（用户刚好取消了跟单等），行内必须有能退回非托管的按钮
+        const op = '<button class="btn btn-danger" data-close="' + esc(p.token) + '">平仓</button> '
+          + (Number(p.managed) === 0 || Number(p.managed) === 3
+              ? '<button class="btn" data-mid="' + p.id + '" data-on="1">恢复托管</button>'
+              : '<button class="btn" data-mid="' + p.id + '" data-on="0">取消托管</button>');
+        return '<tr>'
+          + '<td>' + esc(p.token) + ' <span class="tag ' + (up ? 'tag-long' : 'tag-short')
+            + '">' + (up ? '多' : '空') + '</span></td>'
+          + '<td>' + esc(p.trader_label) + '</td>'
+          + '<td class="right">' + num(p.quantity) + '</td>'
+          + '<td class="right">' + (p.ex_quantity == null
+              ? '<span class="muted">—</span>' : num(p.ex_quantity)) + '</td>'
+          + '<td class="right">' + num(p.entry_price) + ' / '
+            + (p.ex_entry == null ? '<span class="muted">—</span>' : num(p.ex_entry))
+            + '</td>'
+          + '<td class="right">' + num(p.current_price) + '</td>'
+          + '<td class="right ' + pnlCls(pnl) + '">' + sign(pnl) + ' / '
+            + (p.ex_pnl == null ? '<span class="muted">—</span>'
+                : '<span class="' + pnlCls(p.ex_pnl) + '">' + sign(p.ex_pnl) + '</span>')
+            + '</td>'
+          + '<td>' + num(p.ex_leverage != null ? p.ex_leverage : p.leverage, 0)
+            + 'x</td>'
+          + '<td><span class="' + p.state_cls + '">' + esc(p.state) + '</span>'
+            + (p.live_warn ? '<div class="warn">⚠ 实盘未建立：'
+                + esc(p.live_warn) + '</div>' : '')
+            + (p.warn ? '<div class="warn">⚠ ' + esc(p.warn) + '</div>' : '')
+            + '</td>'
+          + '<td>' + op + '</td></tr>';
+      }).join('') + '</tbody></table>';
+}
+
+// 历史/日志分页：两个面板各自独立的上限，点"加载更多"每次 +50；接口上限 200。
+// 翻页状态放模块级变量 → 轮询（5s）重渲染时不会把展开的页数收回去
+const PAGE_STEP = 50, PAGE_MAX = 200;
+let _hisLimit = PAGE_STEP, _logLimit = PAGE_STEP;
+let _reloadPending = false;   // 点"加载更多"撞上在飞的请求 → 它回来后立刻补拉
+
+function renderMoreRow(rowId, cntId, key, shown, limit, fetched) {
+  const w = document.getElementById(rowId);
+  const c = document.getElementById(cntId);
+  if (c) c.textContent = shown ? '（已显示 ' + shown + ' 条）' : '';
+  if (!w) return;
+  if (fetched < limit) { w.innerHTML = ''; return; }        // 已到底，不显示按钮
+  if (limit >= PAGE_MAX) {
+    w.innerHTML = '<span class="muted" style="font-size:11px">最多显示 '
+      + PAGE_MAX + ' 条</span>';
+    return;
+  }
+  w.innerHTML = '<button class="btn" data-more="' + key + '">加载更多</button>';
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-more]');
+  if (!b) return;
+  if (b.getAttribute('data-more') === 'his') {
+    _hisLimit = Math.min(PAGE_MAX, _hisLimit + PAGE_STEP);
+  } else {
+    _logLimit = Math.min(PAGE_MAX, _logLimit + PAGE_STEP);
+  }
+  // 有一轮请求正在飞时 load() 会直接返回 → 这次点击得等下一个轮询才生效
+  // （趋势页 30s 一轮，用户会以为按钮没反应）→ 记个待办，等它回来立刻补拉
+  if (loading) { _reloadPending = true; return; }
+  load();
+});
+
+function renderHistory(rows) {
+  const w = document.getElementById('his-wrap');
+  const show = rows.slice(0, _hisLimit);
+  if (!show.length) {
+    w.innerHTML = '<div class="empty">暂无平仓记录</div>';
+    renderMoreRow('his-more', 'his-cnt', 'his', 0, _hisLimit, rows.length);
+    return;
+  }
+  w.innerHTML = '<table><thead><tr>'
+    + '<th>平仓时间</th><th>币种</th><th>跟单员</th>'
+    + '<th class="right">开仓价<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th class="right">平仓价</th><th class="right">收益率</th>'
+    + '<th class="right">盈亏<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th>平仓原因</th>'
+    + '</tr></thead><tbody>'
+    + show.map(p => {
+        const up = p.side === 'LONG';
+        return '<tr>'
+          + '<td class="muted">' + fmtDb(p.closed_at) + '</td>'
+          + '<td>' + esc(p.token) + ' <span class="tag ' + (up ? 'tag-long' : 'tag-short')
+            + '">' + (up ? '多' : '空') + '</span></td>'
+          + '<td>' + esc(p.trader_label) + '</td>'
+          + '<td class="right">' + num(p.entry_price) + ' / '
+            + (p.live_entry == null ? '<span class="muted">—</span>'
+                : num(p.live_entry)) + '</td>'
+          + '<td class="right">' + num(p.current_price) + '</td>'
+          + '<td class="right ' + pnlCls(p.pnl_pct) + '">' + sign(p.pnl_pct) + '%</td>'
+          + '<td class="right ' + pnlCls(p.realized_pnl) + '">' + sign(p.realized_pnl)
+            + ' / '
+            + (p.live_pnl == null ? '<span class="muted">—</span>'
+                : '<span class="' + pnlCls(p.live_pnl) + '">' + sign(p.live_pnl)
+                  + '</span>') + '</td>'
+          + '<td class="muted">' + esc(p.advice || '—') + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  renderMoreRow('his-more', 'his-cnt', 'his', show.length, _hisLimit, rows.length);
+}
+
+function renderLogs(rows) {
+  const w = document.getElementById('log-wrap');
+  const show = rows.slice(0, _logLimit);
+  if (!show.length) {
+    w.innerHTML = '<div class="empty">暂无交易日志</div>';
+    renderMoreRow('log-more', 'log-cnt', 'log', 0, _logLimit, rows.length);
+    return;
+  }
+  w.innerHTML = '<table><thead><tr>'
+    + '<th>时间</th><th>币种</th><th>跟单员</th><th>动作</th>'
+    + '<th class="right">价格</th><th class="right">数量</th><th>说明</th>'
+    + '</tr></thead><tbody>'
+    + show.map(t => {
+        let detail = '';
+        try { detail = (JSON.parse(t.details_json || '{}') || {}).reason || ''; } catch(e) {}
+        return '<tr>'
+          + '<td class="muted">' + fmtDb(t.created_at) + '</td>'
+          + '<td>' + esc(t.token) + '</td>'
+          + '<td>' + esc(t.trader_label) + '</td>'
+          + '<td>' + esc(ACT_CN[t.action] || t.action || '—') + '</td>'
+          + '<td class="right">' + num(t.price) + '</td>'
+          + '<td class="right">' + num(t.quantity) + '</td>'
+          + '<td class="muted">' + esc(detail) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  renderMoreRow('log-more', 'log-cnt', 'log', show.length, _logLimit, rows.length);
+}
+
+let _tsData = null;
+
+function renderTraders(rows) {
+  const w = document.getElementById('trd-wrap');
+  document.getElementById('trd-cnt').textContent = '(' + rows.length + ')';
+  if (!rows.length) { w.innerHTML = '<div class="empty">没有跟单中的交易员</div>'; return; }
+  w.innerHTML = rows.map(t => {
+    let body, head;
+    if (t.positions == null) {
+      // 缓存里还没有这份快照（刚跟单/探测还没跑）→ 显示等待，不谎报空仓
+      head = '—';
+      body = '<div class="muted" style="font-size:11px">等待探测…</div>';
+    } else {
+      head = t.pos_count + ' 个持仓 · 名义 ' + usd(t.notional_sum)
+           + ' · 浮盈 ' + sign(t.upnl_sum);
+      // 每个持仓把能拿到的字段全列出来（不截断、不省略；卡片内滚动看全）
+      body = t.positions.length
+        ? t.positions.map(p => {
+            const up = p.side === 'LONG';
+            return '<div class="trd-pos">'
+              + '<div><b>' + esc(p.symbol) + '</b> <span class="tag '
+              + (up ? 'tag-long' : 'tag-short') + '">' + (up ? '多' : '空') + '</span>'
+              + (p.leverage ? ' <span class="muted">' + num(p.leverage, 0) + 'x</span>' : '')
+              + '</div>'
+              + '<div class="muted">数量 ' + num(p.qty) + '</div>'
+              + '<div class="muted">开仓 ' + num(p.avg_price) + ' / 标记 '
+              + num(p.mark_price) + '</div>'
+              + '<div class="muted">名义 ' + usd(p.notional)
+              + (p.liq_price ? ' · 强平 ' + num(p.liq_price) : '') + '</div>'
+              + '<div class="' + pnlCls(p.unrealized_pnl) + '">浮盈 '
+              + sign(p.unrealized_pnl) + '</div>'
+              + (p.last_order_time
+                  ? '<div class="muted">最后下单 ' + fmtMs(p.last_order_time) + '</div>'
+                  : '')
+              + '</div>';
+          }).join('')
+        : '<div class="muted" style="font-size:11px">当前空仓</div>';
+    }
+    // 卡片点击跳雷达页、⚡ 按钮走快速跟随 → 都在 #trd-wrap 的委托里分流
+    // （不能用内联 onclick：按钮在卡片内，会先冒泡到卡片的 onclick 直接跳走）
+    return '<div class="trd-card" data-card="' + esc(t.trader_id) + '">'
+      + '<div class="trd-name">' + esc(t.label)
+      + ' <button class="btn" data-qf="' + esc(t.trader_id) + '">⚡ 快速跟随</button>'
+      + '</div>'
+      + '<div class="trd-sum">' + head + '</div>'
+      + '<div class="trd-body">' + body + '</div></div>';
+  }).join('');
+}
+
+function renderTokenSettings(d, tokenOptions) {
+  _tsData = d || {};
+  const g = _tsData.globals || {};
+  // token_options 在 board 的**顶层**（不在 token_settings 里）——必须单独接进来
+  const opts = tokenOptions || _tsData.token_options || [];
+  const dl = document.getElementById('ts-tokens');
+  if (dl) {
+    dl.innerHTML = opts.map(t => '<option value="' + esc(t) + '"></option>').join('');
+  }
+  // datalist 要点进输入框/打字才弹，很多人以为"没有可选币种" → 再做一排看得见、
+  // 点一下就填入的按钮（内容与 datalist 同一份 token_options）
+  const cw = document.getElementById('ts-chips');
+  if (cw) {
+    cw.innerHTML = opts.length
+      ? opts.map(t => '<button class="btn ts-tok" data-chip="' + esc(t) + '">'
+                      + esc(t) + '</button>').join('')
+      : '<span class="muted" style="font-size:11px">（还没有交易记录，直接手输）</span>';
+  }
+  const w = document.getElementById('ts-wrap');
+  const it = _tsData.items || [];
+  renderGlobalLive(g);
+  if (!it.length) {
+    w.innerHTML = '<div class="empty">还没有每币覆盖（全部走全局：杠杆 '
+      + num(g.live_leverage, 0) + 'x'
+      + (Number(g.max_notional) > 0 ? ' / 单笔上限 ' + usd(g.max_notional) : '')
+      + '）</div>';
+    return;
+  }
+  w.innerHTML = '<table><thead><tr><th>币种</th>'
+    + '<th class="right">杠杆（空=全局）</th>'
+    + '<th class="right">生效杠杆</th><th>操作</th></tr></thead><tbody>'
+    + it.map(x =>
+      '<tr><td>' + esc(x.token)
+        + (x.has_position ? ' <span class="tag tag-long">持仓中</span>' : '')
+        + '</td>'
+      + '<td class="right">' + (x.live_leverage == null
+          ? '<span class="muted">全局</span>' : num(x.live_leverage, 0) + 'x') + '</td>'
+      + '<td class="right muted">' + num(x.eff_leverage, 0) + 'x</td>'
+      + '<td><button class="btn" data-tok="' + esc(x.token) + '" data-act="edit">编辑</button> '
+      + '<button class="btn btn-danger" data-tok="' + esc(x.token)
+        + '" data-act="clear">清除</button></td></tr>').join('')
+    + '</tbody></table>';
+}
+
+// 全局值只在"用户没在改"时回填（否则 30s 轮询会把正在输入的框冲掉）
+function renderGlobalLive(g) {
+  const lv = document.getElementById('g-lev'), mn = document.getElementById('g-maxn'),
+        rt = document.getElementById('g-ratio');
+  if (lv && document.activeElement !== lv && !lv.dataset.dirty) {
+    lv.value = g.live_leverage == null ? '' : g.live_leverage;
+  }
+  if (mn && document.activeElement !== mn && !mn.dataset.dirty) {
+    mn.value = Number(g.max_notional) > 0 ? g.max_notional : '';
+  }
+  if (rt && document.activeElement !== rt && !rt.dataset.dirty) {
+    rt.value = Number(g.live_ratio) > 0 ? g.live_ratio : 1;
+  }
+}
+
+function saveGlobalLive() {
+  const lv = document.getElementById('g-lev').value.trim();
+  const rt = document.getElementById('g-ratio').value.trim();
+  const body = {alphafox_live_max_notional:
+                  Number(document.getElementById('g-maxn').value || 0)};
+  // 空字符串过不了后端的 float 校验（422）→ 留空就当作"不改杠杆"
+  if (lv !== '') body.alphafox_live_leverage = Number(lv);
+  if (rt !== '') body.alphafox_live_ratio = Number(rt);
+  act('/api/trading/settings', body, '全局已保存（只对之后新开的仓生效）');
+  ['g-lev', 'g-maxn', 'g-ratio'].forEach(
+    id => delete document.getElementById(id).dataset.dirty);
+}
+['g-lev', 'g-maxn', 'g-ratio'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('input', () => { el.dataset.dirty = '1'; });
+});
+
+document.getElementById('ts-chips').addEventListener('click', e => {
+  const b = e.target.closest('[data-chip]');
+  if (!b) return;
+  document.getElementById('ts-token').value = b.getAttribute('data-chip');
+  document.getElementById('ts-lev').focus();
+});
+
+document.getElementById('ts-wrap').addEventListener('click', e => {
+  const b = e.target.closest('[data-act][data-tok]');
+  if (!b) return;
+  const tok = b.getAttribute('data-tok');
+  if (b.getAttribute('data-act') === 'edit') {
+    const x = ((_tsData || {}).items || []).find(v => v.token === tok) || {};
+    document.getElementById('ts-token').value = tok;
+    document.getElementById('ts-lev').value =
+      x.live_leverage == null ? '' : x.live_leverage;
+  } else if (confirm('清除 ' + tok + ' 的每币覆盖？（回到全局设置，不影响已有仓）')) {
+    act('/api/alphafox/token-settings',
+        {token: tok, live_notional: '', live_leverage: ''}, tok + ' 已清除每币覆盖');
+  }
+});
+
+function saveTokenSetting() {
+  const t = document.getElementById('ts-token').value.trim();
+  if (!t) { alert('请填币种'); return; }
+  act('/api/alphafox/token-settings',
+      {token: t, live_leverage: document.getElementById('ts-lev').value},
+      '已保存（只对之后新开的仓生效）');
+  document.getElementById('ts-token').value = '';
+  document.getElementById('ts-lev').value = '';
+}
+
+let loading = false;
+async function load() {
+  if (loading) return;   // 上一轮还没回来（网络慢/后端重试中）→ 不叠加请求
+  loading = true;
+  try {
+    // 一次取两个面板需要的最大条数，各自再按自己的上限截断渲染
+    const _lim = Math.min(PAGE_MAX, Math.max(_hisLimit, _logLimit));
+    const r = await fetch('/api/alphafox/board?limit=' + _lim);
+    const d = await r.json();
+    renderAcct(d.account || {});
+    renderStats(d.stats || {});
+    renderPositions(d.positions || []);
+    renderHistory(d.history || []);
+    renderLogs(d.trades || []);
+    renderTraders(d.traders || []);
+    renderTokenSettings(d.token_settings || {}, d.token_options || []);
+  } catch(e) { /* 保留下一次轮询重试 */ } finally {
+    loading = false;
+    if (_reloadPending) { _reloadPending = false; load(); }
+  }
+}
+
+async function act(url, body, okMsg) {
+  try {
+    const r = await fetch(url, {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json().catch(() => ({}));
+    // 平仓接口用 HTTP 200 + ok:false 回报"部分失败"（成交/记录收敛不一致）
+    if (!r.ok || d.ok === false) {
+      alert(d.detail || d.msg || '操作失败'); return;
+    }
+    if (okMsg) alert(okMsg);
+    load();
+  } catch(e) { alert('操作失败：' + e.message); }
+}
+
+document.getElementById('pos-wrap').addEventListener('click', e => {
+  const c = e.target.closest('[data-close]');
+  if (c) {
+    if (!confirm('平仓 ' + c.dataset.close + '？\\n\\n'
+        + '• 纸盘按现价平 + 币安实盘市价平（有实盘镜像时），不可撤销\\n'
+        + '• 会撤掉该币全部挂单，并平掉该币所有策略的实盘持仓\\n'
+        + '  （含你在币安同币手动开的仓，因为合约持仓是合并的）')) return;
+    act('/api/live-binance/close', {token: c.dataset.close});
+    return;
+  }
+  const m = e.target.closest('[data-mid]');
+  if (m) {
+    const on = m.dataset.on === '1';
+    if (on) {
+      if (!confirm('恢复托管？\\n\\n'
+          + '• 纸盘按该交易员当前仓位对齐（内部记账，不动交易所）\\n'
+          + '• 实盘档位按当前持仓重定（不额外下单），之后跟随交易员的新信号\\n'
+          + '• 你手动加减的数量不会被按旧档位改回；若不是整份，\\n'
+          + '  最多半份的零头会被对账校正（份数模型只能按整份跟单）')) return;
+      act('/api/alphafox/manage', {position_id: Number(m.dataset.mid), managed: true});
+    } else {
+      if (!confirm('取消托管？\\n\\n'
+          + '不再跟随该交易员的加减仓/平仓，仓位保留（纸盘和实盘都不平）。\\n'
+          + '跟单仓没有止损，取消后失去唯一退出信号，需要你自己盯盘。')) return;
+      act('/api/alphafox/manage', {position_id: Number(m.dataset.mid), managed: false});
+    }
+  }
+});
+
+// 交易员卡片：⚡ 按钮 → 快速跟随；点卡片其他地方 → 跳雷达页
+document.getElementById('trd-wrap').addEventListener('click', e => {
+  const q = e.target.closest('[data-qf]');
+  if (q) { quickFollow(q.getAttribute('data-qf')); return; }
+  const c = e.target.closest('[data-card]');
+  if (c) location.href = '/alphafox';
+});
+
+async function quickFollow(tid) {
+  // 先预览（dry_run：不写库不下单），确认后再执行
+  try {
+    const r = await fetch('/api/alphafox/quick-follow', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({trader_id: tid, dry_run: true})});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) { alert(d.detail || d.msg || '预览失败'); return; }
+    const lines = (d.results || []).map(x =>
+      '· ' + x.token + ' ' + (x.side === 'LONG' ? '多' : '空') + '  '
+      + x.action + '（交易员持仓 ' + num(x.trader_qty, 4) + '）'
+      + (x.reason ? ' — ' + x.reason : ''));
+    if (!lines.length) { alert('该交易员当前没有持仓'); return; }
+    if (!confirm('快速跟随「' + d.label + '」？\\n\\n' + lines.join('\\n')
+        + '\\n\\n· 纸盘：缺失则新建、已有则补齐到交易员当前量，并置为托管\\n'
+        + '· 实盘：按「我的可用余额 ÷ 交易员保证金」的比例跟（开仓时冻结）\\n'
+        + '· 交易所已有手动仓 / 杠杆与设置不一致的币：**纸盘照建，实盘跳过**\\n'
+        + '  （日志里记 quick_follow_blocked，处理完再点一次即可）')) return;
+    const r2 = await fetch('/api/alphafox/quick-follow', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({trader_id: tid})});
+    const d2 = await r2.json().catch(() => ({}));
+    if (!r2.ok || d2.ok === false) { alert(d2.detail || d2.msg || '跟随失败'); return; }
+    const done = (d2.results || []).map(x => x.token + ' ' + x.action
+      + (x.live ? '（实盘: ' + x.live + '）' : '')
+      + (x.reason ? ' — ' + x.reason : '')).join('\\n');
+    alert('快速跟随完成：\\n' + (done || '无变化'));
+    load();
+  } catch(e) { alert('操作失败：' + e.message); }
+}
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+SUPERTREND_LIVE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>趋势实盘 - BSM Agent</title>
+<style>
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; max-width: 1400px; margin: 0 auto; font-size: 13px; }
+h2 { font-size: 18px; margin-bottom: 12px; }
+.sec { font-size: 12px; color: var(--muted); margin: 16px 0 8px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+.panel h3 { font-size: 14px; margin-bottom: 10px; }
+.metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.metric { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.metric .lbl { font-size: 11px; color: var(--muted); }
+.metric .val { font-size: 17px; font-weight: 700; margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 7px 8px; border-bottom: 1px solid var(--border); font-size: 11px; }
+td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+tr:hover { background: rgba(88,166,255,0.04); }
+.right { text-align: right; }
+.green { color: var(--green); } .red { color: var(--red); } .yellow { color: var(--yellow); } .muted { color: var(--muted); }
+.tag { padding: 1px 7px; border-radius: 8px; font-size: 11px; font-weight: 600; }
+.tag-long { background: #1a3a2a; color: var(--green); }
+.tag-short { background: #3a1a1a; color: var(--red); }
+.tag-pend { background: #3a2f1a; color: var(--yellow); }
+.tag-live { background: #1a2a3a; color: var(--accent); }
+.btn { border: 1px solid var(--border); background: #0a0e15; color: var(--muted); border-radius: 4px; padding: 3px 9px; cursor: pointer; font-size: 11px; white-space: nowrap; }
+.btn:hover { color: var(--text); border-color: var(--accent); }
+.btn-danger:hover { border-color: var(--red); color: var(--red); }
+.warn { color: var(--red); font-size: 11px; margin-top: 3px; max-width: 260px; }
+.empty { color: var(--muted); text-align: center; padding: 24px; }
+tr[data-tok] { cursor: pointer; }
+/* 历史持仓 / 交易日志 的"加载更多"行 */
+.more-row { text-align: center; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+{NAV}
+
+<h2>📈 主流趋势实盘</h2>
+
+<div class="sec">① 币安账户概览 <span class="muted">（账户级：跟单/链上/趋势共用同一个币安账户，最后三项才是趋势归属）</span></div>
+<div class="metrics" id="acct"><div class="empty">加载中...</div></div>
+
+<div class="sec">② 策略盈亏 <span class="muted">（纸盘 = 策略记账口径 / 实盘 = 真实成交口径）</span></div>
+<div class="metrics" id="stats"><div class="empty">加载中...</div></div>
+
+<div class="panel"><h3>③ 监控币种 <span class="muted">（与「主流币趋势」监控页同一份数据；点行去该页改参数）</span></h3>
+  <div id="tk-wrap"><div class="empty">加载中...</div></div></div>
+
+<div class="panel"><h3>④ 持仓 <span class="muted" id="pos-cnt"></span></h3>
+  <div id="pos-wrap"><div class="empty">加载中...</div></div></div>
+
+<div class="panel"><h3>⑤ 历史持仓 <span class="muted" id="his-cnt"></span></h3>
+  <div id="his-wrap"><div class="empty">加载中...</div></div>
+  <div id="his-more" class="more-row"></div></div>
+
+<div class="panel"><h3>⑥ 交易日志 <span class="muted">（实盘层动作：挂/改/撤止损、限价腿、对账补减仓）</span>
+  <span class="muted" id="log-cnt"></span></h3>
+  <div id="log-wrap"><div class="empty">加载中...</div></div>
+  <div id="log-more" class="more-row"></div></div>
+
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (v,d) => (v==null||isNaN(Number(v)))?'—':Number(v).toFixed(d==null?6:d);
+const usd = v => (v==null||isNaN(Number(v)))?'—':'$'+Number(v).toLocaleString('en-US',{maximumFractionDigits:2});
+const pnlCls = v => (Number(v)>0?'green':(Number(v)<0?'red':'muted'));
+const sign = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=0?'+':'')+Number(v).toFixed(2);
+const px = v => (v==null||isNaN(Number(v)))?'—':Number(v).toLocaleString('en-US',{maximumFractionDigits:6});
+// 后端已转成北京时间的字符串，直接截断显示
+const fmtDb = ts => ts ? String(ts).slice(5,16).replace('T',' ') : '—';
+
+const ACT_CN = {open:'开仓', close:'平仓', sl_set:'挂止损', sl_update:'改止损',
+                sl_cancel:'撤止损', limit_cancel:'撤挂单',
+                rebalance_add:'对账补仓', rebalance_reduce:'对账减仓',
+                rebuild:'补建记录'};
+const ST_CN = {HOLDING:'持仓中', PENDING:'挂单等待', WAITING:'等待闭合',
+               WAIT_DIR:'等待方向', FLAT:'空仓', PAUSED:'已暂停'};
+
+function metric(lbl, val, cls) {
+  return '<div class="metric"><div class="lbl">' + lbl + '</div>'
+       + '<div class="val ' + (cls||'') + '">' + val + '</div></div>';
+}
+function rate(w, n) { return n > 0 ? (w / n * 100).toFixed(0) + '%' : '—'; }
+
+function renderAcct(a, s) {
+  const live = (s || {}).live || {};
+  if (a.ok === false) {
+    document.getElementById('acct').innerHTML =
+      '<div class="empty red">⚠ 币安账户查询失败（权益/持仓数据暂不可用），自动重试中…</div>';
+    return;
+  }
+  document.getElementById('acct').innerHTML =
+      metric('账户权益', usd(a.equity))
+    + metric('可用余额', usd(a.available_balance))
+    + metric('占用保证金', usd(a.margin_used))
+    + metric('未实现盈亏', usd(a.unrealized_pnl), pnlCls(a.unrealized_pnl))
+    + metric('交易所持仓数', a.open_count == null ? '—' : a.open_count)
+    + metric('趋势实盘·持仓', live.open_count == null ? '—' : live.open_count)
+    + metric('趋势实盘·挂单腿', live.pending_count == null ? '—' : live.pending_count)
+    + metric('趋势实盘·占用保证金', live.margin_used == null ? '—' : usd(live.margin_used));
+}
+
+function renderStats(s) {
+  const live = s.live || {}, paper = s.paper || {}, open = s.open || {},
+        acc = s.account || {};
+  document.getElementById('stats').innerHTML =
+      metric('纸盘已平仓（笔）', paper.closed == null ? '—' : paper.closed)
+    + metric('纸盘胜率', rate(paper.wins, paper.closed))
+    + metric('纸盘累计盈亏', sign(paper.pnl), pnlCls(paper.pnl))
+    + metric('纸盘权益', usd(acc.equity))
+    + metric('纸盘可用 / 占用', usd(acc.available_balance) + ' / ' + usd(acc.locked_margin))
+    + metric('实盘已平仓（笔）', live.closed == null ? '—' : live.closed)
+    + metric('实盘胜率', rate(live.wins, live.closed))
+    + metric('实盘累计盈亏', sign(live.pnl), pnlCls(live.pnl))
+    + metric('当前浮盈·纸盘', sign(open.paper_pnl), pnlCls(open.paper_pnl))
+    + metric('当前浮盈·实盘',
+             open.ex_pnl == null ? '—' : sign(open.ex_pnl), pnlCls(open.ex_pnl))
+    + metric('未平仓·纸盘', (open.open_paper == null ? '—' : open.open_paper)
+             + (open.open_pending ? '（挂单 ' + open.open_pending + '）' : ''))
+    + metric('未平仓·实盘', open.open_ex == null ? '—' : open.open_ex);
+}
+
+function renderCards(cards, params) {
+  const w = document.getElementById('tk-wrap');
+  if (!cards.length) { w.innerHTML = '<div class="empty">监控列表为空</div>'; return; }
+  const gN = params.notional_usd, gL = params.leverage;
+  w.innerHTML = '<table><thead><tr>'
+    + '<th>币种</th><th>趋势</th><th class="right">轨道（上 / 下）</th>'
+    + '<th class="right">现价</th><th>状态</th><th>槽位</th>'
+    + '<th class="right">名义 / 杠杆</th><th>模式</th><th>备注</th>'
+    + '</tr></thead><tbody>'
+    + cards.map(c => {
+        const up = c.trend === 'UP';
+        const sl = [];
+        if (c.position) sl.push('<span class="tag tag-long">持仓</span> '
+          + num(c.position.quantity, 4) + ' @ ' + px(c.position.entry_price));
+        if (c.pending) sl.push('<span class="tag tag-pend">挂单</span> '
+          + num(c.pending.quantity, 4) + ' @ ' + px(c.pending.limit_price));
+        const notes = [];
+        if (c.paused) notes.push('⏸ 暂停');
+        if (c.live_blocked_by) notes.push('被跟单占用（镜像暂停）');
+        if (c.fetch_error) notes.push('取数异常：' + esc(c.fetch_error));
+        return '<tr data-tok="' + esc(c.token) + '" onclick="location.href=\\'/supertrend\\'">'
+          + '<td>' + esc(c.token) + '</td>'
+          + '<td class="' + (up ? 'green' : 'red') + '">' + (c.trend || '—') + '</td>'
+          + '<td class="right muted">' + px(c.upper_band) + ' / ' + px(c.lower_band) + '</td>'
+          + '<td class="right">' + px(c.last_price) + '</td>'
+          + '<td>' + (ST_CN[c.state] || c.state || '—') + '</td>'
+          + '<td>' + (sl.join('<br>') || '<span class="muted">—</span>') + '</td>'
+          + '<td class="right muted">' + usd(c.notional_usd != null ? c.notional_usd : gN)
+            + ' / ' + num(c.leverage != null ? c.leverage : gL, 0) + 'x</td>'
+          + '<td>' + (c.live_mode ? '<span class="tag tag-live">实盘</span>'
+                                  : '<span class="muted">纸盘</span>') + '</td>'
+          + '<td class="muted">' + (notes.join('；') || '—') + '</td></tr>';
+      }).join('') + '</tbody></table>';
+}
+
+function renderPositions(rows, live) {
+  const w = document.getElementById('pos-wrap');
+  document.getElementById('pos-cnt').textContent = '(' + rows.length + ')';
+  const warn = (live && live.orphan_count)
+    ? '<div class="warn">⚠ 实盘有 ' + live.orphan_count + ' 条记录没有对应的活跃纸盘仓（'
+      + esc((live.orphan_tokens || []).join(' '))
+      + '）—— 收敛中，或撤单/平仓卡住了需要人工看一眼</div>' : '';
+  if (!rows.length) {
+    w.innerHTML = warn + '<div class="empty">暂无持仓</div>';
+    return;
+  }
+  w.innerHTML = warn + '<table><thead><tr>'
+    + '<th>币种</th><th>槽位</th>'
+    + '<th class="right">纸盘数量</th><th class="right">实盘数量</th>'
+    + '<th class="right">开仓价<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th class="right">现价</th>'
+    + '<th class="right">浮动盈亏<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th>杠杆</th>'
+    + '<th class="right">止损<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th>操作</th></tr></thead><tbody>'
+    + rows.map(p => {
+        const up = p.side === 'LONG';
+        const pend = p.status === 'PENDING';
+        const liveSl = p.live_sl == null
+          ? (p.live_id ? '<span class="red">无</span>' : '<span class="muted">—</span>')
+          : px(p.live_sl) + (p.live_sl_qty == null ? ''
+              : ' <span class="muted">×' + num(p.live_sl_qty, 4) + '</span>');
+        const op = '<button class="btn btn-danger" data-close="' + esc(p.token) + '">平仓</button>';
+        return '<tr>'
+          + '<td>' + esc(p.token) + ' <span class="tag ' + (up ? 'tag-long' : 'tag-short')
+            + '">' + (up ? '多' : '空') + '</span></td>'
+          + '<td>' + (pend ? '<span class="tag tag-pend">挂单</span>'
+                            : '<span class="tag tag-long">持仓</span>')
+            + (p.live_status === 'PENDING'
+                ? ' <span class="muted" style="font-size:10px">实盘挂单 @'
+                  + px(p.live_limit_price) + '</span>' : '') + '</td>'
+          + '<td class="right">' + num(p.quantity, 4) + '</td>'
+          + '<td class="right">' + (p.ex_qty == null
+              ? '<span class="muted">—</span>' : num(p.ex_qty, 4)) + '</td>'
+          + '<td class="right">' + px(p.entry_price) + ' / '
+            + (p.ex_entry == null ? '<span class="muted">—</span>' : px(p.ex_entry)) + '</td>'
+          + '<td class="right">' + px(p.current_price) + '</td>'
+          + '<td class="right ' + pnlCls(p.unrealized_pnl) + '">' + sign(p.unrealized_pnl)
+            + ' / '
+            + (p.ex_pnl == null ? '<span class="muted">—</span>'
+                : '<span class="' + pnlCls(p.ex_pnl) + '">' + sign(p.ex_pnl) + '</span>')
+            + '</td>'
+          + '<td>' + num(p.leverage, 0) + 'x'
+            + (p.ex_leverage != null && Number(p.ex_leverage) !== Number(p.leverage)
+                ? ' <span class="muted">(实盘 ' + num(p.ex_leverage, 0) + 'x)</span>' : '')
+            + '</td>'
+          + '<td class="right">' + px(p.stop_loss_price) + ' / ' + liveSl + '</td>'
+          + '<td>' + op + '</td></tr>';
+      }).join('') + '</tbody></table>';
+}
+
+// 历史/日志分页（与跟单托管页同一套语义）：各自独立上限，点"加载更多"每次 +50，
+// 接口上限 200；状态放模块级变量 → 30s 轮询重渲染不会把展开的页数收回去
+const PAGE_STEP = 50, PAGE_MAX = 200;
+let _hisLimit = PAGE_STEP, _logLimit = PAGE_STEP;
+let _reloadPending = false;   // 点"加载更多"撞上在飞的请求 → 它回来后立刻补拉
+
+function renderMoreRow(rowId, cntId, key, shown, limit, fetched) {
+  const w = document.getElementById(rowId);
+  const c = document.getElementById(cntId);
+  if (c) c.textContent = shown ? '（已显示 ' + shown + ' 条）' : '';
+  if (!w) return;
+  if (fetched < limit) { w.innerHTML = ''; return; }        // 已到底，不显示按钮
+  if (limit >= PAGE_MAX) {
+    w.innerHTML = '<span class="muted" style="font-size:11px">最多显示 '
+      + PAGE_MAX + ' 条</span>';
+    return;
+  }
+  w.innerHTML = '<button class="btn" data-more="' + key + '">加载更多</button>';
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-more]');
+  if (!b) return;
+  if (b.getAttribute('data-more') === 'his') {
+    _hisLimit = Math.min(PAGE_MAX, _hisLimit + PAGE_STEP);
+  } else {
+    _logLimit = Math.min(PAGE_MAX, _logLimit + PAGE_STEP);
+  }
+  // 有一轮请求正在飞时 load() 会直接返回 → 这次点击得等下一个轮询才生效
+  // （趋势页 30s 一轮，用户会以为按钮没反应）→ 记个待办，等它回来立刻补拉
+  if (loading) { _reloadPending = true; return; }
+  load();
+});
+
+function renderHistory(rows) {
+  const w = document.getElementById('his-wrap');
+  const show = rows.slice(0, _hisLimit);
+  if (!show.length) {
+    w.innerHTML = '<div class="empty">暂无平仓记录</div>';
+    renderMoreRow('his-more', 'his-cnt', 'his', 0, _hisLimit, rows.length);
+    return;
+  }
+  w.innerHTML = '<table><thead><tr>'
+    + '<th>平仓时间</th><th>币种</th><th>方向</th>'
+    + '<th class="right">开仓价<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th class="right">平仓价</th><th class="right">收益率</th>'
+    + '<th class="right">盈亏<div class="muted" style="font-size:10px">纸盘/实盘</div></th>'
+    + '<th>平仓原因</th><th>平仓时趋势</th>'
+    + '</tr></thead><tbody>'
+    + show.map(p => {
+        const up = p.side === 'LONG';
+        const snap = p.close_snap || {};
+        return '<tr>'
+          + '<td class="muted">' + fmtDb(p.closed_at) + '</td>'
+          + '<td>' + esc(p.token) + '</td>'
+          + '<td><span class="tag ' + (up ? 'tag-long' : 'tag-short') + '">'
+            + (up ? '多' : '空') + '</span></td>'
+          + '<td class="right">' + px(p.entry_price) + ' / '
+            + (p.live_entry == null ? '<span class="muted">—</span>' : px(p.live_entry))
+            + '</td>'
+          + '<td class="right">' + px(p.current_price) + '</td>'
+          + '<td class="right ' + pnlCls(p.pnl_pct) + '">' + sign(p.pnl_pct) + '%</td>'
+          + '<td class="right ' + pnlCls(p.realized_pnl) + '">' + sign(p.realized_pnl)
+            + ' / '
+            + (p.live_pnl == null ? '<span class="muted">—</span>'
+                : '<span class="' + pnlCls(p.live_pnl) + '">' + sign(p.live_pnl)
+                  + '</span>') + '</td>'
+          + '<td class="muted">' + esc(p.advice || '—') + '</td>'
+          + '<td class="muted">' + (snap.trend
+              ? '<span class="' + (snap.trend === 'UP' ? 'green' : 'red') + '">'
+                + esc(snap.trend) + '</span>' : '—') + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  renderMoreRow('his-more', 'his-cnt', 'his', show.length, _hisLimit, rows.length);
+}
+
+function renderLogs(rows) {
+  const w = document.getElementById('log-wrap');
+  const show = rows.slice(0, _logLimit);
+  if (!show.length) {
+    w.innerHTML = '<div class="empty">暂无交易日志</div>';
+    renderMoreRow('log-more', 'log-cnt', 'log', 0, _logLimit, rows.length);
+    return;
+  }
+  w.innerHTML = '<table><thead><tr>'
+    + '<th>时间</th><th>币种</th><th>动作</th>'
+    + '<th class="right">价格</th><th class="right">数量</th>'
+    + '<th>单号</th><th>说明</th>'
+    + '</tr></thead><tbody>'
+    + show.map(t => {
+        let detail = '';
+        try { detail = (JSON.parse(t.details_json || '{}') || {}).reason || ''; } catch(e) {}
+        return '<tr>'
+          + '<td class="muted">' + fmtDb(t.created_at) + '</td>'
+          + '<td>' + esc(t.token) + '</td>'
+          + '<td>' + esc(ACT_CN[t.action] || t.action || '—') + '</td>'
+          + '<td class="right">' + px(t.price) + '</td>'
+          + '<td class="right">' + num(t.quantity, 4) + '</td>'
+          + '<td class="muted">' + esc(t.exchange_order_id || '—') + '</td>'
+          + '<td class="muted">' + esc(detail) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  renderMoreRow('log-more', 'log-cnt', 'log', show.length, _logLimit, rows.length);
+}
+
+let loading = false;
+async function load() {
+  if (loading) return;   // 上一轮还没回来（网络慢/后端重试中）→ 不叠加请求
+  loading = true;
+  try {
+    // 一次取两个面板需要的最大条数，各自再按自己的上限截断渲染
+    const _lim = Math.min(PAGE_MAX, Math.max(_hisLimit, _logLimit));
+    const r = await fetch('/api/supertrend/board?limit=' + _lim);
+    const d = await r.json();
+    renderAcct(d.account || {}, d.stats || {});
+    renderStats(d.stats || {});
+    renderCards(d.cards || [], d.params || {});
+    renderPositions(d.positions || [], d.stats && d.stats.live);
+    renderHistory(d.history || []);
+    renderLogs(d.trades || []);
+  } catch(e) { /* 保留下一次轮询重试 */ } finally {
+    loading = false;
+    if (_reloadPending) { _reloadPending = false; load(); }
+  }
+}
+
+document.getElementById('pos-wrap').addEventListener('click', e => {
+  const c = e.target.closest('[data-close]');
+  if (!c) return;
+  if (!confirm('平仓 ' + c.dataset.close + '？\\n\\n'
+      + '• 纸盘按现价平 + 币安实盘市价平（该币开了实盘镜像时），不可撤销\\n'
+      + '• 会撤掉该币全部挂单，并暂停该币的趋势监控\\n'
+      + '• 会平掉该币所有策略的实盘持仓\\n'
+      + '  （含你在币安同币手动开的仓，因为合约持仓是合并的）')) return;
+  fetch('/api/live-binance/close', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: c.dataset.close})})
+    .then(r => r.json().catch(() => ({})))
+    .then(d => { if (d && d.ok === false) alert(d.msg || d.detail || '平仓部分失败'); load(); })
+    .catch(e => alert('操作失败：' + e.message));
+});
+
+load();
+setInterval(load, 30000);   // 与后端 overview 缓存 TTL 对齐（避免重复触达币安）
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/alphafox-live", response_class=HTMLResponse)
+def alphafox_live_page():
+    return HTMLResponse(
+        content=ALPHAFOX_LIVE_HTML.replace("{NAV}", _nav_html("alphafox-live")),
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
 @app.get("/supertrend", response_class=HTMLResponse)
 def supertrend_page():
     return HTMLResponse(
         content=SUPERTREND_HTML.replace("{NAV}", _nav_html("supertrend")),
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@app.get("/supertrend-live", response_class=HTMLResponse)
+def supertrend_live_page():
+    return HTMLResponse(
+        content=SUPERTREND_LIVE_HTML.replace("{NAV}", _nav_html("supertrend-live")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -8475,7 +10874,9 @@ function renderTrades(list) {
   }
   let h = '<table><thead><tr><th>Token</th><th>操作</th><th class="right">价格</th><th class="right">数量</th><th>时间</th></tr></thead><tbody>';
   for (const t of list.slice(0,20)) {
-    const actionLabel = t.action === 'open' ? '🔵开仓' : t.action === 'close' ? '🔴平仓' : t.action;
+    const actMap = {open:'🔵开仓', close:'🔴平仓', add:'➕跟单加仓', reduce:'➖跟单减仓',
+                    rebalance_add:'⚖️对账补仓', rebalance_reduce:'⚖️对账减仓'};
+    const actionLabel = actMap[t.action] || t.action;
     h += '<tr>' +
       '<td style="font-weight:bold">' + (t.token||'') + '</td>' +
       '<td>' + actionLabel + '</td>' +
@@ -8500,6 +10901,253 @@ setInterval(load, 30000);
 def live_onchain_page():
     return HTMLResponse(
         content=LIVE_ONCHAIN_HTML.replace("{NAV}", _nav_html("live-onchain")),
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+LIVE_BINANCE_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>币安实盘</title>
+<style>
+:root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #1f6feb; --green: #3fb950; --red: #f85149; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; padding: 20px; }
+.nav-bar { display: flex; justify-content: center; gap: 16px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+.nav-bar a { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-bar a:hover { color: var(--text); }
+.nav-bar a.active { color: var(--accent); font-weight: 600; }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown > a { cursor: pointer; color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav-dropdown > a:hover { color: var(--text); }
+.nav-dropdown-content { display: none; position: absolute; top: 100%; left: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; min-width: 200px; z-index: 10; padding: 8px 0; }
+.nav-dropdown:hover .nav-dropdown-content { display: block; }
+.nav-dropdown-content a { display: block; padding: 6px 16px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+.nav-dropdown-content a:hover { color: var(--text); background: rgba(88,166,255,0.08); }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin-bottom: 20px; }
+h2 { font-size: 16px; margin-bottom: 12px; color: var(--accent); }
+.metric-row { display: flex; gap: 24px; flex-wrap: wrap; }
+.metric { display: flex; flex-direction: column; gap: 2px; }
+.metric .lbl { font-size: 11px; color: var(--muted); }
+.metric .val { font-size: 20px; font-weight: 700; }
+.green { color: var(--green); }
+.red { color: var(--red); }
+.muted { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 11px; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+tr:hover { background: rgba(88,166,255,0.04); }
+.right { text-align: right; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge-green { background: #1a3a2a; color: var(--green); }
+.badge-red { background: #3a1a1a; color: var(--red); }
+.badge-blue { background: #12233d; color: var(--accent); }
+.btn-close { background: #3a1a1a; color: var(--red); border: 1px solid #6e2b2b; border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.btn-close:hover { background: #4d2222; }
+.btn-close:disabled { opacity: 0.5; cursor: wait; }
+</style>
+</head>
+<body>
+
+{NAV}
+
+<h1>💹 币安实盘</h1>
+
+<div class="panel">
+  <h2>账户概览</h2>
+  <div class="metric-row">
+    <div class="metric"><div class="lbl">账户权益</div><div class="val" id="ov-equity">--</div></div>
+    <div class="metric"><div class="lbl">可用余额</div><div class="val" id="ov-available">--</div></div>
+    <div class="metric"><div class="lbl">占用保证金</div><div class="val" id="ov-margin">--</div></div>
+    <div class="metric"><div class="lbl">未实现盈亏</div><div class="val" id="ov-uniq">--</div></div>
+    <div class="metric"><div class="lbl">当前持仓</div><div class="val" id="ov-count">--</div></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>当前持仓</h2>
+  <div id="positions-table"><span class="muted">加载中...</span></div>
+</div>
+
+<div class="panel">
+  <h2>当前挂单</h2>
+  <div id="orders-table"><span class="muted">加载中...</span></div>
+</div>
+
+<div class="panel">
+  <h2>历史持仓</h2>
+  <div id="history-table"><span class="muted">加载中...</span></div>
+</div>
+
+<div class="panel">
+  <h2>交易日志</h2>
+  <div id="trades-table"><span class="muted">加载中...</span></div>
+</div>
+
+<script>
+const fmtUsd = v => (v!=null && !isNaN(Number(v))) ? '$'+Number(v).toFixed(2) : '--';
+const fmtPct = v => (v!=null && !isNaN(Number(v))) ? (v>=0?'+':'')+Number(v).toFixed(2)+'%' : '--';
+const fmtPrice = v => (v==null||isNaN(Number(v)))?'—':(Number(v)>=1?Number(v).toFixed(4):Number(v).toFixed(6));
+const fmtQty = v => (v==null||isNaN(Number(v)))?'—':Number(v).toFixed(4);
+const esc = s => String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const stLabel = s => s === 'supertrend' ? '主流趋势' : s === 'onchain' ? '链上监控' : s === 'alphafox' ? '跟单雷达' : (s || '—');
+
+async function load() {
+  try {
+    const [ov, pos, orders, hist, trades] = await Promise.all([
+      fetch('/api/live-binance/overview'),
+      fetch('/api/live-binance/positions'),
+      fetch('/api/live-binance/orders'),
+      fetch('/api/live-binance/history'),
+      fetch('/api/live-binance/trades')
+    ]);
+    const o = await ov.json();
+    document.getElementById('ov-equity').textContent = fmtUsd(o.equity);
+    document.getElementById('ov-available').textContent = fmtUsd(o.available_balance);
+    document.getElementById('ov-margin').textContent = fmtUsd(o.margin_used);
+    const pnl = o.unrealized_pnl || 0;
+    const pnlEl = document.getElementById('ov-uniq');
+    pnlEl.textContent = fmtUsd(pnl);
+    pnlEl.className = 'val ' + (pnl >= 0 ? 'green' : 'red');
+    document.getElementById('ov-count').textContent = o.open_count || 0;
+
+    renderPositions(await pos.json());
+    renderOrders(await orders.json());
+    renderHistory(await hist.json());
+    renderTrades(await trades.json());
+  } catch(e) { console.error('load:', e); }
+}
+
+function renderPositions(list) {
+  const el = document.getElementById('positions-table');
+  if (!list || !list.length) {
+    el.innerHTML = '<span class="muted">无活跃持仓</span>';
+    return;
+  }
+  let h = '<table><thead><tr><th>Token</th><th>策略</th><th>方向</th><th class="right">入场价</th><th class="right">现价</th><th class="right">数量</th><th>杠杆</th><th class="right">PnL</th><th>操作</th></tr></thead><tbody>';
+  for (const p of list) {
+    const pnlCls = (p.unrealized_pnl||0) >= 0 ? 'green' : 'red';
+    h += '<tr>' +
+      '<td style="font-weight:bold;color:var(--accent)">' + esc(p.token) + '</td>' +
+      '<td>' + stLabel(p.strategy) + '</td>' +
+      '<td>' + (p.side==='SHORT' ? '<span class="badge badge-red">空</span>' : '<span class="badge badge-green">多</span>') + '</td>' +
+      '<td class="right">' + fmtPrice(p.entry_price) + '</td>' +
+      '<td class="right">' + fmtPrice(p.mark_price) + '</td>' +
+      '<td class="right">' + fmtQty(p.quantity) + '</td>' +
+      '<td>' + (p.leverage||1) + 'x</td>' +
+      '<td class="right ' + pnlCls + '">' + fmtUsd(p.unrealized_pnl) + '</td>' +
+      '<td><button class="btn-close" onclick="closePos(this, \\'' + esc(p.token) + '\\')">平仓</button></td>' +
+    '</tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderOrders(d) {
+  const el = document.getElementById('orders-table');
+  const normal = (d.normal || []).map(o => ({
+    kind: '限价', oid: o.order_id, sym: o.symbol, side: o.side,
+    price: o.price, qty: o.quantity, pside: o.position_side,
+  }));
+  const algos = (d.algos || []).map(o => ({
+    kind: (o.type||'').includes('STOP') ? '止损条件' : (o.type||'条件'),
+    oid: o.order_id, sym: o.symbol, side: o.side,
+    price: o.price, qty: o.quantity, pside: o.position_side,
+  }));
+  const all = normal.concat(algos);
+  if (!all.length) { el.innerHTML = '<span class="muted">无挂单</span>'; return; }
+  let h = '<table><thead><tr><th>类型</th><th>交易对</th><th>方向</th><th>仓位侧</th><th class="right">价格</th><th class="right">数量</th><th>单号</th></tr></thead><tbody>';
+  for (const o of all) {
+    h += '<tr>' +
+      '<td>' + o.kind + '</td>' +
+      '<td style="font-weight:bold">' + esc(o.sym) + '</td>' +
+      '<td>' + (o.side === 'SELL' ? '<span class="badge badge-red">卖</span>' : '<span class="badge badge-green">买</span>') + '</td>' +
+      '<td>' + esc(o.pside || '—') + '</td>' +
+      '<td class="right">' + fmtPrice(o.price) + '</td>' +
+      '<td class="right">' + fmtQty(o.qty) + '</td>' +
+      '<td class="muted">' + esc(o.oid) + '</td>' +
+    '</tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderHistory(list) {
+  const el = document.getElementById('history-table');
+  if (!list || !list.length) {
+    el.innerHTML = '<span class="muted">暂无平仓记录</span>';
+    return;
+  }
+  let h = '<table><thead><tr><th>Token</th><th>策略</th><th>方向</th><th class="right">入场价</th><th class="right">数量</th><th class="right">实现盈亏</th><th>开仓时间</th><th>平仓时间</th></tr></thead><tbody>';
+  for (const p of list) {
+    const cls = (p.realized_pnl||0) >= 0 ? 'green' : 'red';
+    h += '<tr>' +
+      '<td style="font-weight:bold;color:var(--accent)">' + esc(p.token) + '</td>' +
+      '<td>' + stLabel(p.strategy) + '</td>' +
+      '<td>' + esc(p.side || '—') + '</td>' +
+      '<td class="right">' + fmtPrice(p.entry_price) + '</td>' +
+      '<td class="right">' + fmtQty(p.quantity) + '</td>' +
+      '<td class="right ' + cls + '">' + fmtUsd(p.realized_pnl) + '</td>' +
+      '<td>' + (p.created_at||'').substring(0,16) + '</td>' +
+      '<td>' + (p.closed_at||'').substring(0,16) + '</td>' +
+    '</tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderTrades(list) {
+  const el = document.getElementById('trades-table');
+  if (!list || !list.length) {
+    el.innerHTML = '<span class="muted">无交易记录</span>';
+    return;
+  }
+  let h = '<table><thead><tr><th>Token</th><th>策略</th><th>操作</th><th class="right">价格</th><th class="right">数量</th><th>时间</th></tr></thead><tbody>';
+  for (const t of list.slice(0, 30)) {
+    const actionLabel = t.action === 'open' ? '🔵开仓' : t.action === 'close' ? '🔴平仓' : esc(t.action);
+    h += '<tr>' +
+      '<td style="font-weight:bold">' + esc(t.token) + '</td>' +
+      '<td>' + stLabel(t.strategy) + '</td>' +
+      '<td>' + actionLabel + '</td>' +
+      '<td class="right">' + fmtPrice(t.price) + '</td>' +
+      '<td class="right">' + fmtQty(t.quantity) + '</td>' +
+      '<td>' + (t.created_at||'').substring(0,16) + '</td>' +
+    '</tr>';
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+async function closePos(btn, token) {
+  if (!confirm('确认平仓 ' + token + ' 的全部实盘持仓？\\n（主流趋势币会同时暂停监控，防止策略重开）')) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/live-binance/close', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: token})
+    });
+    const d = await r.json();
+    if (d.ok) { alert(token + ' 已平仓'); load(); }
+    else alert('平仓失败：' + (d.detail || '未知错误'));
+  } catch(e) { alert('平仓失败：' + e.message); }
+  btn.disabled = false;
+}
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/live-binance", response_class=HTMLResponse)
+def live_binance_page():
+    return HTMLResponse(
+        content=LIVE_BINANCE_HTML.replace("{NAV}", _nav_html("live-binance")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 

@@ -346,7 +346,7 @@ def execute_close(conn, decision: dict) -> dict:
 
 
 def one_scan():
-    """每2秒执行一次：读 Agent 决策 + 系统自动开仓 → 风控检查 → 执行"""
+    """每1秒执行一次：读 Agent 决策 + 系统自动开仓 → 风控检查 → 执行"""
     with storage.get_conn() as conn:
         settings = storage.trading_settings_get(conn)
 
@@ -499,7 +499,7 @@ def main():
             traceback.print_exc()
             time.sleep(3)
             continue
-        time.sleep(2)
+        time.sleep(1)
     console.print("[green]自动交易循环已退出[/green]")
 
 

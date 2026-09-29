@@ -7,6 +7,7 @@ import os
 
 import json
 import os
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -206,6 +207,115 @@ def _is_core_event(name: str) -> bool:
     return any(kw in low for kw in _CORE_EVENT_KEYWORDS)
 
 
+# OKX 事件名 → 中文。表按 OKX 真实命名逐个核对（2026-09-11 实拉 66 个事件名）。
+# 表里没有的原样返回英文——宁可露英文也不要显示错误的中文。
+_MACRO_EVENT_CN = {
+    "ADP Employment Change": "ADP 就业人数",
+    "ADP Employment Change Weekly": "ADP 就业人数（周度）",
+    "API Crude Oil Stock Change": "API 原油库存变化",
+    "Building Permits MoM Prel": "营建许可月率（初值）",
+    "Building Permits Prel": "营建许可（初值）",
+    "Business Inventories MoM": "商业库存月率",
+    "CB Consumer Confidence": "谘商会消费者信心指数",
+    "CPI s.a": "CPI（季调）",   # 裸 "CPI" 走英文兜底（原名即 CPI，无需译）
+    "Chicago Fed National Activity Index": "芝加哥联储全国活动指数",
+    "Chicago PMI": "芝加哥 PMI",
+    "Core Inflation Rate MoM": "核心 CPI 月率",
+    "Core Inflation Rate YoY": "核心 CPI 年率",
+    "Core PCE Price Index MoM": "核心 PCE 物价指数月率",
+    "Core PCE Price Index YoY": "核心 PCE 物价指数年率",
+    "Current Account": "经常帐",
+    "Dallas Fed Manufacturing Index": "达拉斯联储制造业指数",
+    "Durable Goods Orders Ex Transp MoM": "耐用品订单月率（除运输）",
+    "Durable Goods Orders MoM": "耐用品订单月率",
+    "EIA Crude Oil Stocks Change": "EIA 原油库存变化",
+    "EIA Gasoline Stocks Change": "EIA 汽油库存变化",
+    "Existing Home Sales": "成屋销售",
+    "Export Prices MoM": "出口物价月率",
+    "FOMC Economic Projections": "美联储经济预期（点阵图）",
+    "FOMC Minutes": "美联储会议纪要",
+    "Fed Interest Rate Decision": "美联储利率决议",
+    "Fed Press Conference": "美联储主席新闻发布会",
+    "GDP Growth Rate Annualized": "GDP 年化季率",
+    "GDP Growth Rate QoQ Final": "GDP 季率（终值）",
+    "GDP Growth Rate QoQ Prel": "GDP 季率（初值）",
+    "GDP Growth Rate YoY": "GDP 年率",
+    "GDP Price Index QoQ Final": "GDP 价格指数季率（终值）",
+    "Goods Trade Balance Adv": "商品贸易帐（初值）",
+    "Housing Starts": "新屋开工",
+    "Housing Starts MoM": "新屋开工月率",
+    "ISM Manufacturing PMI": "ISM 制造业 PMI",
+    "ISM Services PMI": "ISM 服务业 PMI",
+    "Import Prices MoM": "进口物价月率",
+    "Industrial Production MoM": "工业产出月率",
+    "Inflation Rate MoM": "CPI 月率",
+    "Inflation Rate YoY": "CPI 年率",
+    "Initial Jobless Claims": "初请失业金人数",
+    "Continuing Jobless Claims": "续请失业金人数",
+    "JOLTs Job Openings": "JOLTS 职位空缺",
+    "MBA 30-Year Mortgage Rate": "MBA 30 年期抵押贷款利率",
+    "Michigan Consumer Sentiment Final": "密歇根消费者信心指数（终值）",
+    "Michigan Consumer Sentiment Prel": "密歇根消费者信心指数（初值）",
+    "Monthly Budget Statement": "月度财政预算",
+    "NAHB Housing Market Index": "NAHB 房产市场指数",
+    "NY Empire State Manufacturing Index": "纽约联储制造业指数",
+    "Net Long-term TIC Flows": "长期资本净流入（TIC）",
+    "New Home Sales": "新屋销售",
+    "New Home Sales MoM": "新屋销售月率",
+    "Non Farm Payrolls": "非农就业人数",
+    "Nonfarm Payrolls": "非农就业人数",
+    "Average Hourly Earnings MoM": "平均时薪月率",
+    "PCE Price Index MoM": "PCE 物价指数月率",
+    "PCE Price Index YoY": "PCE 物价指数年率",
+    "PPI MoM": "PPI 月率",
+    "PPI YoY": "PPI 年率",
+    "Pending Home Sales MoM": "成屋签约销售月率",
+    "Pending Home Sales YoY": "成屋签约销售年率",
+    "Personal Income MoM": "个人收入月率",
+    "Personal Spending MoM": "个人支出月率",
+    "Philadelphia Fed Manufacturing Index": "费城联储制造业指数",
+    "Retail Inventories Ex Autos MoM Adv": "零售库存月率（除汽车，初值）",
+    "Retail Sales Control Group MoM": "零售销售控制组月率",
+    "Retail Sales Ex Autos MoM": "零售销售月率（除汽车）",
+    "Retail Sales MoM": "零售销售月率",
+    "Richmond Fed Manufacturing Index": "里士满联储制造业指数",
+    "S&P/Case-Shiller Home Price YoY": "标普/CS 房价指数年率",
+    "Unemployment Rate": "失业率",
+    "Wholesale Inventories MoM Adv": "批发库存月率（初值）",
+}
+
+# 变体用规则兜底（发言人姓名等无法穷举）
+_MACRO_EVENT_CN_RULES = (
+    (re.compile(r"^Fed (\w+) Speech$"), "美联储{0}讲话"),
+)
+
+
+def _event_cn(name: str) -> str:
+    """宏观事件名转中文；表里没有的原样返回英文"""
+    if not name:
+        return name
+    hit = _MACRO_EVENT_CN.get(name.strip())
+    if hit:
+        return hit
+    for pat, tpl in _MACRO_EVENT_CN_RULES:
+        m = pat.match(name.strip())
+        if m:
+            return tpl.format(*m.groups())
+    return name
+
+
+_MACRO_REGION_CN = {
+    "United States": "美国", "Euro Area": "欧元区", "United Kingdom": "英国",
+    "Japan": "日本", "China": "中国", "Germany": "德国", "Canada": "加拿大",
+    "Australia": "澳大利亚", "Switzerland": "瑞士", "France": "法国",
+    "Italy": "意大利", "New Zealand": "新西兰",
+}
+
+
+def _region_cn(region: str) -> str:
+    return _MACRO_REGION_CN.get((region or "").strip(), region)
+
+
 def get_macro_events() -> dict:
     now = datetime.now(timezone.utc)
     now_ms = int(now.timestamp() * 1000)
@@ -234,15 +344,17 @@ def get_macro_events() -> dict:
             except (ValueError, OSError):
                 continue
             name = e.get("event", "")
+            # 核心判定用英文原名（关键词表是英文），展示名转中文
             tag = "核心" if _is_core_event(name) else "观察"
             events.append({
-                "name": name,
+                "name": _event_cn(name),
+                "name_en": name,
                 "type": e.get("category", "MACRO"),
                 "time": t_str,
                 "tag": tag,
                 "forecast": e.get("forecast", ""),
                 "previous": e.get("previous", ""),
-                "region": e.get("region", ""),
+                "region": _region_cn(e.get("region", "")),
             })
 
     next_event = None

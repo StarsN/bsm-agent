@@ -36,6 +36,17 @@ with storage.get_conn() as conn:
     );
     """)
 
+# ---- 测试隔离：不发真实网络请求、不真等待 ----
+# 1) 本文件 ~22 次 _run_round 会走到 C 段实盘对账，真连币安每次 401 往返 ~0.3s；
+#    实盘镜像另有专门套件（extra/test_supertrend_live.py），这里打桩
+import supertrend_live as _stl_mod
+_stl_mod.sync_supertrend_live = lambda *a, **k: None
+# 2) OKX 取数重试间隔 2+4s 与交易对过滤器请求：测试只要确定性，不需要真实等待/请求
+st.time.sleep = lambda *a, **k: None          # 该模块的 time 即全局 time，仅测试进程内生效
+import exchange as _ex
+_ex._fetch_symbol_filters = lambda symbol: {
+    "stepSize": 0.001, "minQty": 0.0, "priceStep": 0.01}
+
 # ---- mock：token -> 已闭合K线信号 / 标记价 ----
 MOCK_SIG: dict = {}
 MOCK_PRICE: dict = {}
@@ -119,11 +130,12 @@ def check(name, cond, detail=""):
 def main():
     st.init_db()
     # 测试全程假设处于同一个 15m K 线窗口（closed_ts 基准不变）。
-    # 若距边界 <100s（测试总耗时余量），先睡过边界，避免跨边界时序错位。
+    # 仅防"启动瞬间恰好跨边界导致 closed_ts 计算翻页"竞态（测试全 mock、10s 内跑完，
+    # age 永远不会超 32min stale 上限，无需长窗口）
     import time as _t
     now_ms = int(_t.time() * 1000)
     remain = CANDLE - (now_ms % CANDLE)
-    if remain < 100 * 1000:
+    if remain < 10 * 1000:
         print(f"  （距15m边界 {remain // 1000}s，睡过边界再跑）")
         _t.sleep(remain / 1000 + 3)
 
@@ -424,12 +436,24 @@ def main():
     old2 = closed - 2 * CANDLE
     st.requests.post = lambda url, json=None, timeout=None: FakeResp(okx_body(
         (old2, ("DOWN", 95000, 93000)), (old1, ("DOWN", 96000, 94000))))
-    sig = st._fetch_okx_supertrend("BTC")
+    sig = st._fetch_okx_supertrend("BTC", attempts=1)
     check("延迟两根都旧 → 返回 None", sig is None, str(sig))
     st.requests.post = lambda url, json=None, timeout=None: FakeResp(okx_body(
         (forming, ("UP", 1, 2))))
-    sig = st._fetch_okx_supertrend("BTC")
+    sig = st._fetch_okx_supertrend("BTC", attempts=1)
     check("只有形成中 → None", sig is None, str(sig))
+    st.requests.post = lambda url, json=None, timeout=None: FakeResp(okx_body(
+        (closed, ("UP", "NaN", "99000")), (forming, ("UP", 101200, 99200))))
+    sig = st._fetch_okx_supertrend("BTC", attempts=1)
+    check("NaN 轨道 → None（防 SL 失效持仓裸奔）", sig is None, str(sig))
+    st.requests.post = lambda url, json=None, timeout=None: FakeResp(okx_body(
+        (closed, ("UP", "Infinity", "99000"))))
+    sig = st._fetch_okx_supertrend("BTC", attempts=1)
+    check("Infinity 轨道 → None", sig is None, str(sig))
+    st.requests.post = lambda url, json=None, timeout=None: FakeResp(okx_body(
+        (closed, ("UP", 101000, "-5"))))
+    sig = st._fetch_okx_supertrend("BTC", attempts=1)
+    check("负轨道 → None", sig is None, str(sig))
     st._fetch_okx_supertrend = lambda token: MOCK_SIG.get(token)
 
     print("== 17. 参数防御：异常值回退默认 ==")
@@ -796,11 +820,13 @@ def main():
           pend and abs(pend["stop_loss_price"] - 98505) < 1e-6,
           str(pend and pend["stop_loss_price"]))
     # 场景2：挂单成交 → 两笔合并（数量相加、开仓价加权、被并入行 CANCELED）
+    # 合并由 _run_round 每轮开头兜底执行（不依赖 OKX 取数）→ 走真实入口验证
     MOCK_PRICE["BTC"] = 100400  # ≤ 挂单价 100495 → 成交
     with storage.get_conn() as mc:
         trade_logic.update_paper_positions(mc)
-    with storage.get_conn() as mc, storage.get_conn(config.SUPERTREND_DB) as sc:
-        st._process_token(mc, sc, "BTC", 1.0, 1.0, 50.0, 3.0, "LONG_ONLY", True)
+    with storage.get_conn() as mc:
+        storage.trading_settings_update(mc, {"supertrend_enabled": True})
+    st._run_round()
     with storage.get_conn() as mc:
         rows = mc.execute(
             "SELECT * FROM trade_positions WHERE token='BTC' AND strategy='supertrend' "
@@ -1039,6 +1065,318 @@ def main():
     with storage.get_conn(config.SUPERTREND_DB) as sc:
         sc.execute("DELETE FROM supertrend_status")
         sc.execute("UPDATE supertrend_tokens SET paused=0 WHERE token='BTC'")
+
+    print("== 30. 合并兜底：OKX 取数失败/暂停币也要合并同向多笔 ==")
+    import supertrend_live
+    supertrend_live.sync_supertrend_live = lambda: None  # 本组只验合并，屏蔽 C 段
+    with storage.get_conn() as mc:
+        storage.trading_settings_update(mc, {"supertrend_enabled": True})
+
+    def _mk_rows(token, qty1, qty2):
+        with storage.get_conn() as conn:
+            for q in (qty1, qty2):
+                conn.execute(
+                    "INSERT INTO trade_positions (token, symbol, side, status, mode, "
+                    "margin_amount, leverage, notional, quantity, entry_price, "
+                    "current_price, stop_loss_price, strategy) "
+                    "VALUES (?, ?, 'LONG', 'OPEN', 'paper', 50, 3, ?, ?, 100, 100, 95, "
+                    "'supertrend')",
+                    (token, f"{token}USDT", q * 100, q))
+
+    def _active_rows(token):
+        with storage.get_conn() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM trade_positions WHERE token=? AND strategy='supertrend' "
+                "AND status IN ('OPEN','PARTIAL')", (token,)).fetchall()]
+
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("INSERT OR REPLACE INTO supertrend_tokens "
+                   "(token, status, added_at, live_mode, paused) "
+                   "VALUES ('MGX', 'ACTIVE', 0, 0, 0)")
+        sc.execute("INSERT OR REPLACE INTO supertrend_tokens "
+                   "(token, status, added_at, live_mode, paused) "
+                   "VALUES ('MGY', 'ACTIVE', 0, 0, 1)")   # 暂停
+    _mk_rows("MGX", 1.0, 2.0)
+    _mk_rows("MGY", 1.0, 3.0)
+    MOCK_SIG.pop("MGX", None)      # OKX 取数失败
+    MOCK_PRICE.pop("MGX", None)    # 标记价也失败
+    st._run_round()
+    rows = _active_rows("MGX")
+    check("OKX/标记价失败仍合并为 1 笔", len(rows) == 1, str(len(rows)))
+    check("合并后数量 = 1+2 = 3",
+          rows and abs(rows[0]["quantity"] - 3.0) < 1e-9,
+          str(rows[0]["quantity"] if rows else None))
+    rows = _active_rows("MGY")
+    check("暂停币也合并为 1 笔", len(rows) == 1, str(len(rows)))
+    check("暂停币合并后数量 = 1+3 = 4",
+          rows and abs(rows[0]["quantity"] - 4.0) < 1e-9,
+          str(rows[0]["quantity"] if rows else None))
+
+    print("== 31. 合并竞态：1s 循环旧快照不得复活 CANCELED 行（防数量/盈亏双计） ==")
+    with storage.get_conn() as mc:
+        mc.execute("DELETE FROM trade_positions WHERE strategy='supertrend'")
+        cur = mc.execute(
+            "INSERT INTO trade_positions (token, symbol, side, status, mode, "
+            "margin_amount, leverage, notional, quantity, entry_price, current_price, "
+            "stop_loss_price, strategy) VALUES ('RACE','RACEUSDT','LONG','OPEN',"
+            "'paper',50,3,150,1.0,100,100,95,'supertrend')")
+        rid = cur.lastrowid
+    MOCK_PRICE["RACE"] = 90.0            # 跌破 SL 95
+    with storage.get_conn() as mc:
+        stale = storage.trade_open_positions(mc)   # 1s 循环已取的旧快照
+    with storage.get_conn() as mc:                 # 合并线程把该行标 CANCELED
+        mc.execute("UPDATE trade_positions SET status='CANCELED' WHERE id=?", (rid,))
+    old_fn = trade_logic.storage.trade_open_positions
+    trade_logic.storage.trade_open_positions = lambda conn: stale
+    try:
+        with storage.get_conn() as mc:
+            trade_logic.update_paper_positions(mc)
+    finally:
+        trade_logic.storage.trade_open_positions = old_fn
+    with storage.get_conn() as mc:
+        row = mc.execute("SELECT status, realized_pnl FROM trade_positions "
+                         "WHERE id=?", (rid,)).fetchone()
+    check("CANCELED 行未被复活为 CLOSED", row["status"] == "CANCELED",
+          str(dict(row)))
+    check("未产生幽灵 realized", not (row["realized_pnl"] or 0), str(dict(row)))
+
+    print("== 32. 反转市价容忍（flip_market_tolerance_pct）==")
+
+    def _reset_pos():
+        with storage.get_conn() as mc:
+            mc.execute("DELETE FROM trade_positions WHERE strategy='supertrend'")
+        with storage.get_conn(config.SUPERTREND_DB) as sc:
+            sc.execute("DELETE FROM supertrend_status")
+
+    def _setup_flip(direction, tol, flip=1):
+        """设为指定方向/容忍 → 在受限方向跑一轮记基准（WAIT_DIR）。
+        受限方向：只做多=DOWN（反转前画上轨 101000）；只做空=UP（画下轨 99000）"""
+        _reset_pos()
+        with storage.get_conn(config.SUPERTREND_DB) as sc:
+            sc.execute("UPDATE supertrend_tokens SET direction=?, flip_market_open=?, "
+                       "flip_market_tolerance_pct=? WHERE token='BTC'",
+                       (direction, flip, tol))
+        set_sig("BTC", "DOWN" if direction == "LONG_ONLY" else "UP", 101000, 99000)
+        MOCK_PRICE["BTC"] = 100000
+        new_candle("BTC")
+        new_candle("BTC")
+        with storage.get_conn() as mc, storage.get_conn(config.SUPERTREND_DB) as sc:
+            st._process_token(mc, sc, "BTC", 1.0, 1.0, 50.0, 3.0, direction, True, tol)
+
+    def _flip(direction, trend, price, tol):
+        """翻到允许方向跑一轮（走真实入口，带容忍参数）"""
+        set_sig("BTC", trend, 101000, 99000)
+        MOCK_PRICE["BTC"] = price
+        new_candle("BTC")
+        new_candle("BTC")
+        new_candle("BTC")
+        with storage.get_conn() as mc, storage.get_conn(config.SUPERTREND_DB) as sc:
+            st._process_token(mc, sc, "BTC", 1.0, 1.0, 50.0, 3.0, direction, True, tol)
+
+    # 32a：只做多 + 容忍1%，参考线=反转前上轨 101000 → 阈值 101000*1.01=102010
+    _setup_flip("LONG_ONLY", 1.0)
+    _flip("LONG_ONLY", "UP", 100500, 1.0)     # 100500 ≤ 102010 → 容忍内
+    p = pos_of("BTC")
+    pend = pending_of("BTC")
+    check("32a 容忍内：市价开多", p and p["status"] == "OPEN" and p["side"] == "LONG",
+          str(p and (p["status"], p["side"])))
+    check("32a 容忍内：同轮挂单并存", pend and pend["status"] == "PENDING",
+          str(pend and pend["status"]))
+
+    # 32b：同币，价格跑到 102500 > 102010 → 超容忍：不打市价、只挂单
+    _setup_flip("LONG_ONLY", 1.0)
+    _flip("LONG_ONLY", "UP", 102500, 1.0)
+    p = pos_of("BTC")
+    pend = pending_of("BTC")
+    check("32b 超容忍：无市价仓", p is None, str(p and p["status"]))
+    check("32b 超容忍：只挂单", pend and pend["status"] == "PENDING",
+          str(pend and pend["status"]))
+    check("32b 超容忍：挂单价仍=99000*1.01=99990",
+          pend and abs(pend["limit_price"] - 99990) < 1e-6,
+          str(pend and pend["limit_price"]))
+    check("32b 超容忍：原因写进挂单 open_reason（页面据此留痕）",
+          pend and "反转市价跳过" in (pend["open_reason"] or ""),
+          str(pend and pend["open_reason"]))
+    check("32b 超容忍：open_reason 仍以原有文案开头（不破坏展示）",
+          pend and (pend["open_reason"] or "").startswith("超级趋势 15m"),
+          str(pend and pend["open_reason"]))
+    check("32b 超容忍：advice 不含原因（运行期会被 1s 循环重写，不能放那）",
+          pend and "反转市价跳过" not in (pend["advice"] or ""),
+          str(pend and pend["advice"]))
+
+    # 32c：容忍 0 → 不设限，价格再远也直接市价进（向后兼容）
+    _setup_flip("LONG_ONLY", 0.0)
+    _flip("LONG_ONLY", "UP", 105000, 0.0)
+    p = pos_of("BTC")
+    check("32c 容忍0：直接市价进", p and p["status"] == "OPEN",
+          str(p and p["status"]))
+    check("32c 容忍0：成交价=现价 105000",
+          p and abs(p["entry_price"] - 105000) < 1e-6, str(p and p["entry_price"]))
+
+    # 32d：旧轨道脏数据（NULL）→ 不设限，不拿脏数据拦真交易
+    _setup_flip("LONG_ONLY", 1.0)
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("UPDATE supertrend_status SET upper_band=NULL WHERE token='BTC'")
+    _flip("LONG_ONLY", "UP", 105000, 1.0)
+    p = pos_of("BTC")
+    check("32d 旧轨道 NULL：按不设限直接市价进", p and p["status"] == "OPEN",
+          str(p and p["status"]))
+
+    # 32e：翻空对称 —— 只做空，参考线=反转前下轨 99000 → 阈值 99000*0.99=98010
+    _setup_flip("SHORT_ONLY", 1.0)
+    _flip("SHORT_ONLY", "DOWN", 97500, 1.0)   # 97500 < 98010 → 超容忍
+    p = pos_of("BTC")
+    pend = pending_of("BTC")
+    check("32e 翻空超容忍：无市价仓 + 只挂空单",
+          p is None and pend and pend["side"] == "SHORT",
+          str((p and p["status"], pend and pend["side"])))
+    check("32e 翻空超容忍：open_reason 留痕",
+          pend and "反转市价跳过" in (pend["open_reason"] or ""),
+          str(pend and pend["open_reason"]))
+
+    # 32f：翻空容忍内
+    _setup_flip("SHORT_ONLY", 1.0)
+    _flip("SHORT_ONLY", "DOWN", 98500, 1.0)   # 98500 ≥ 98010 → 容忍内
+    p = pos_of("BTC")
+    check("32f 翻空容忍内：市价开空",
+          p and p["status"] == "OPEN" and p["side"] == "SHORT",
+          str(p and (p["status"], p["side"])))
+
+    _reset_pos()
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("UPDATE supertrend_tokens SET direction='BOTH', flip_market_open=0, "
+                   "flip_market_tolerance_pct=NULL WHERE token='BTC'")
+
+    print("== 33. 参考线不可用（状态表停更 > 1 根K线）→ 只挂单，不 fail-open ==")
+    # 场景：暂停恢复 / OKX 连续取数失败 / 重启 / 切实盘后，supertrend_status 停更很久，
+    # 旧轨道是几小时前的另一条线——拿它当"反转前趋势线"等于随机门闸。
+    # 这些场景恰恰价格已经跑远 → 必须拦，不能放行市价追高。
+    _setup_flip("LONG_ONLY", 1.0)
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("UPDATE supertrend_status SET last_candle_ts = last_candle_ts - ?",
+                   (5 * CANDLE,))          # 人为把基准推远 5 根K线
+    _flip("LONG_ONLY", "UP", 100500, 1.0)  # 价格其实在容忍内（100500 ≤ 102010）
+    p = pos_of("BTC")
+    pend = pending_of("BTC")
+    check("参考线不可用：不打市价（即使现价在容忍范围内）", p is None,
+          str(p and p["status"]))
+    check("参考线不可用：只挂限价单", pend and pend["status"] == "PENDING",
+          str(pend and pend["status"]))
+    check("参考线不可用：留痕说明原因",
+          pend and "参考线不可用" in (pend["open_reason"] or ""),
+          str(pend and pend["open_reason"]))
+
+    print("== 34. 合并竞态：SELECT 之后被平掉的 extras 不得并进 keep（A3）==")
+
+    class _RaceConn:
+        """在 _merge_positions **重读某条 extras 的状态那一刻**抢先把它平掉
+        （模拟 1s 循环在 SELECT 与累加之间扫损）。必须卡在重读那一句上——在
+        外层 SELECT 之前就平掉的话，那条压根不会进 rows，竞态根本没被模拟到。"""
+
+        def __init__(self, conn, victim_id):
+            self._c = conn
+            self._victim = victim_id
+            self.fired = False
+
+        def execute(self, sql, params=()):
+            if (not self.fired
+                    and "WHERE id=? AND" in sql and "status IN ('OPEN','PARTIAL')" in sql
+                    and params and params[0] == self._victim):
+                self.fired = True
+                with storage.get_conn() as c2:
+                    c2.execute("UPDATE trade_positions SET status='CLOSED', "
+                               "advice='SL 扫损', closed_at=CURRENT_TIMESTAMP "
+                               "WHERE id=?", (self._victim,))
+            return self._c.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    with storage.get_conn() as mc:
+        mc.execute("DELETE FROM trade_positions WHERE strategy='supertrend'")
+        ids = []
+        for qty in (1.0, 2.0, 3.0):     # 同向三笔，最早的是 keep
+            cur = mc.execute(
+                "INSERT INTO trade_positions (token, symbol, side, status, mode, "
+                "margin_amount, leverage, notional, quantity, entry_price, "
+                "current_price, stop_loss_price, strategy) "
+                "VALUES ('MRG','MRGUSDT','LONG','OPEN','paper',?,3,?,?,100,100,95,"
+                "'supertrend')", (qty * 100 / 3, qty * 100, qty))
+            ids.append(cur.lastrowid)
+    race = None
+    with storage.get_conn() as mc:
+        race = _RaceConn(mc, ids[1])
+        st._merge_positions(race, "MRG")
+    check("竞态确实被模拟到（重读那一刻把中间那笔平掉了）", race and race.fired)
+    with storage.get_conn() as mc:
+        keep = mc.execute("SELECT quantity, notional FROM trade_positions "
+                          "WHERE id=?", (ids[0],)).fetchone()
+        can = mc.execute("SELECT status FROM trade_positions WHERE id=?",
+                         (ids[2],)).fetchone()
+    check("合并只并进还活着的那笔：数量 = 1.0 + 3.0 = 4.0（不含被平掉的 2.0）",
+          abs(float(keep["quantity"]) - 4.0) < 1e-9,
+          f"keep 数量 {keep['quantity']}")
+    check("名义也不含被平掉那笔", abs(float(keep["notional"]) - 400.0) < 1e-6,
+          f"notional {keep['notional']}")
+    check("还活着的那笔已被并入并标 CANCELED", can and can["status"] == "CANCELED",
+          str(can))
+    with storage.get_conn() as mc:
+        mc.execute("DELETE FROM trade_positions WHERE token='MRG'")
+
+    print("== 35. 总开关关闭时：已移除币仍要被清理（A9）==")
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("UPDATE supertrend_tokens SET status='REMOVED' WHERE token='ETH'")
+    with storage.get_conn() as mc:
+        mc.execute("DELETE FROM trade_positions WHERE strategy='supertrend'")
+    with storage.get_conn() as mc:
+        mc.execute(
+            "INSERT INTO trade_positions (token, symbol, side, status, mode, "
+            "margin_amount, leverage, notional, quantity, entry_price, "
+            "current_price, stop_loss_price, strategy) "
+            "VALUES ('ETH','ETHUSDT','LONG','OPEN','paper',50,3,150,1.0,3000,3000,"
+            "2900,'supertrend')")
+    MOCK_PRICE["ETH"] = 3000.0
+    with storage.get_conn() as mc:
+        storage.trading_settings_update(mc, {"supertrend_enabled": False})
+    st._run_round()                      # 总开关关闭
+    with storage.get_conn() as mc:
+        st_rows = [dict(r) for r in mc.execute(
+            "SELECT status FROM trade_positions WHERE token='ETH' "
+            "AND strategy='supertrend'")]
+    check("总开关关闭时，已移除币的残留仓仍被清理（不是永远没人管）",
+          st_rows and st_rows[0]["status"] == "CLOSED", str(st_rows))
+    with storage.get_conn() as mc:
+        storage.trading_settings_update(mc, {"supertrend_enabled": True})
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("UPDATE supertrend_tokens SET status='ACTIVE' WHERE token='ETH'")
+
+    print("== 36. flip_tol_pct 漏传必须可见（A8）==")
+    _reset_pos()
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("UPDATE supertrend_tokens SET direction='LONG_ONLY', "
+                   "flip_market_open=1, flip_market_tolerance_pct=1.0 "
+                   "WHERE token='BTC'")
+    import io as _io
+    import contextlib as _ctx
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        # 故意漏传 flip_tol_pct（模拟"新调用点忘了传"）
+        with storage.get_conn() as mc, storage.get_conn(config.SUPERTREND_DB) as sc:
+            st._process_token(mc, sc, "BTC", 1.0, 1.0, 50.0, 3.0, "LONG_ONLY", True)
+    check("漏传 flip_tol_pct → 打 [WARN] 告警（不静默）",
+          "flip_tol_pct 未传" in _buf.getvalue(), _buf.getvalue()[-200:])
+    # 显式传 0 是合法值，不该告警
+    _buf2 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf2):
+        with storage.get_conn() as mc, storage.get_conn(config.SUPERTREND_DB) as sc:
+            st._process_token(mc, sc, "BTC", 1.0, 1.0, 50.0, 3.0, "LONG_ONLY",
+                              True, 0.0)
+    check("显式传 0（不设限）不告警（区分「漏传」与「显式不设限」）",
+          "flip_tol_pct 未传" not in _buf2.getvalue(), _buf2.getvalue()[-200:])
+    _reset_pos()
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("UPDATE supertrend_tokens SET direction='BOTH', flip_market_open=0, "
+                   "flip_market_tolerance_pct=NULL WHERE token='BTC'")
 
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     sys.exit(1 if FAIL else 0)

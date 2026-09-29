@@ -29,6 +29,8 @@ PROGRAMS = [
     ("auto_trader", "auto_trader.py"),
     ("market_realtime", "market_realtime.py"),
     ("worker", "worker.py"),
+    # 加密事件：抓金十快讯 → 币种识别 → AI 判利多/利空 → 事件驱动纸盘
+    ("event_agent", "event_agent.py"),
 ]
 START_INTERVAL = 20
 
