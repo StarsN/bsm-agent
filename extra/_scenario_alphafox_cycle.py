@@ -157,10 +157,45 @@ K = FAKE.balance / TRADER_MARGIN          # 0.005
 TR = "bn-A"
 
 
-def snap(margin, positions, orders=None):
+_TP_HIST: dict = {}   # 假平台成交流水（跨轮累积）：{(token, side): [point, ...]}
+
+
+def _synth_tp(positions, no_close=False):
+    """照真样本合成 tradePoints：持仓各一条 OPEN；这轮没了的仓补一条 CLOSE
+    （真平台会记，实测 7/7：平过的币都有、还持有的一律没有）。
+    模拟"平台抖动"（丢行但没有平仓记录）→ no_close=True。"""
+    keys = set()
+    for p in positions or []:
+        if not isinstance(p, dict):
+            continue
+        sym = str(p.get("symbol") or "").upper()
+        if not sym:
+            continue
+        keys.add((sym[:-4] if sym.endswith("USDT") else sym,
+                  str(p.get("side") or "").upper()))
+    now_ms = int(time.time() * 1000)
+
+    def _pt(k, action, ts):
+        return {"symbol": f"{k[0]}USDT",
+                "side": "BUY" if k[1] == "LONG" else "SELL",
+                "action": action, "quantity": 1.0, "price": 1.0, "timeMs": ts}
+
+    for k in sorted(keys):
+        lst = _TP_HIST.setdefault(k, [])
+        if not lst or lst[-1]["action"] != "OPEN":
+            lst.append(_pt(k, "OPEN", now_ms - 60000))
+    for k, lst in sorted(_TP_HIST.items()):
+        if k not in keys and lst and lst[-1]["action"] == "OPEN" and not no_close:
+            lst.append(_pt(k, "CLOSE", now_ms))
+    return {f"{k[0]}USDT": [dict(x) for x in lst]
+            for k, lst in _TP_HIST.items() if lst}
+
+
+def snap(margin, positions, orders=None, no_close=False):
     d = {"traderName": "熬鹰", "marginBalance": margin, "positions": positions}
     if orders is not None:
         d["latestOrders"] = orders
+    d["tradePoints"] = _synth_tp(positions, no_close)
     return {"data": d}
 
 

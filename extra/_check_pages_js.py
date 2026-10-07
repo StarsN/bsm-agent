@@ -191,8 +191,11 @@ ALPHAFOX_PAYLOAD = {
 }
 
 
-# 这两页的 HTML 全静态、脚本全部有效 → 缺 id 直接判失败（其余页面只告警）
-HARD_PAGES = {"SUPERTREND_LIVE_HTML", "ALPHAFOX_LIVE_HTML"}
+# 这几页的 HTML 全静态、脚本全部有效 → 缺 id 直接判失败（其余页面只告警）
+# 事件四页（加密/美股 × 展览/AI）同样是静态页：JS 里 getElementById 打错字必须拦下
+HARD_PAGES = {"SUPERTREND_LIVE_HTML", "ALPHAFOX_LIVE_HTML",
+              "CRYPTO_EVENTS_HTML", "CRYPTO_EVENT_AI_HTML",
+              "STOCK_EVENTS_HTML", "STOCK_EVENT_AI_HTML"}
 
 
 # 短列表变体（历史/日志都空）→ 验证"不到一页不显示加载更多"

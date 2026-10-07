@@ -39,13 +39,16 @@ GROUPS = {
     "web": ["extra/_check_exempt_recorder.py", "extra/_check_af_payload.py",
             "extra/_check_exchange_orders.py", "extra/_check_af_board.py",
             "extra/_check_live_close.py", "extra/_check_st_board.py",
-            "extra/_check_pages_js.py"],
+            "extra/_check_pages_js.py", "extra/_check_nav.py",
+            # 该套件第 5/8 节大量断言 web.py 源码接线（翻转相关），改 web.py 必须带上
+            "extra/_check_flip_wiring.py"],
     "tg": ["extra/_check_tg_signals.py"],
     "macro": ["extra/_check_macro_cn.py"],
     # 币安符号表：TRADIFI 永续（CL/NVDA/XAU）跟单可见、但不混进纯加密符号集
     "market": ["extra/test_market_symbols.py"],
     # 加密事件：币种识别（中英文）/ 金十预览页解析（真样本夹具）/ 事件独立 DB
-    "event": ["extra/test_crypto_event.py"],
+    # + 美股/商品事件（独立库、同一抓取、另一条管线）
+    "event": ["extra/test_crypto_event.py", "extra/test_stock_event.py"],
     # 全新库/换库/恢复备份的前置检查（init_db 不炸 + managed 列自动创建 + 幂等）
     "storage": ["extra/_check_storage_init.py"],
 }
@@ -63,6 +66,11 @@ MODULE_GROUPS = {
     "web.py": ["web"],
     # market 符号表：动它要连带跑"跟单认不认得出这个合约"的套件
     "market.py": ["market", "alphafox_trade", "alphafox_live", "e2e"],
+    # 事件两条管线（加密 + 美股/商品）改动跑 event 组
+    "event_agent.py": ["event"],
+    "event_coins.py": ["event"],
+    "event_scrape.py": ["event"],
+    "stock_coins.py": ["event"],
     # storage 改动跑"全新库 init"检查 + 跟单相关组（用户要求：不要自动升级为全量；
     # 真要大范围回归，部署前单独跑 all）
     "storage.py": ["storage", "alphafox_live", "alphafox_trade", "e2e"],

@@ -15,6 +15,7 @@
   交易员任何动作（纸盘不动、实盘只做事实同步）；取消跟单/取消托管**不平仓**
 """
 import json
+import threading
 import time
 
 import config
@@ -96,6 +97,15 @@ ANOMALY_MAX_GAP = 600  # 秒
 # 单轮判定会把仓误标"已脱离"——标记后守卫全拦，只有用户再点一次才能解除
 _reattach_missing: dict = {}
 
+# 快照抖动扣留：{(trader_id, symbol, side): [首次扣留时间, 最近一次扣留时间]}。
+# 平台丢行/空包时 tradePoints 里没有 CLOSE 点 → 判为抖动：暂不平仓、基线里保留旧值；
+# 扣留超时只发 TG 提醒（**不动仓位**）——宁可人工判断，也不许误平/误开。
+_jitter_since: dict = {}
+_jitter_notified: dict = {}      # 同键 → 上次提醒时间（同一笔每小时最多一条）
+JITTER_NOTIFY_AFTER = 300        # 秒：扣留多久后发 TG 提醒
+JITTER_NOTIFY_EVERY = 3600       # 秒：之后重复提醒的最小间隔
+JITTER_STALE_AFTER = 600         # 秒：这么久没再被扣留 → 忘掉上一次计时
+
 # 托管状态（trade_positions.managed）：跟单仓是否被系统管理。
 # 只有 MANAGED_ON 的仓才跟随交易员动作；其余状态一律不动作（仓位保留）
 MANAGED_ON = 1          # 托管中
@@ -108,6 +118,110 @@ def _managed(pos: dict) -> int:
     """读托管状态（老行无值是历史遗留 → 视为托管中）"""
     v = pos.get("managed")
     return MANAGED_ON if v is None else int(v)
+
+
+def _tp_closed(data: dict, key: tuple) -> bool:
+    """平台成交流水（tradePoints）里，这个币**最近一笔是 CLOSE**（= 交易员真的平过）。
+
+    这是"交易员平仓"的**旁证**：快照丢行/空包时 tradePoints 里没有这一笔
+    （或最后一笔还是 OPEN），一律当成平台抖动、不许平（2026-09-29 CL 事故）。
+    实测 7/7：交易员平过的币都有 CLOSE 点、还持有的一律没有。
+
+    取"最近一笔"而不是"有没有 CLOSE"：他平了又开（last=OPEN）时必须算"没平"。
+    比 timeMs 而非靠数组顺序（平台给的是新→旧，但别赌顺序）。"""
+    symbol, _side = key
+    tok = _token_of(symbol)
+    tps = (data or {}).get("tradePoints") or {}
+    if not isinstance(tps, dict):
+        # 脏包（tradePoints 给成 list/str 之类）：当"没有旁证"处理——
+        # 直接 .get 会抛 AttributeError 把整轮 process 打断（上游什么都可能给）
+        return False
+    pts = tps.get(symbol)
+    if pts is None:
+        pts = tps.get(tok)
+    if pts is None:      # 拼写兜底：平台有 BTC / BTCUSDT / xyz:BTC 多种写法
+        for k, v in tps.items():
+            if _token_of(str(k)) == tok:
+                pts = v
+                break
+    if not isinstance(pts, list):
+        return False
+    latest_t, latest_act = -1, ""
+    for p in pts:
+        if not isinstance(p, dict):
+            continue
+        try:
+            t = int(p.get("timeMs") or 0)
+        except (TypeError, ValueError):
+            continue
+        if t > latest_t:
+            latest_t, latest_act = t, str(p.get("action") or "").upper()
+    return latest_act == "CLOSE"
+
+
+def _tp_qty_ok(pts, qty):
+    """数量旁证（**只记诊断、不做闸门**）：成交流水的 Σ(OPEN)−Σ(CLOSE) 是否等于快照数量。
+
+    实测 CL：平台 8 笔 OPEN 加起来正好 21535.00，与快照一致。
+    将来若要防"平台吐错数量"这类抖动，靠的就是这个不变量；现在先攒数据。
+    数据不全（缺 quantity/action）→ None（无法判断，别当 False 误导）。"""
+    try:
+        net, n = 0.0, 0
+        for p in pts or []:
+            if not isinstance(p, dict):
+                continue
+            act = str(p.get("action") or "").upper()
+            if act not in ("OPEN", "CLOSE"):
+                continue
+            try:
+                q = abs(float(p.get("quantity") or 0))
+            except (TypeError, ValueError):
+                return None
+            net += q if act == "OPEN" else -q
+            n += 1
+        if not n or not qty:
+            return None
+        return abs(abs(net) - abs(float(qty))) <= max(abs(float(qty)), 1.0) * 0.001
+    except Exception:
+        return None
+
+
+def _note_jitter(trader_id: str, key: tuple) -> None:
+    """该仓本轮判为"平台数据抖动"→ 暂不平仓，只计时；超时发一条 TG 提醒。
+
+    **不做任何仓位操作**：系统不替人做"平台就是不给平仓点"这种极端判断。"""
+    now = time.time()
+    # 先清理陈旧键：> JITTER_STALE_AFTER 没再被扣留 → 上一次的事已经结束
+    # （不清的话，同一个币很久以后再抖一次会拿着旧计时立刻触发提醒）
+    for k, v in list(_jitter_since.items()):
+        if k[0] == trader_id and now - v[1] > JITTER_STALE_AFTER:
+            _jitter_since.pop(k, None)
+            _jitter_notified.pop(k, None)
+    kk = (trader_id, key[0], key[1])
+    rec = _jitter_since.get(kk)
+    if rec is None:
+        print(f"[alphafox] 抖动扣留：{key[0]} {key[1]} 平台成交流水无平仓记录"
+              f" → 本轮不平（等证据）")
+        rec = [now, now]
+    else:
+        rec = [rec[0], now]
+    _jitter_since[kk] = rec
+    held = now - rec[0]
+    if held < JITTER_NOTIFY_AFTER:
+        return
+    if now - _jitter_notified.get(kk, 0.0) < JITTER_NOTIFY_EVERY:
+        return
+    _jitter_notified[kk] = now
+    mins = int(held // 60)
+    print(f"[AFLIVE-ESCAPE] {key[0]} {key[1]} 已扣留 {mins} 分钟且始终无平仓记录"
+          f" → 发 TG 提醒（未动仓位）")
+    try:
+        import tg_notify
+        threading.Thread(
+            target=tg_notify.send_alphafox_jitter_alert,
+            args=(_token_of(key[0]), key[1], mins), daemon=True).start()
+    except Exception as e:
+        print(f"[alphafox] 抖动提醒发送失败: {e}")
 
 
 # 动作写入的托管守卫（拼进 UPDATE 的 WHERE）：读状态到写库之间隔着 get_mark_price
@@ -751,12 +865,17 @@ def _first_round_orphans(trader_id: str, cur: dict) -> set:
     return out
 
 
-def _confirm_orphans(trader_id: str, keys: set, cur: dict, params: dict) -> list:
+def _confirm_orphans(trader_id: str, keys: set, cur: dict, params: dict,
+                     data: dict | None = None) -> list:
     """第二轮确认孤儿：两轮快照都没有该 key → 平仓（交易员已真的没有）。
+    平台的成交流水里没有平仓点 → 判快照抖动，本轮不确认（下轮再看）。
     返回真的平掉的 key 列表（调用方要落信号日志 + 推 TG：这里平的是真钱）"""
     closed = []
     for key in sorted(keys):
         if key in cur:
+            continue
+        if not _tp_closed(data or {}, key):
+            _note_jitter(trader_id, key)
             continue
         if _close_our_position(trader_id, key, None, params):
             closed.append(key)
@@ -774,7 +893,8 @@ def _set_managed(position_id: int, value: int, only_if=None) -> bool:
         return conn.execute(sql, args).rowcount > 0
 
 
-def _resolve_reattach(trader_id: str, cur: dict, params: dict) -> int:
+def _resolve_reattach(trader_id: str, cur: dict, params: dict,
+                      data: dict | None = None) -> int:
     """消费"恢复中"(managed=2) 的仓（重新跟单/恢复托管后每个轮次都会跑，直到落定）：
     - 交易员快照里仍有该 key → 追平数量/杠杆 → 托管中（并重算实盘份数）
     - 交易员已无该 key → **不交易**，标记"已脱离"（页面提示用户自行处理）
@@ -808,6 +928,11 @@ def _resolve_reattach(trader_id: str, cur: dict, params: dict) -> int:
             pass
         cv = cur.get(key)
         if cv is None:
+            if not _tp_closed(data or {}, key):
+                # 平台成交流水里没有平仓点 → 快照抖动：不标"已脱离"、也不喂给下面的
+                # 连续缺失计数（标记后守卫全拦，只有用户再点一次才能解除）
+                _note_jitter(trader_id, key)
+                continue
             mk = (trader_id, pos["id"])
             miss = _reattach_missing.get(mk, 0) + 1
             if miss < 2:
@@ -985,11 +1110,21 @@ def _anomaly_diag(trader_id: str, label: str, data: dict, prev: dict, cur: dict,
         for sym, side in list(set(prev) - set(cur))[:10]:
             tok = sym[:-4] if sym.endswith("USDT") else sym
             pts = tps.get(sym) or tps.get(tok) or []
-            last = pts[-1] if pts else None
+            # 最新一笔按 timeMs 取大（平台数组是"新→旧"，但别赌顺序；
+            # 原实现取 pts[-1] 拿到的是**最老**那笔，一直误导排查）
+            newest = None
+            for p in pts:
+                if not isinstance(p, dict):
+                    continue
+                if newest is None or (int(p.get("timeMs") or 0)
+                                      > int(newest.get("timeMs") or 0)):
+                    newest = p
             gone.append({
                 "sym": sym, "side": side, "tp_n": len(pts),
-                "tp_last": (f"{last.get('action')}@{last.get('timeMs')}"
-                            if isinstance(last, dict) else None),
+                "tp_last": (f"{newest.get('action')}@{newest.get('timeMs')}"
+                            if isinstance(newest, dict) else None),
+                # 数量旁证：ΣOPEN−ΣCLOSE 是否等于快照数量（只记录，攒证据用）
+                "qty_ok": _tp_qty_ok(pts, prev.get((sym, side), {}).get("qty")),
             })
         rec = {
             "label": label, "trader_id": trader_id, "event": "anomaly",
@@ -1138,7 +1273,7 @@ def process(trader_id: str, snapshot: dict, params: dict) -> list[dict]:
     # 恢复托管（managed=2）：追平到交易员当前仓 → 托管中；交易员已无 → 已脱离。
     # 放三阶段之前，且首轮也要跑（重新跟单落到首轮）
     try:
-        _resolve_reattach(trader_id, cur, params)
+        _resolve_reattach(trader_id, cur, params, data)
     except Exception as e:
         print(f"[alphafox] {label} 恢复托管处理异常: {e}")
 
@@ -1164,7 +1299,7 @@ def process(trader_id: str, snapshot: dict, params: dict) -> list[dict]:
     pend = _orphan_pending.pop(trader_id, None)
     if pend:
         try:
-            closed_keys = _confirm_orphans(trader_id, pend, cur, params)
+            closed_keys = _confirm_orphans(trader_id, pend, cur, params, data)
             if closed_keys:
                 print(f"[alphafox] {label} 孤儿仓确认平仓 {len(closed_keys)} 笔"
                       f"（连续两轮快照无此仓）")
@@ -1191,10 +1326,19 @@ def process(trader_id: str, snapshot: dict, params: dict) -> list[dict]:
     if degraded:
         print(f"[alphafox] {label} 快照降级（有持仓项解析失败）→ 本轮跳过平仓阶段、"
               f"基线不推进，下轮重试")
+    held_back: set = set()   # 判为平台抖动、本轮不平的仓（基线里保留旧值）
     with storage.get_conn(config.ALPHAFOX_DB) as st_conn:
         # 阶段1：平仓（prev有 cur无）——顺序固定（排序）避免 set 迭代随机
         for key in (set() if degraded else sorted(set(prev) - set(cur))):
             symbol, side = key
+            if not _tp_closed(data, key):
+                # 平台成交流水里没有平仓点 → 判为快照抖动（丢行/空包），不许平：
+                # 误平是真金白银（2026-09-29 CL 事故）。等证据（下轮证据到了正常平），
+                # 超时只发 TG 提醒；本仓保留在基线里（见函数尾部），
+                # 否则快照恢复时同一个老仓会变成"cur 有 prev 无" → 被当新开仓真下单
+                held_back.add(key)
+                _note_jitter(trader_id, key)
+                continue
             pv = prev[key]
             sig = {"trader_id": trader_id, "label": label, "action": "CLOSE",
                    "symbol": symbol, "side": side,
@@ -1305,7 +1449,9 @@ def process(trader_id: str, snapshot: dict, params: dict) -> list[dict]:
         # 本轮执行期间被取消 → 不写回（写回会抵消 set_follow 的清基线：
         # 重新跟单首轮不重建 → 按停用前的旧快照补开仓/推过期信号）
         if _is_enabled(trader_id):
-            _prev_snap[trader_id] = cur
+            # 判为抖动的仓：基线里**保留旧值**（不能抹掉）——抹掉的话下一轮快照
+            # 恢复时同一个老仓会变成"cur 有 prev 无" → 被当新开仓真下单
+            _prev_snap[trader_id] = {**cur, **{k: prev[k] for k in held_back}}
         else:
             _prev_snap.pop(trader_id, None)
     else:

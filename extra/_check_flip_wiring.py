@@ -196,8 +196,9 @@ check("基准过期 → 只挂限价单且留痕说明原因",
       str(pend2 and dict(pend2)))
 
 print("== 5. web.py 接线（源码断言：少一层就会静默失效）==")
-web_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "web.py"), encoding="utf-8").read()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # extra/
+from _mut_src import read_module_source         # 变异注入的源码优先，否则变异不可见
+web_src = read_module_source("web")
 check("TradingSettingsBody 有该字段", "supertrend_flip_tolerance_pct: float | None = None" in web_src)
 check("api_trading_settings 白名单含该键",
       '"supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct"' in web_src)
@@ -206,7 +207,7 @@ check("overview params 返回 flip_tolerance_pct（按生效值 _st_tol 给）",
       '"flip_tolerance_pct": _st_tol(' in web_src
       and 'settings.get("supertrend_flip_tolerance_pct"),' in web_src)
 check("卡片 API 返回每币值", '"flip_market_tolerance_pct": t.get("flip_market_tolerance_pct")' in web_src)
-check("保存 API UPDATE 含该列", "flip_market_tolerance_pct=? " in web_src)
+check("保存 API UPDATE 含该列", "flip_market_tolerance_pct=?," in web_src)
 check("全局设置页有输入框", 'id="trade-supertrend-flip-tolerance"' in web_src)
 check("每币弹窗有输入框", 'id="set-flip-tol"' in web_src)
 check("全局默认摘要行含反转容忍",
@@ -244,6 +245,64 @@ check("C-4′ 弹窗回填仍用每币原始值（编辑时看到的是库里存
       "set-flip-tol').value = c.flip_market_tolerance_pct != null" in web_src)
 check("C-3 全局容忍框标注「留空=不改动」",
       "留空=不改动此项" in web_src)
+
+print("== 8. 反转市价平仓（close_on_reverse）接线 ==")
+check("web 卡片 API 返回该字段",
+      '"close_on_reverse": t.get("close_on_reverse") in (1, "1", True),' in web_src)
+check("web 保存 API UPDATE 含该列",
+      "flip_market_tolerance_pct=?, close_on_reverse=? " in web_src)
+_i = web_src.find('cor = 1 if str(body.get("close_on_reverse"))')
+_seg = web_src[_i:_i + 400] if _i >= 0 else ""
+check("BOTH 币不做 close_on_reverse 清零（与 flip 不同）",
+      _i >= 0 and "cor = 0" not in _seg)
+check("弹窗有下拉", 'id="set-cor"' in web_src)
+check("弹窗回填读每币值",
+      "document.getElementById('set-cor').value = c.close_on_reverse ? '1' : '0';" in web_src)
+check("保存提交带该字段",
+      "close_on_reverse: document.getElementById('set-cor').value," in web_src)
+check("卡片徽标显示反转平仓", "if (c.close_on_reverse) cust.push('反转平仓');" in web_src)
+
+# 端到端：DB 列 → _run_round 读取（tok_cor）→ 判据 → 市价平仓
+reset_pos()
+with storage.get_conn(config.SUPERTREND_DB) as sc:
+    sc.execute("UPDATE supertrend_tokens SET close_on_reverse=1 WHERE token='BTC'")
+MOCK_SIG["BTC"] = {"ts": closed_ts(0), "trend": "UP",
+                   "upper_band": 101000.0, "lower_band": 99000.0}
+MOCK_PRICE["BTC"] = 100500.0
+st._run_round()                      # 首轮记基准
+MOCK_SIG["BTC"] = {"ts": closed_ts(1), "trend": "UP",
+                   "upper_band": 101000.0, "lower_band": 99000.0}
+st._run_round()                      # 新K线 → 挂多单
+MOCK_PRICE["BTC"] = 99980.0
+with storage.get_conn() as mc:
+    trade_logic.update_paper_positions(mc)   # 挂单成交 OPEN @99990
+with storage.get_conn() as mc:
+    held = mc.execute("SELECT 1 FROM trade_positions WHERE token='BTC' "
+                      "AND strategy='supertrend' "
+                      "AND status IN ('OPEN','PARTIAL')").fetchone()
+check("前置：持仓 OPEN", held is not None)
+MOCK_SIG["BTC"] = {"ts": closed_ts(2), "trend": "DOWN",
+                   "upper_band": 101000.0, "lower_band": 99000.0}
+MOCK_PRICE["BTC"] = 100700.0
+st._run_round()                      # 反转：LONG vs DOWN → 市价平仓
+with storage.get_conn() as mc:
+    gone = not mc.execute("SELECT 1 FROM trade_positions WHERE token='BTC' "
+                          "AND strategy='supertrend' "
+                          "AND status IN ('OPEN','PARTIAL')").fetchone()
+    last = dict(mc.execute("SELECT * FROM trade_positions WHERE token='BTC' "
+                           "AND strategy='supertrend' "
+                           "ORDER BY id DESC LIMIT 1").fetchone())
+check("端到端：反转后市价平仓（DB 列 → _run_round 全链路）",
+      gone and last["status"] == "CLOSED" and "趋势反转" in (last["advice"] or ""),
+      str(last))
+with storage.get_conn(config.SUPERTREND_DB) as sc:
+    st_state = sc.execute("SELECT state FROM supertrend_status WHERE token='BTC'").fetchone()
+check("平仓轮状态归位 WAIT_DIR（只做多等 UP）",
+      st_state and st_state["state"] == "WAIT_DIR",
+      str(dict(st_state) if st_state else None))
+with storage.get_conn(config.SUPERTREND_DB) as sc:
+    sc.execute("UPDATE supertrend_tokens SET close_on_reverse=0 WHERE token='BTC'")
+reset_pos()
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

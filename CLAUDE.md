@@ -34,6 +34,8 @@ Deployment path: `/root/binance-monitor/bsm-agent/` on a Linux server with Japan
 - `agent-trade/scripts/extract_market_data.py` — Agent's data entry point. Branches by `AGENT_DATA_SOURCE` config.
 - `agent-review/scripts/extract_review_data.py` — Review data extractor with noise filter + orphan filter.
 - `manage_processes.py` — Process manager. `restart` does SIGKILL + wait 180s + start. Called by `/api/system/restart`.
+- `event_agent.py` — 事件驱动独立进程（两条管线：加密 `crypto_event` + 美股/商品 `stock_event`）。抓取一次写两个库；AI 走 DeepSeek（`EVENT_AI_*`）；只做纸盘。
+- `event_coins.py` / `stock_coins.py` — 两条管线的标的识别（币种别名 / 美股+商品 ticker 映射，后者必须在币安 TradFi 永续名单里；**不做指数/ETF**）。
 
 ## Config parameters worth knowing
 
@@ -78,6 +80,10 @@ The trading SKILL's decision JSON must use envelope format `{"market_read": "...
 - `/agent-kol` — KOL Agent monitor
 - `/agent-kol-snapshot` — KOL cognitive snapshot monitor
 - `/agent-short` — Short Agent panel
+- `/crypto-events` — 加密事件展览（金十快讯里指向某个币种的消息）
+- `/crypto-event-ai` — 加密事件 AI 判定（利多/利空 + 该判定开的纸盘仓）
+- `/stock-events` — 美股/商品事件展览（指向美股个股/商品标的的消息；不含指数/ETF）
+- `/stock-event-ai` — 美股/商品 AI 判定（利好/利空 + 纸盘仓）
 - `/strategies` — Multi-strategy overview
 - `/dashboard` — Market panorama dashboard
 - `/settings` — Trading parameters, Agent switches, intervals

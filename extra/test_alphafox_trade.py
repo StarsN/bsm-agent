@@ -51,10 +51,64 @@ T2 = "bn-222"
 K1 = 1000.0 / 100000.0   # T1 的 k_qty
 
 
-def make_snap(trader_id, margin, positions, orders=None):
+# 假平台的成交流水（tradePoints）：trader → {(token, side): [point, ...]}，跨轮累积。
+# 真平台就是这样：开过/平过的都留点，判据（_tp_closed）看"最近一笔是不是 CLOSE"。
+_TP_HIST: dict = {}
+
+
+def _synth_tp(trader_id, positions, no_close=False):
+    """照真样本合成 tradePoints：持仓各留一条 OPEN 点；**这轮没了的仓**补一条 CLOSE 点。
+
+    真平台平仓会记 CLOSE（实测 7/7：平过的币都有、还持有的一律没有）——
+    不补的话，"按快照缺失判平仓"的旁证判据会把所有模拟平仓的用例判成平台抖动。
+    要模拟**平台抖动**（丢行但没有平仓记录，2026-09-29 CL 事故）→ no_close=True。"""
+    keys = set()
+    for p in positions or []:
+        if not isinstance(p, dict):     # 脏数据用例会塞裸字符串进来
+            continue
+        sym = str(p.get("symbol") or "").upper()
+        if not sym:
+            continue
+        keys.add((sym[:-4] if sym.endswith("USDT") else sym,
+                  str(p.get("side") or "").upper()))
+    hist = _TP_HIST.setdefault(trader_id, {})
+    now_ms = int(time.time() * 1000)
+
+    def _pt(k, action, ts):
+        return {"symbol": f"{k[0]}USDT",
+                "side": "BUY" if k[1] == "LONG" else "SELL",
+                "action": action, "quantity": 1.0, "price": 1.0, "timeMs": ts}
+
+    for k in sorted(keys):
+        lst = hist.setdefault(k, [])
+        if not lst or lst[-1]["action"] != "OPEN":
+            lst.append(_pt(k, "OPEN", now_ms - 60000))
+    for k, lst in sorted(hist.items()):
+        if k not in keys and lst and lst[-1]["action"] == "OPEN" and not no_close:
+            lst.append(_pt(k, "CLOSE", now_ms))
+    return {f"{k[0]}USDT": [dict(x) for x in lst]
+            for k, lst in hist.items() if lst}
+
+
+def seed_tp(trader_id, token, side, action="CLOSE"):
+    """给假平台的成交流水**预置**一条点：给"快照里从来没出现过"的符号用
+    （孤儿仓就是这样——交易员早平了，我们才开始跟，他的流水里留着那条 CLOSE）。"""
+    hist = _TP_HIST.setdefault(trader_id, {})
+    lst = hist.setdefault((token, side), [])
+    if not lst or lst[-1]["action"] != action:
+        lst.append({"symbol": f"{token}USDT",
+                    "side": "BUY" if side == "LONG" else "SELL",
+                    "action": action, "quantity": 1.0, "price": 1.0,
+                    "timeMs": int(time.time() * 1000)})
+
+
+def make_snap(trader_id, margin, positions, orders=None, no_close=False,
+              trade_points=None):
     d = {"traderName": trader_id, "marginBalance": margin, "positions": positions}
     if orders is not None:
         d["latestOrders"] = orders
+    d["tradePoints"] = (trade_points if trade_points is not None
+                        else _synth_tp(trader_id, positions, no_close))
     return {"data": d}
 
 
@@ -260,6 +314,7 @@ def main():
              'test','test','alphafox')
         """)
     PRICE["ORPHAN"] = 55
+    seed_tp(T1, "ORPHAN", "LONG", "CLOSE")  # 交易员平过（孤儿成因）→ 流水里有 CLOSE 点
     aft.process(T1, make_snap(T1, 100000, []), PARAMS)  # T1 首轮（只识别候选）
     with storage.get_conn() as conn:
         row = conn.execute(
@@ -762,6 +817,7 @@ def main():
             "1.0,100.0,100.0,'alphafox',0.0,?)",
             (json.dumps({"trader_id": TE, "k_qty": 0.01}),))
     PRICE["ORPH1"] = 100.0
+    seed_tp(TE, "ORPH1", "LONG", "CLOSE")   # 交易员早平过（孤儿成因）→ 流水里有 CLOSE 点
     aft.process(TE, make_snap(TE, 100000, []), PARAMS)   # 首轮：只识别候选
     check("首轮记下孤儿候选", TE in aft._orphan_pending
           and len(aft._orphan_pending[TE]) == 1, str(aft._orphan_pending.get(TE)))
@@ -1612,6 +1668,241 @@ def main():
                          PARAMS)
     check("无永续/无标记价 → 跳过该币",
           r["results"][0]["action"] == "跳过" and count_active(_TOK5) == 0, str(r))
+
+    print("== 60. 平台快照抖动：没有平仓记录就不许平、基线不许重开"
+          "（2026-09-29 CL 事故）==")
+    TJ = "bn-JIT"
+    aft.set_follow(TJ, "JIT", "", True)
+    aft._prev_snap.clear()
+    aft._jitter_since.clear()
+    aft._jitter_notified.clear()
+    PRICE["JIT1"] = 10.0
+    _pos_j = [tp("JIT1USDT", "LONG", 1000, 10.0, 10.0, lev=2)]
+    aft.process(TJ, make_snap(TJ, 100000, []), PARAMS)          # 首轮：只建基线
+    _s = aft.process(TJ, make_snap(TJ, 100000, _pos_j), PARAMS)  # 交易员开仓 → 我们跟开
+    check("60 前置：跟开一笔",
+          count_active("JIT1") == 1 and _s and _s[0]["action"] == "OPEN", str(_s))
+    _q_j = open_qty("JIT1")
+
+    # 平台空包 ×2（tradePoints 里没有平仓点 = 抖动）
+    aft.process(TJ, make_snap(TJ, 100000, [], no_close=True), PARAMS)      # 异常第 1 轮
+    _s = aft.process(TJ, make_snap(TJ, 100000, [], no_close=True), PARAMS)  # 第 2 轮：确认异常
+    check("60 抖动：不发平仓信号（没有平仓点就不许平）",
+          all(x["action"] != "CLOSE" for x in _s), str(_s))
+    check("60 抖动：纸盘仓还在（没被误平）", open_qty("JIT1") == _q_j,
+          str(open_qty("JIT1")))
+    check("60 抖动：扣留记了账（日志/页面可查）",
+          (TJ, "JIT1USDT", "LONG") in aft._jitter_since, str(aft._jitter_since))
+
+    # 快照恢复（同一个老仓）→ 基线保住了它 → 不许当新开仓（今天亏钱的就是这条）
+    _s = aft.process(TJ, make_snap(TJ, 100000, _pos_j), PARAMS)
+    check("60 恢复后不重开（基线没被清空）",
+          all(x["action"] != "OPEN" for x in _s) and open_qty("JIT1") == _q_j,
+          f"{_s} {open_qty('JIT1')}")
+
+    # 证据后来才到（流水里终于有 CLOSE 点）→ 正常平，不卡死
+    aft.process(TJ, make_snap(TJ, 100000, [], no_close=False), PARAMS)
+    _s = aft.process(TJ, make_snap(TJ, 100000, [], no_close=False), PARAMS)
+    check("60 证据到了 → 正常平仓（自愈，不卡死）",
+          any(x["action"] == "CLOSE" for x in _s) and count_active("JIT1") == 0,
+          f"{_s} {count_active('JIT1')}")
+
+    print("== 61. 抖动超时：只发 TG 提醒、不动仓位 ==")
+    TK = "bn-JITB"
+    aft.set_follow(TK, "JITB", "", True)
+    aft._prev_snap.clear()
+    aft._jitter_since.clear()
+    aft._jitter_notified.clear()
+    PRICE["JITB"] = 10.0
+    aft.process(TK, make_snap(TK, 100000, []), PARAMS)          # 首轮：只建基线
+    aft.process(TK, make_snap(TK, 100000,
+                              [tp("JITBUSDT", "SHORT", 1000, 10.0, 10.0, lev=2)]), PARAMS)
+    _q_b = open_qty("JITB")
+    check("61 前置：跟开一笔", _q_b > 0, str(_q_b))
+    _sent = []
+    import tg_notify
+    _orig_send = tg_notify.send_alphafox_jitter_alert
+    _orig_th = aft.threading
+    tg_notify.send_alphafox_jitter_alert = lambda t, s, m: _sent.append((t, s, m))
+
+    class _SyncThread:      # 提醒是异步线程发的，测试里改成同步才看得到
+        def __init__(self, target=None, args=(), daemon=None, **kw):
+            self._t, self._a = target, args
+
+        def start(self):
+            self._t(*self._a)
+
+    aft.threading = type("Th", (), {"Thread": _SyncThread})
+    try:
+        aft.process(TK, make_snap(TK, 100000, [], no_close=True), PARAMS)
+        aft.process(TK, make_snap(TK, 100000, [], no_close=True), PARAMS)
+        check("61 刚扣留不发提醒", _sent == [], str(_sent))
+        _kk = (TK, "JITBUSDT", "SHORT")
+        _now = time.time()
+        aft._jitter_since[_kk] = [_now - aft.JITTER_NOTIFY_AFTER - 1, _now]  # 时间推进
+        aft.process(TK, make_snap(TK, 100000, [], no_close=True), PARAMS)
+        check("61 超时 → 发一条 TG 提醒（带币种/方向/分钟）",
+              len(_sent) == 1 and _sent[0][0] == "JITB" and _sent[0][1] == "SHORT"
+              and _sent[0][2] >= 5, str(_sent))
+        check("61 提醒不动仓位", open_qty("JITB") == _q_b, str(open_qty("JITB")))
+        aft.process(TK, make_snap(TK, 100000, [], no_close=True), PARAMS)
+        check("61 一小时内不重复提醒（防刷屏）", len(_sent) == 1, str(_sent))
+        # 超过一小时 → 再提醒一次（防漏看；计时器仍指向同一笔）
+        aft._jitter_notified[_kk] = time.time() - aft.JITTER_NOTIFY_EVERY - 1
+        aft.process(TK, make_snap(TK, 100000, [], no_close=True), PARAMS)
+        check("61 超过一小时 → 再提醒一次", len(_sent) == 2, str(_sent))
+    finally:
+        tg_notify.send_alphafox_jitter_alert = _orig_send
+        aft.threading = _orig_th
+
+    print("== 62. 抖动期间恢复托管：不许把仓标成「已脱离」==")
+    TL = "bn-JITC"
+    aft.set_follow(TL, "JITC", "", True)
+    aft._prev_snap.clear()
+    with storage.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO trade_positions (token, symbol, side, status, mode, "
+            "margin_amount, leverage, notional, quantity, entry_price, "
+            "current_price, strategy, closed_qty, managed, signal_snapshot) "
+            "VALUES ('JITC','JITCUSDT','LONG','OPEN','paper',100.0,2.0,200.0,"
+            "1.0,100.0,100.0,'alphafox',0.0,2,?)",
+            (json.dumps({"trader_id": TL, "k_qty": 0.01}),))
+    aft.process(TL, make_snap(TL, 100000, []), PARAMS)       # 基线（交易员空仓）
+    aft.process(TL, make_snap(TL, 100000, [], no_close=True), PARAMS)
+    aft.process(TL, make_snap(TL, 100000, [], no_close=True), PARAMS)
+    with storage.get_conn() as conn:
+        _mr = conn.execute("SELECT managed FROM trade_positions "
+                           "WHERE token='JITC'").fetchone()
+    check("62 抖动不标已脱离（留在恢复中，等人处理）",
+          _mr and _mr["managed"] == 2, str(dict(_mr) if _mr else None))
+
+    print("== 63. 抖动期间孤儿确认：没有平仓点不确认（不误平孤儿）==")
+    TM = "bn-JITD"
+    aft.set_follow(TM, "JITD", "", True)
+    aft._prev_snap.clear()
+    with storage.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO trade_positions (token, symbol, side, status, mode, "
+            "margin_amount, leverage, notional, quantity, entry_price, "
+            "current_price, strategy, closed_qty, signal_snapshot) "
+            "VALUES ('JITD','JITDUSDT','LONG','OPEN','paper',100.0,2.0,200.0,"
+            "1.0,100.0,100.0,'alphafox',0.0,?)",
+            (json.dumps({"trader_id": TM, "k_qty": 0.01}),))
+    PRICE["JITD"] = 100.0
+    aft.process(TM, make_snap(TM, 100000, []), PARAMS)       # 首轮：只记候选
+    check("63 首轮只记候选不动作",
+          len(aft._orphan_pending.get(TM) or []) == 1 and our_pos("JITD") is not None,
+          str(aft._orphan_pending.get(TM)))
+    aft.process(TM, make_snap(TM, 100000, [], no_close=True), PARAMS)   # 抖动
+    check("63 抖动：不确认平仓（孤儿仓保留，等证据）", our_pos("JITD") is not None,
+          str(our_pos("JITD")))
+
+    print("== 64. 单币消失（多仓，不进异常闸门）：必须扣留，其余仓照常 ==")
+    TN = "bn-JITM"
+    aft.set_follow(TN, "JITM", "", True)
+    aft._prev_snap.clear()
+    aft._jitter_since.clear()
+    _toks_m = ["JITMA", "JITMB", "JITMC", "JITMD"]
+    for _t in _toks_m:
+        PERPS.add(_t)
+        PRICE[_t] = 10.0
+    _pos_m = [tp(f"{_t}USDT", "LONG", 1000, 10.0, 10.0, lev=2) for _t in _toks_m]
+    aft.process(TN, make_snap(TN, 100000, []), PARAMS)          # 首轮：基线
+    _s = aft.process(TN, make_snap(TN, 100000, _pos_m), PARAMS)
+    check("64 前置：4 个仓都跟上了",
+          sum(count_active(_t) for _t in _toks_m) == 4, str(_s))
+    _q_md = open_qty("JITMD")
+    # 少一个（4→3）：丢 1/4 判不到异常 → 直接进阶段1（判据下沉的意义所在）
+    _s = aft.process(TN, make_snap(TN, 100000, _pos_m[:3], no_close=True), PARAMS)
+    check("64 单币消失：不发平仓信号", all(x["action"] != "CLOSE" for x in _s), str(_s))
+    check("64 单币消失：仓还在（没被误平）", open_qty("JITMD") == _q_md,
+          str(open_qty("JITMD")))
+    check("64 其余仓不受影响（无任何信号）", _s == [], str(_s))
+    _s = aft.process(TN, make_snap(TN, 100000, _pos_m), PARAMS)   # 快照恢复
+    check("64 恢复后不重开（基线保住了它）",
+          all(x["action"] != "OPEN" for x in _s) and open_qty("JITMD") == _q_md,
+          f"{_s} {open_qty('JITMD')}")
+    # 证据到了（流水里终于有 CLOSE）→ 单轮就平（非异常路径不延迟）
+    _s = aft.process(TN, make_snap(TN, 100000, _pos_m[:3]), PARAMS)
+    check("64 证据到了 → 单轮平仓（不延迟）",
+          any(x["action"] == "CLOSE" for x in _s) and count_active("JITMD") == 0,
+          f"{_s} {count_active('JITMD')}")
+
+    print("== 65. 部分骤降 + 混合证据：真平的照平、抖动的扣留 ==")
+    TP2 = "bn-JITN"
+    aft.set_follow(TP2, "JITN", "", True)
+    aft._prev_snap.clear()
+    aft._jitter_since.clear()
+    _toks_n = ["JITNA", "JITNB", "JITNC"]
+    for _t in _toks_n:
+        PERPS.add(_t)
+        PRICE[_t] = 10.0
+    _pos_n = [tp(f"{_t}USDT", "LONG", 1000, 10.0, 10.0, lev=2) for _t in _toks_n]
+    aft.process(TP2, make_snap(TP2, 100000, []), PARAMS)
+    aft.process(TP2, make_snap(TP2, 100000, _pos_n), PARAMS)
+    check("65 前置：3 个仓", sum(count_active(_t) for _t in _toks_n) == 3, "")
+    seed_tp(TP2, "JITNB", "LONG", "CLOSE")      # B 是真平（流水里留了 CLOSE 点）
+    # 掉 2 个（3→1）= 异常 → 第 1 轮待确认、第 2 轮确认 → 逐币验证据
+    aft.process(TP2, make_snap(TP2, 100000, _pos_n[:1], no_close=True), PARAMS)
+    _s = aft.process(TP2, make_snap(TP2, 100000, _pos_n[:1], no_close=True), PARAMS)
+    _acts = {x["symbol"]: x["action"] for x in _s}
+    check("65 有 CLOSE 点的（真平）→ 照平", _acts.get("JITNBUSDT") == "CLOSE", str(_s))
+    check("65 没有 CLOSE 点的（抖动）→ 扣留不平",
+          "JITNCUSDT" not in _acts and count_active("JITNC") == 1,
+          f"{_s} {count_active('JITNC')}")
+    check("65 还在的仓不受影响", count_active("JITNA") == 1, str(count_active("JITNA")))
+
+    print("== 66. 脏包：tradePoints 不是 dict → 当「没有旁证」，不许打断整轮 ==")
+    TZ = "bn-JITZ"
+    aft.set_follow(TZ, "JITZ", "", True)
+    aft._prev_snap.clear()
+    aft._jitter_since.clear()
+    for _t in ("JITZY", "JITZZ"):
+        PERPS.add(_t)
+        PRICE[_t] = 10.0
+    _pos_z = [tp(f"{_t}USDT", "LONG", 1000, 10.0, 10.0, lev=2) for _t in ("JITZY", "JITZZ")]
+    aft.process(TZ, make_snap(TZ, 100000, []), PARAMS)
+    aft.process(TZ, make_snap(TZ, 100000, _pos_z), PARAMS)
+    _qz = open_qty("JITZZ")
+    # 脏包：少一个仓 + tradePoints 给成 list（上游什么都可能给）
+    _dirty = {"data": {"traderName": TZ, "marginBalance": 100000.0,
+                       "positions": _pos_z[:1], "tradePoints": ["garbage"]}}
+    try:
+        _s = aft.process(TZ, _dirty, PARAMS)
+        _no_raise = True
+    except Exception as _e:      # noqa: BLE001
+        _s, _no_raise = [], False
+        print(f"    （抛了 {type(_e).__name__}: {_e}）")
+    check("66 脏包不抛异常（不许打断整轮）", _no_raise, str(_s))
+    check("66 脏包按「没有旁证」处理 → 扣留不平",
+          all(x["action"] != "CLOSE" for x in _s) and open_qty("JITZZ") == _qz,
+          f"{_s} {open_qty('JITZZ')}")
+
+    print("== 67. 扣留期间别的仓照常跟；扣留恢复后交易员的加仓也照跟 ==")
+    TW = "bn-JITW"
+    aft.set_follow(TW, "JITW", "", True)
+    aft._prev_snap.clear()
+    aft._jitter_since.clear()
+    for _t in ("JITW1", "JITW2"):
+        PERPS.add(_t)
+        PRICE[_t] = 10.0
+    _pw1 = tp("JITW1USDT", "LONG", 1000, 10.0, 10.0, lev=2)
+    _pw2 = tp("JITW2USDT", "LONG", 1000, 10.0, 10.0, lev=2)
+    aft.process(TW, make_snap(TW, 100000, []), PARAMS)            # 基线
+    aft.process(TW, make_snap(TW, 100000, [_pw1, _pw2]), PARAMS)  # 跟开 2 仓
+    _qw1 = open_qty("JITW1")
+    # 抖动：W1 消失（无平仓点）→ 扣留；同时 W2 被交易员加仓 → 必须照跟
+    _pw2_add = tp("JITW2USDT", "LONG", 1500, 10.0, 10.0, lev=2)
+    _s = aft.process(TW, make_snap(TW, 100000, [_pw2_add], no_close=True), PARAMS)
+    _acts = {x["symbol"]: x["action"] for x in _s}
+    check("67 扣留期间不影响别的仓加仓", _acts.get("JITW2USDT") == "ADD", str(_s))
+    check("67 扣留的仓没被平", open_qty("JITW1") == _qw1, str(open_qty("JITW1")))
+    # 扣留的仓回来了、且交易员加了仓 → 照跟加仓（扣留自动解除，不粘住）
+    _pw1_add = tp("JITW1USDT", "LONG", 1300, 10.0, 10.0, lev=2)
+    _s = aft.process(TW, make_snap(TW, 100000, [_pw1_add, _pw2_add]), PARAMS)
+    check("67 恢复后交易员加的仓照跟（不粘住）",
+          {x["symbol"]: x["action"] for x in _s}.get("JITW1USDT") == "ADD"
+          and open_qty("JITW1") > _qw1, f"{_s} {open_qty('JITW1')}")
 
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     sys.exit(1 if FAIL else 0)

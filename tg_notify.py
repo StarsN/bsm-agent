@@ -148,6 +148,36 @@ def send_alphafox_trader_actions(signals: list[dict]):
         print(f"[tg] 交易员动作流推送异常: {e}")
 
 
+def send_alphafox_jitter_alert(token: str, side: str, minutes: int):
+    """平台快照抖动提醒（跟单 bot）：某仓从快照消失、但平台成交流水没有平仓记录。
+
+    只提醒、**不动仓位**——系统暂不跟这一笔的平仓，等人判断
+    （真平仓但平台始终不记 CLOSE 点属于极端情况，宁可不动也不许误平/误开）。
+    """
+    bot = getattr(config, "ALPHAFOX_TG_BOT_TOKEN", "")
+    chat_id = getattr(config, "ALPHAFOX_TG_CHAT_ID", "")
+    if not bot or not chat_id:
+        return
+    side_cn = "多" if side == "LONG" else "空"
+    text = (f"<b>⚠️ 跟单异常：疑似平台数据抖动</b>\n"
+            f"{token} {side_cn}单 已从平台快照消失 {minutes} 分钟，"
+            f"但平台成交流水里<b>没有平仓记录</b>。\n"
+            f"已暂停跟平（仓位未动）—— 若交易员确实已平仓，"
+            f"请在跟单页手动平掉这一笔；若你已手动处理过，忽略本条即可。")
+    try:
+        r = requests.post(
+            TG_API.format(token=bot),
+            json={"chat_id": chat_id, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10,
+        )
+        if getattr(r, "status_code", 200) >= 400:
+            print(f"[tg] 抖动提醒推送被拒 {getattr(r, 'status_code', '?')}: "
+                  f"{getattr(r, 'text', '')[:200]}")
+    except Exception as e:
+        print(f"[tg] 抖动提醒推送异常: {e}")
+
+
 def send_supertrend_reversal(token: str, old_trend: str, new_trend: str,
                              upper: float, lower: float, price: float,
                              candle_ts: int):

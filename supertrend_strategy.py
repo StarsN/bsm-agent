@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS supertrend_tokens (
     flip_market_tolerance_pct REAL,         -- 反转市价容忍%（NULL=用全局；0=不设限直接市价进）
     paused              INTEGER DEFAULT 0,  -- 1=暂停监控（线程跳过；持仓/挂单不动，1s 循环仍管）
     sort_order          INTEGER,            -- 卡片拖拽排序（NULL 排最后）
-    live_mode           INTEGER DEFAULT 0   -- 1=实盘镜像（纸盘为策略引擎，supertrend_live 同步币安）
+    live_mode           INTEGER DEFAULT 0,  -- 1=实盘镜像（纸盘为策略引擎，supertrend_live 同步币安）
+    close_on_reverse    INTEGER DEFAULT 0   -- 1=趋势反转后：活跃方向≠当前趋势 → 市价平仓+撤逆势挂单
 );
 
 CREATE TABLE IF NOT EXISTS supertrend_status (
@@ -97,6 +98,7 @@ def init_db():
             ("paused", "INTEGER DEFAULT 0"),
             ("sort_order", "INTEGER"),
             ("live_mode", "INTEGER DEFAULT 0"),
+            ("close_on_reverse", "INTEGER DEFAULT 0"),
         ])
         now = int(time.time())
         for token in getattr(config, "SUPERTREND_TOKENS", []) or []:
@@ -485,9 +487,13 @@ def _update_sl(conn, pos: dict, sig: dict, tol_pct: float) -> None:
                 print(f"[supertrend] {pos['token']} SL 下移 {old_sl} → {new_sl}")
 
 
-def close_supertrend_position(token: str, reason: str = "REMOVED") -> bool:
-    """幂等平仓唯一入口（web 移除 + 线程清理安全网共用）。
+def close_supertrend_position(token: str, reason: str = "REMOVED",
+                              slip_pct: float = 0.0,
+                              price: float | None = None) -> bool:
+    """幂等平仓唯一入口（web 移除 + 线程清理 + 反转平仓共用）。
     口径对齐现有平仓路径：close 价写 current_price、realized/pnl_pct 同口径。
+    slip_pct>0：市价平仓按假设滑点取更差的成交价（多单 ×(1−slip%)、空单 ×(1+slip%)）。
+    price：调用方已取的标记价（复用，省一次取价）；None → 自行取。
     挂单（PENDING）→ 取消。返回是否实际处理（已被处理返回 False，静默）。
     并存场景（市价仓+挂单）：挂单取消后继续平持仓，不能提前 return。"""
     token = token.upper()
@@ -497,12 +503,14 @@ def close_supertrend_position(token: str, reason: str = "REMOVED") -> bool:
         pends = [dict(r) for r in conn.execute(
             "SELECT * FROM trade_positions WHERE token=? AND strategy='supertrend' "
             "AND status='PENDING'", (token,)).fetchall()]
+        pend_advice = ("移除监控：挂单已取消" if reason == "REMOVED"
+                       else f"超势策略平仓（{reason}）：挂单已取消")
         for pend in pends:
             conn.execute(
                 "UPDATE trade_positions SET status='CANCELED', "
-                "advice='移除监控：挂单已取消', closed_at=CURRENT_TIMESTAMP "
+                "advice=?, closed_at=CURRENT_TIMESTAMP "
                 "WHERE id=? AND status='PENDING'",
-                (pend["id"],),
+                (pend_advice, pend["id"]),
             )
             storage.trade_signal_lock_release(conn, token, "supertrend")
             print(f"[supertrend] {token} 挂单已取消（{reason}）")
@@ -513,7 +521,8 @@ def close_supertrend_position(token: str, reason: str = "REMOVED") -> bool:
             "AND status IN ('OPEN','PARTIAL')", (token,)).fetchall()]
         if not rows:
             return handled
-        price = get_mark_price(token)
+        if not price or price <= 0:
+            price = get_mark_price(token)
         if not price or price <= 0:
             print(f"[supertrend] {token} 平仓失败：缺少标记价")
             return False
@@ -525,25 +534,31 @@ def close_supertrend_position(token: str, reason: str = "REMOVED") -> bool:
             open_qty = max(qty - closed_qty, 0)
             if open_qty <= 0:
                 continue
-            realized = float(pos.get("realized_pnl") or 0)
+            # 市价平仓滑点：多单卖出更低价、空单买回更高价（与 1s 扫损同口径）
             if pos.get("side") == "SHORT":
-                realized += (entry - price) * open_qty
+                fill = price * (1 + slip_pct / 100) if slip_pct else price
+                realized = float(pos.get("realized_pnl") or 0) + (entry - fill) * open_qty
             else:
-                realized += (price - entry) * open_qty
+                fill = price * (1 - slip_pct / 100) if slip_pct else price
+                realized = float(pos.get("realized_pnl") or 0) + (fill - entry) * open_qty
             margin = float(pos.get("margin_amount") or 1)
-            advice = ("移除监控：按市价平仓" if reason == "REMOVED"
-                      else f"超势策略平仓（{reason}）")
+            if reason == "REMOVED":
+                advice = "移除监控：按市价平仓"
+            elif slip_pct:
+                advice = f"超势策略平仓（{reason}）@ ${fill:.6g}（含假设滑点）"
+            else:
+                advice = f"超势策略平仓（{reason}）@ ${fill:.6g}"
             cur = conn.execute(
                 "UPDATE trade_positions SET status='CLOSED', current_price=?, "
                 "closed_qty=?, realized_pnl=?, unrealized_pnl=0, "
                 "pnl_pct=?, advice=?, closed_at=CURRENT_TIMESTAMP "
                 "WHERE id=? AND status IN ('OPEN','PARTIAL')",
-                (price, qty, realized, (realized / margin) * 100, advice, pos["id"]),
+                (fill, qty, realized, (realized / margin) * 100, advice, pos["id"]),
             )
             if cur.rowcount == 0:
                 continue
             storage.trade_signal_lock_release(conn, token, "supertrend")
-            print(f"[supertrend] {token} 平仓（{reason}）@ {price} "
+            print(f"[supertrend] {token} 平仓（{reason}）@ {fill} "
                   f"realized={realized:.4f}")
             record_close_snap(token, pos["id"])
             closed_any = True
@@ -611,10 +626,12 @@ def _write_status(conn_st, token: str, sig: dict, price: float, pos: dict | None
 def _process_token(conn, conn_st, token: str, tol_sl_pct: float,
                    tol_order_pct: float, notional: float, leverage: float,
                    direction: str = "BOTH", flip_market_open: bool = False,
-                   flip_tol_pct: float | None = None) -> None:
+                   flip_tol_pct: float | None = None,
+                   close_on_reverse: bool = False) -> None:
     """单币处理：拉信号 → 取价 → 兜底合并同向多笔 →
     有持仓 → 新K线更新 SL（只朝有利）；有挂单 → 方向受限且趋势反转则取消，
     否则新K线更新挂单价+SL（无条件跟随）；持仓挂单并存时两者都处理；
+    close_on_reverse=1 且活跃方向≠当前趋势 → 市价平仓+撤逆势挂单（状态型：每轮检查）；
     无仓无单 → 等新闭合K线才挂单（首次加入先记基准，扫损后等下一根闭合，
     期间 state=WAITING；方向受限且趋势不符 → state=WAIT_DIR；
     flip_market_open=1 且受限方向反转到允许方向 → 市价开仓 + 同轮挂单；
@@ -717,8 +734,30 @@ def _process_token(conn, conn_st, token: str, tol_sl_pct: float,
                              f"={flip_ref:.6g}×(1{'+' if sig['trend'] == 'UP' else '-'}"
                              f"{flip_tol_pct}%)）")
 
+    # 反转市价平仓（按币设置，状态型）：每轮检查「活跃方向 ≠ 当前趋势」→ 平仓+撤逆势挂单。
+    # 不带 new_candle 门槛：新鲜翻转仍是翻转后第一轮（≤60s）动作；额外覆盖「开启设置时已有
+    # 逆势仓」与「平仓失败重试」——带门槛会被 last_candle_ts 去重卡到下一根 K 线。成功平仓后
+    # 活跃行消失，判据自然失效 → 不重复动作；入场仍需新闭合 K 线 → 同一根 K 线不反手
+    reversed_closed = False
+    active_side = pos["side"] if pos else (pending["side"] if pending else None)
+    if close_on_reverse and active_side is not None:
+        against = ((active_side == "LONG" and sig["trend"] == "DOWN")
+                   or (active_side == "SHORT" and sig["trend"] == "UP"))
+        if against:
+            reversed_closed = close_supertrend_position(
+                token, reason="趋势反转",
+                slip_pct=config.TRADING_STOP_SLIPPAGE_PCT, price=price)
+            if reversed_closed:
+                if flip_open:
+                    # 平掉的是"与允许方向相反"的遗留持仓（方向切换场景）：同轮"反转到
+                    # 允许方向"的市价开+挂单是设计内动作，不能被刚清掉的陈旧活跃行挡掉。
+                    # 仅此情形放行；普通场景（如 BOTH 币）仍保持"同一根K线不反手"
+                    pos = pending = None
+                elif not direction_ok:
+                    dir_wait = True
+
     if pos:
-        if new_candle:
+        if new_candle and not reversed_closed:
             _update_sl(conn, pos, sig, tol_sl_pct)
     if pending:
         if not direction_ok:
@@ -733,7 +772,7 @@ def _process_token(conn, conn_st, token: str, tol_sl_pct: float,
                 storage.trade_signal_lock_release(conn, token, "supertrend")
                 print(f"[supertrend] {token} 方向限制：趋势反转，挂单已取消（等{wait_trend}趋势）")
             dir_wait = True
-        elif new_candle:
+        elif new_candle and not reversed_closed:
             _update_order(conn, pending, sig, price, tol_order_pct, tol_sl_pct)
     if not pos and not pending:
         now_ms = int(time.time() * 1000)
@@ -894,6 +933,7 @@ def _run_round() -> None:
         tok_flip_tol = _num(t.get("flip_market_tolerance_pct"), flip_tol)
         if not (0 <= tok_flip_tol <= 20):
             tok_flip_tol = flip_tol
+        tok_cor = t.get("close_on_reverse") in (1, "1", True)
         # 兜底合并同向多笔：纯 DB 操作、不依赖 OKX/标记价，所以放在取数之前。
         # 暂停币也要合并（暂停期间挂单仍可能成交产生第二笔）→ 放在 paused 判断之前
         try:
@@ -908,7 +948,8 @@ def _run_round() -> None:
                 with storage.get_conn(config.SUPERTREND_DB) as conn_st:
                     _process_token(main_conn, conn_st, t["token"],
                                    tok_tol, tok_order_tol, tok_notional,
-                                   tok_lev, tok_dir, tok_flip, tok_flip_tol)
+                                   tok_lev, tok_dir, tok_flip, tok_flip_tol,
+                                   tok_cor)
         except Exception as e:
             print(f"[supertrend] {t['token']} 处理异常: {e}")
         # 币间间隔：平滑 OKX 调用峰值（限额 5次/秒，20币也仅 0.3次/秒，此为保险）

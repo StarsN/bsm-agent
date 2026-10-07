@@ -460,7 +460,9 @@ MUTATIONS = [
         "old": """        # 本轮执行期间被取消 → 不写回（写回会抵消 set_follow 的清基线：
         # 重新跟单首轮不重建 → 按停用前的旧快照补开仓/推过期信号）
         if _is_enabled(trader_id):
-            _prev_snap[trader_id] = cur
+            # 判为抖动的仓：基线里**保留旧值**（不能抹掉）——抹掉的话下一轮快照
+            # 恢复时同一个老仓会变成"cur 有 prev 无" → 被当新开仓真下单
+            _prev_snap[trader_id] = {**cur, **{k: prev[k] for k in held_back}}
         else:
             _prev_snap.pop(trader_id, None)""",
         "new": """        _prev_snap[trader_id] = cur  # MUT 不校验跟单状态""",
@@ -2787,6 +2789,223 @@ const EV_STEP = 20;""",
         "new": """        if lv is None:   # MUT 不区分认领""",
         "script": "extra/test_alphafox_live.py",
         "caught_by": "交易所有我们的仓 + 可用余额不足：仍认领",
+    },
+    {
+        "name": "M259 阶段1 不查平仓证据（平台丢行/空包被当成交易员平仓 → 误平+重开）",
+        "module": "alphafox_trade",
+        "old": """            if not _tp_closed(data, key):
+                # 平台成交流水里没有平仓点 → 判为快照抖动（丢行/空包），不许平：
+                # 误平是真金白银（2026-09-29 CL 事故）。等证据（下轮证据到了正常平），
+                # 超时只发 TG 提醒；本仓保留在基线里（见函数尾部），
+                # 否则快照恢复时同一个老仓会变成"cur 有 prev 无" → 被当新开仓真下单
+                held_back.add(key)
+                _note_jitter(trader_id, key)
+                continue""",
+        "new": """            if False:   # MUT 不查平仓证据（2026-09-29 事故版）
+                continue""",
+        "script": "extra/test_alphafox_trade.py",
+        "caught_by": "60 抖动：不发平仓信号 / 60 抖动：纸盘仓还在",
+    },
+    {
+        "name": "M260 判抖动的仓照样从基线里抹掉（恢复后重开真下单）",
+        "module": "alphafox_trade",
+        "old": """            _prev_snap[trader_id] = {**cur, **{k: prev[k] for k in held_back}}""",
+        "new": """            _prev_snap[trader_id] = cur   # MUT 抖动仓也被抹掉""",
+        "script": "extra/test_alphafox_trade.py",
+        "caught_by": "60 恢复后不重开（基线没被清空）",
+    },
+    {
+        "name": "M261 孤儿确认不查平仓证据（抖动期间误平孤儿仓）",
+        "module": "alphafox_trade",
+        "old": """        if not _tp_closed(data or {}, key):
+            _note_jitter(trader_id, key)
+            continue
+        if _close_our_position(trader_id, key, None, params):""",
+        "new": """        if False:   # MUT 孤儿确认不查平仓证据
+            continue
+        if _close_our_position(trader_id, key, None, params):""",
+        "script": "extra/test_alphafox_trade.py",
+        "caught_by": "63 抖动：不确认平仓",
+    },
+    {
+        "name": "M262 恢复托管不查平仓证据（抖动期间把仓标成已脱离）",
+        "module": "alphafox_trade",
+        "old": """            if not _tp_closed(data or {}, key):
+                # 平台成交流水里没有平仓点 → 快照抖动：不标"已脱离"、也不喂给下面的
+                # 连续缺失计数（标记后守卫全拦，只有用户再点一次才能解除）
+                _note_jitter(trader_id, key)
+                continue
+            mk = (trader_id, pos["id"])""",
+        "new": """            if False:   # MUT 恢复托管不查平仓证据
+                continue
+            mk = (trader_id, pos["id"])""",
+        "script": "extra/test_alphafox_trade.py",
+        "caught_by": "62 抖动不标已脱离",
+    },
+    {
+        "name": "M263 抖动逃逸阀静默（扣留超时也不提醒，用户永远不知道）",
+        "module": "alphafox_trade",
+        "old": """    try:
+        import tg_notify
+        threading.Thread(
+            target=tg_notify.send_alphafox_jitter_alert,
+            args=(_token_of(key[0]), key[1], mins), daemon=True).start()
+    except Exception as e:
+        print(f"[alphafox] 抖动提醒发送失败: {e}")""",
+        "new": """    pass  # MUT 逃逸阀不发提醒""",
+        "script": "extra/test_alphafox_trade.py",
+        "caught_by": "61 超时 → 发一条 TG 提醒",
+    },
+    {
+        "name": "M264 旁证判据不防脏包（tradePoints 给成 list → AttributeError 打断整轮）",
+        "module": "alphafox_trade",
+        "old": """    if not isinstance(tps, dict):
+        # 脏包（tradePoints 给成 list/str 之类）：当"没有旁证"处理——
+        # 直接 .get 会抛 AttributeError 把整轮 process 打断（上游什么都可能给）
+        return False""",
+        "new": """    # MUT 不防脏包""",
+        "script": "extra/test_alphafox_trade.py",
+        "caught_by": "66 脏包不抛异常",
+    },
+    {
+        "name": "M265 美股标的不过 TradFi 白名单（未上市的公司也开仓）",
+        "module": "stock_coins",
+        "old": """        if not tk or tk in seen or not _tradable(tk):
+            return""",
+        "new": """        if not tk or tk in seen:   # MUT 不验 TradFi 白名单
+            return""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "京东/百度/蔚来/波音/星巴克（白名单外）被挡",
+    },
+    {
+        "name": "M266 指数被收进来（标普→SPY，违背「不做指数」）",
+        "module": "stock_coins",
+        "old": """    "泡泡玛特": "POPMART",""",
+        "new": """    "泡泡玛特": "POPMART",
+    "标普": "SPY", "标普500": "SPY",   # MUT 把指数也映射了""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "标普/纳指/道琼斯不映射",
+    },
+    {
+        "name": "M267 每条消息的标的上限失效（要闻整理一条能带出 7 个）",
+        "module": "stock_coins",
+        "old": """    return [t for _, _, t in hits[:n]]""",
+        "new": """    return [t for _, _, t in hits]   # MUT 不限个数""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "≤3 个上限 / max_n 生效",
+    },
+    {
+        "name": "M268 英文名回退 \\b 词边界（MetaMask 被当成 Meta；中文句尾也匹配不到）",
+        "module": "stock_coins",
+        "old": """    return re.compile(r"(?<![A-Za-z])" + re.escape(name) + r"(?![A-Za-z])",
+                      re.IGNORECASE)""",
+        "new": """    return re.compile(r"\\b" + re.escape(name) + r"\\b", re.IGNORECASE)   # MUT""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "MetaMask ≠ Meta / 中文句子里的 AMD 能认",
+    },
+    {
+        "name": "M269 美股事件交易门槛失效（低置信度判定也开仓）",
+        "module": "event_agent",
+        # 锚点必须带上一行"利好/利空"：加密管线的 SQL 尾部与它逐字相同，
+        # 不带就成了"改加密那处"（M269 第一版就是这么被漏掉的）
+        "old": """            "AND ai.impact IN ('利好','利空','利多') "
+            "AND ai.confidence >= ? ORDER BY ai.id", (cfg["min_conf"],))]""",
+        "new": """            "AND ai.impact IN ('利好','利空','利多') "
+            "AND ai.confidence >= 0 ORDER BY ai.id", ())]  # MUT 门槛失效""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "护栏：过期 + 低置信度各留一条未下单原因",
+    },
+    {
+        "name": "M270 美股事件首轮就回填历史（几百条过期快讯全灌进来）",
+        "module": "event_agent",
+        "old": """    with storage.get_conn(config.STOCK_EVENT_DB_PATH) as conn:
+        wm = storage.stock_event_meta_get(conn, "watermark_msg_id", "")
+    watermark = int(wm) if wm.isdigit() else None""",
+        "new": """    with storage.get_conn(config.STOCK_EVENT_DB_PATH) as conn:
+        wm = storage.stock_event_meta_get(conn, "watermark_msg_id", "")
+    watermark = int(wm) if wm.isdigit() else 0   # MUT 首轮也回填""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "首轮只记水位、不回填",
+    },
+    {
+        "name": "M271 商品区间去重失效（「布伦特原油」算成 BZ+CL，一处引用开两个仓）",
+        "module": "stock_coins",
+        "old": """        if any(span[0] < c[1] and c[0] < span[1] for c in claimed):
+            continue""",
+        "new": """        if False:   # MUT 不去重
+            continue""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "「布伦特原油」只是一处引用 → 只算 BZ",
+    },
+    {
+        "name": "M272 中文短名的下一个字排除失效（高通胀→高通、现代化→现代汽车）",
+        "module": "stock_coins",
+        "old": """_NEG_NEXT = {"高通": "胀", "现代": "化"}""",
+        "new": """_NEG_NEXT: dict = {}   # MUT 不排除""",
+        "script": "extra/test_stock_event.py",
+        "caught_by": "「高通胀」不是高通 / 「现代化」不是现代汽车",
+    },
+    {
+        "name": "M273 反转平仓开关失效（设置关也市价平仓）",
+        "module": "supertrend_strategy",
+        "old": """    if close_on_reverse and active_side is not None:""",
+        "new": """    if active_side is not None:  # MUT 开关失效""",
+        "script": "extra/test_supertrend_logic.py",
+        "caught_by": "37 设置关=原逻辑（翻转不主动平仓）",
+    },
+    {
+        "name": "M274 反转平仓方向判反（顺向翻转也平仓）",
+        "module": "supertrend_strategy",
+        "old": """        against = ((active_side == "LONG" and sig["trend"] == "DOWN")
+                   or (active_side == "SHORT" and sig["trend"] == "UP"))""",
+        "new": """        against = ((active_side == "LONG" and sig["trend"] == "UP")
+                   or (active_side == "SHORT" and sig["trend"] == "DOWN"))  # MUT 判反""",
+        "script": "extra/test_supertrend_logic.py",
+        "caught_by": "37 顺向不平 / 逆势平仓",
+    },
+    {
+        "name": "M275 反转平仓不带假设滑点（纸面按现价平、高估收益）",
+        "module": "supertrend_strategy",
+        "old": """                slip_pct=config.TRADING_STOP_SLIPPAGE_PCT, price=price)""",
+        "new": """                slip_pct=0.0, price=price)  # MUT 去掉滑点""",
+        "script": "extra/test_supertrend_logic.py",
+        "caught_by": "37 平仓价含 0.15% 滑点",
+    },
+    {
+        "name": "M276 反转平仓加回新K线门槛（存量逆势仓/失败重试要等下一根K线）",
+        "module": "supertrend_strategy",
+        "old": """    reversed_closed = False
+    active_side = pos["side"] if pos else (pending["side"] if pending else None)
+    if close_on_reverse and active_side is not None:""",
+        "new": """    reversed_closed = False
+    active_side = pos["side"] if pos else (pending["side"] if pending else None)
+    if close_on_reverse and new_candle and active_side is not None:  # MUT 加回门槛""",
+        "script": "extra/test_supertrend_logic.py",
+        "caught_by": "37 存量补平（同K线内）+ 取价恢复同K线重试",
+    },
+    {
+        "name": "M277 web 保存接口漏写 close_on_reverse 列（开关静默不生效）",
+        "module": "web",
+        "old": "flip_market_tolerance_pct=?, close_on_reverse=? ",
+        "new": "flip_market_tolerance_pct=? ",
+        "script": "extra/_check_flip_wiring.py",
+        "caught_by": "8 保存 API UPDATE 含该列",
+    },
+    {
+        "name": "M278 每币 close_on_reverse 不读取（接线断：列存了也不生效）",
+        "module": "supertrend_strategy",
+        "old": """        tok_cor = t.get("close_on_reverse") in (1, "1", True)""",
+        "new": """        tok_cor = False  # MUT 不读取""",
+        "script": "extra/_check_flip_wiring.py",
+        "caught_by": "8 端到端：反转后市价平仓（DB 列 → _run_round）",
+    },
+    {
+        "name": "M279 平仓后不清陈旧活跃行（翻转轮的反手市价开被吞）",
+        "module": "supertrend_strategy",
+        "old": """                    pos = pending = None""",
+        "new": """                    _ = 0  # MUT 不清陈旧活跃行""",
+        "script": "extra/test_supertrend_logic.py",
+        "caught_by": "37 翻转轮同轮反手（市价开空+挂单并存）",
     },
 ]
 

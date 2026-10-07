@@ -508,10 +508,11 @@ def main():
     check("旧数据保留且 forming 为 NULL",
           row and row["trend"] == "UP" and row["last_sl"] == 3
           and row["forming_trend"] is None, str(dict(row) if row else None))
-    check("tokens 表自动加 8 列",
+    check("tokens 表自动加 9 列",
           all(c in tok_cols for c in ("notional_usd", "sl_tolerance_pct",
                                       "order_tolerance_pct", "leverage", "direction",
-                                      "flip_market_open", "paused", "sort_order")),
+                                      "flip_market_open", "paused", "sort_order",
+                                      "close_on_reverse")),
           str(tok_cols))
     config.SUPERTREND_DB = os.path.join(_TMP, "supertrend.db")
 
@@ -1377,6 +1378,154 @@ def main():
     with storage.get_conn(config.SUPERTREND_DB) as sc:
         sc.execute("UPDATE supertrend_tokens SET direction='BOTH', flip_market_open=0, "
                    "flip_market_tolerance_pct=NULL WHERE token='BTC'")
+
+    print("== 37. 反转市价平仓（close_on_reverse）==")
+    SLIP = config.TRADING_STOP_SLIPPAGE_PCT
+
+    def cor_proc(cor):
+        with storage.get_conn() as mc, storage.get_conn(config.SUPERTREND_DB) as sc:
+            st._process_token(mc, sc, "COR", 1.0, 1.0, 50.0, 3.0,
+                              "BOTH", False, 0.0, cor)
+
+    with storage.get_conn() as mc:
+        mc.execute("DELETE FROM trade_positions WHERE strategy='supertrend'")
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("DELETE FROM supertrend_status WHERE token='COR'")
+        sc.execute("INSERT OR REPLACE INTO supertrend_tokens "
+                   "(token, status, added_at, direction, close_on_reverse) "
+                   "VALUES ('COR','ACTIVE',0,'BOTH',0)")
+    # 建仓：UP 趋势，价格 99500 ≤ 挂单价 99990 → 价格到位直接市价开多
+    set_sig("COR", "UP", 101000, 99000)
+    MOCK_PRICE["COR"] = 99500
+    cor_proc(False)                 # 首轮记基准
+    new_candle("COR")
+    cor_proc(False)
+    p = pos_of("COR")
+    check("37 建仓：市价开多 @99500 SL=98010",
+          p and p["side"] == "LONG" and abs(p["entry_price"] - 99500) < 1e-6
+          and abs(p["stop_loss_price"] - 98010) < 1e-6,
+          str(p and (p["status"], p["side"], p["entry_price"])))
+    # 顺向：趋势仍 UP，开启设置也不平（防判反）
+    cor_proc(True)
+    check("37 顺向（多单+UP）开启设置不平", pos_of("COR") is not None)
+    # 关 = 原逻辑：翻 DOWN → 冻结 SL、不主动平仓
+    set_sig("COR", "DOWN", 101000, 99000)
+    new_candle("COR")
+    new_candle("COR")
+    MOCK_PRICE["COR"] = 100800
+    cor_proc(False)
+    p = pos_of("COR")
+    check("37 设置关：翻转不主动平仓（原逻辑）", p and p["status"] == "OPEN",
+          str(p and p["status"]))
+    check("37 设置关：SL 冻结不动（98010）",
+          p and abs(p["stop_loss_price"] - 98010) < 1e-6, str(p and p["stop_loss_price"]))
+    # 开 + 存量逆势：同一根K线内开启（无 new_candle）→ 也平（状态型、每轮检查）
+    cor_proc(True)
+    with storage.get_conn() as mc:
+        row = dict(mc.execute(
+            "SELECT * FROM trade_positions WHERE token='COR' AND strategy='supertrend' "
+            "ORDER BY id DESC LIMIT 1").fetchone())
+    fill = 100800 * (1 - SLIP / 100)
+    check("37 存量补平：同K线内开启即平（不带新K线门槛）", row["status"] == "CLOSED",
+          str(row["status"]))
+    check("37 平仓价含 0.15% 假设滑点",
+          abs(float(row["current_price"]) - fill) < 1e-6,
+          f'{row["current_price"]} vs {fill}')
+    check("37 advice 记趋势反转+滑点",
+          "趋势反转" in (row["advice"] or "") and "含假设滑点" in (row["advice"] or ""),
+          str(row["advice"]))
+    qty = 50 / 99500
+    check("37 realized 按滑点价结算",
+          abs(float(row["realized_pnl"]) - (fill - 99500) * qty) < 1e-6,
+          f'{row["realized_pnl"]} vs {(fill - 99500) * qty}')
+    # 逆势挂单一并撤：DOWN 下挂空单 → 翻 UP → 设置开 → 挂单 CANCELED
+    new_candle("COR")
+    MOCK_PRICE["COR"] = 99500
+    cor_proc(False)                 # 趋势仍 DOWN：挂空单 @ 101000*0.99=99990
+    pend = pending_of("COR")
+    check("37 建空单挂单（前置）", pend and pend["side"] == "SHORT",
+          str(pend and pend["side"]))
+    set_sig("COR", "UP", 101000, 99000)
+    new_candle("COR")
+    cor_proc(True)
+    with storage.get_conn() as mc:
+        row2 = dict(mc.execute(
+            "SELECT * FROM trade_positions WHERE token='COR' AND strategy='supertrend' "
+            "ORDER BY id DESC LIMIT 1").fetchone())
+    check("37 逆势挂单被一并撤销",
+          pending_of("COR") is None and row2["status"] == "CANCELED"
+          and "趋势反转" in (row2["advice"] or ""),
+          str(row2))
+    # 取价失败轮不动作（冻结 SL 兜底）；同一根K线内下一轮重试成功
+    new_candle("COR")
+    MOCK_PRICE["COR"] = 100500
+    cor_proc(False)                 # UP 下挂多单 @ 99990（现价高于挂单价）
+    pend = pending_of("COR")
+    check("37 建多单挂单（前置）", pend and pend["side"] == "LONG",
+          str(pend and pend["side"]))
+    MOCK_PRICE["COR"] = 99980
+    with storage.get_conn() as mc:
+        trade_logic.update_paper_positions(mc)   # 挂单成交 OPEN @99990
+    check("37 挂单成交 OPEN", pos_of("COR") is not None)
+    set_sig("COR", "DOWN", 101000, 99000)
+    new_candle("COR")
+    MOCK_PRICE.pop("COR")           # 取不到标记价 → 整轮早退不动作
+    cor_proc(True)
+    check("37 取价失败轮：不动作、不炸（冻结 SL 兜底）", pos_of("COR") is not None)
+    MOCK_PRICE["COR"] = 100700      # 价格恢复 → 同一根K线内下一轮重试成功
+    cor_proc(True)
+    check("37 取价恢复：同K线内自动重试平仓", pos_of("COR") is None)
+    # 方向切换遗留逆势仓 + flip_market_open：翻转轮同轮"先平 → 反手市价开 + 挂单"
+    with storage.get_conn() as mc:
+        mc.execute("DELETE FROM trade_positions WHERE strategy='supertrend'")
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("DELETE FROM supertrend_status WHERE token='COR'")
+        sc.execute("UPDATE supertrend_tokens SET direction='SHORT_ONLY', "
+                   "flip_market_open=1 WHERE token='COR'")
+    with storage.get_conn() as mc:   # 手工造"切方向遗留"的多单（引擎自己开不出来）
+        mc.execute(
+            "INSERT INTO trade_positions (token, symbol, side, status, mode, "
+            "margin_amount, leverage, notional, quantity, entry_price, "
+            "current_price, stop_loss_price, strategy) "
+            "VALUES ('COR','CORUSDT','LONG','OPEN','paper',50,3,150,0.0015,"
+            "100000,100000,98010,'supertrend')")
+    def flip_proc():
+        # direction/flip 由调用方传入（_run_round 读库），cor_proc 写死了 BOTH → 这里直调
+        with storage.get_conn() as mc, storage.get_conn(config.SUPERTREND_DB) as sc:
+            st._process_token(mc, sc, "COR", 1.0, 1.0, 50.0, 3.0,
+                              "SHORT_ONLY", True, 0.0, True)
+
+    set_sig("COR", "UP", 101000, 99000)    # SHORT_ONLY 受限方向：记基准（旧趋势 UP）
+    MOCK_PRICE["COR"] = 100000
+    flip_proc()
+    set_sig("COR", "DOWN", 101000, 99000)  # 翻到允许方向（was_blocked）
+    new_candle("COR")
+    MOCK_PRICE["COR"] = 99500
+    flip_proc()
+    sh = pos_of("COR")
+    check("37 翻转轮同轮反手：市价开空",
+          sh and sh["status"] == "OPEN" and sh["side"] == "SHORT",
+          str(sh and (sh["status"], sh["side"])))
+    check("37 翻转轮同轮反手：成交价=现价 99500",
+          sh and abs(sh["entry_price"] - 99500) < 1e-6, str(sh and sh["entry_price"]))
+    check("37 翻转轮同轮反手：空单 SL=上轨*1.01=102010",
+          sh and abs(sh["stop_loss_price"] - 102010) < 1e-6,
+          str(sh and sh["stop_loss_price"]))
+    pend = pending_of("COR")
+    check("37 翻转轮同轮反手：同轮挂单并存", pend and pend["side"] == "SHORT",
+          str(pend and pend["side"]))
+    with storage.get_conn() as mc:
+        lg = dict(mc.execute(
+            "SELECT * FROM trade_positions WHERE token='COR' AND strategy='supertrend' "
+            "AND side='LONG' ORDER BY id DESC LIMIT 1").fetchone())
+    check("37 翻转轮同轮反手：遗留多单已被平（趋势反转）",
+          lg and lg["status"] == "CLOSED" and "趋势反转" in (lg["advice"] or ""), str(lg))
+    # 清理
+    with storage.get_conn() as mc:
+        mc.execute("DELETE FROM trade_positions WHERE token='COR'")
+    with storage.get_conn(config.SUPERTREND_DB) as sc:
+        sc.execute("DELETE FROM supertrend_status WHERE token='COR'")
+        sc.execute("DELETE FROM supertrend_tokens WHERE token='COR'")
 
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     sys.exit(1 if FAIL else 0)

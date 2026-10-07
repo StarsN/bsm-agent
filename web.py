@@ -44,32 +44,30 @@ app = FastAPI(title="Binance Square Monitor")
 # ============================================================
 # 统一导航栏：高频直达 + 分组下拉（各页面 HTML 用 {NAV} 占位符）
 # ============================================================
-_NAV_ITEMS = [
-    ("/", "📊 市场监控", "home"),
-    ("/strategies", "📈 运行策略", "strategies"),
-    ("/alphafox", "📡 跟单雷达", "alphafox"),
-]
+_NAV_ITEMS = []         # 不再有顶级直达：高频入口并入 TAG，TAG 标签本身就带链接
+# 三大 TAG（市场=信息 / 策略=动作 / 实盘=真金白银）+ 尾部系统设置。
+# 结构与覆盖见 extra/_check_nav.py（那里钉着"每个页面 key 都在导航里"）。
 _NAV_DROPDOWNS = [
-    # 真金白银的三个页面收在一个 TAG 下
-    ("💹 实盘", [
-        ("/live-binance", "币安实盘", "live-binance"),
-        ("/live-onchain", "实盘监控", "live-onchain"),
-        ("/alphafox-live", "跟单托管", "alphafox-live"),
-        ("/supertrend-live", "趋势实盘", "supertrend-live"),
+    ("🌐 市场", "/", [
+        ("/", "市场监控", "home"),
+        ("/dashboard", "市场全景", "dashboard"),
+        ("/crypto-events", "加密事件展览", "crypto-events"),
+        ("/stock-events", "美股/商品事件展览", "stock-events"),
     ]),
-    ("🔍 链上数据", [
+    ("🎯 策略", "/strategies", [
+        ("-", "总览", ""),
+        ("/strategies", "运行策略", "strategies"),
+        ("-", "跟单", ""),
+        ("/alphafox", "跟单雷达", "alphafox"),
+        ("-", "趋势", ""),
+        ("/supertrend", "主流币趋势", "supertrend"),
+        ("-", "事件 AI", ""),
+        ("/crypto-event-ai", "加密 AI 判定", "crypto-event-ai"),
+        ("/stock-event-ai", "美股 AI 判定", "stock-event-ai"),
+        ("-", "链上", ""),
         ("/onchain", "链上监控", "onchain"),
         ("/alpha-cluster", "Alpha 集群", "alpha-cluster"),
-    ]),
-    ("📈 策略行情", [
-        ("/dashboard", "市场全景", "dashboard"),
-        ("/supertrend", "主流币趋势", "supertrend"),
-    ]),
-    ("⚡ 加密事件", [
-        ("/crypto-events", "事件展览", "crypto-events"),
-        ("/crypto-event-ai", "AI 判定", "crypto-event-ai"),
-    ]),
-    ("🤖 Agent 面板", [
+        ("-", "Agent 面板", ""),
         ("/agent", "Agent-合约扫描", "agent"),
         ("/heat-agent", "Agent-热度榜单", "heat-agent"),
         ("/agent-heat-lessons", "Agent-热度有教训", "agent-heat-lessons"),
@@ -78,23 +76,49 @@ _NAV_DROPDOWNS = [
         ("/agent-kol", "Agent-KOL 监控", "agent-kol"),
         ("/agent-kol-snapshot", "Agent-KOL 快照监控", "agent-kol-snapshot"),
     ]),
+    # link=None = TAG 标签纯悬停不可点（实盘：用户 2026-10-02 定）
+    ("💹 实盘", None, [
+        ("/live-binance", "币安实盘", "live-binance"),
+        ("/live-onchain", "实盘监控", "live-onchain"),
+        ("/alphafox-live", "跟单托管", "alphafox-live"),
+        ("/supertrend-live", "趋势实盘", "supertrend-live"),
+    ]),
 ]
 _NAV_TAIL = ("/settings", "⚙ 系统设置", "settings")
 
 
 def _nav_html(active: str) -> str:
-    parts = []
+    """统一导航（三大 TAG + 系统设置）。
+
+    · TAG 标题可点（市场→/、策略→/strategies）；link=None 则纯悬停（实盘）
+    · 下拉里的 ("-", "总览", "") 是**分组小标题**：不可点，样式走内联 ——
+      各页面的 <style> 各自一份（14+ 处），新增 class 就得逐页改，内联免维护
+    · 高亮：页面传的 active key 落在哪个 TAG 里，哪个 TAG 标题高亮
+    """
+    parts: list = []
+
+    def _row(href: str, label: str, key: str, first: bool) -> str:
+        if href == "-":      # 分组小标题（第一条不画上分隔线）
+            sep = "" if first else "border-top:1px solid var(--border);margin-top:4px;"
+            return ('<div style="font-size:11px;color:var(--muted);opacity:.75;'
+                    f'padding:8px 16px 2px;{sep}">{label}</div>')
+        cls = ' class="active"' if key == active else ''
+        return f'<a href="{href}"{cls}>{label}</a>'
+
     for href, label, key in _NAV_ITEMS:
         cls = ' class="active"' if key == active else ''
         parts.append(f'<a href="{href}"{cls}>{label}</a>')
-    for title, entries in _NAV_DROPDOWNS:
-        cur = any(k == active for _, _, k in entries)
+    for title, link, entries in _NAV_DROPDOWNS:
+        cur = any(k and k == active for _, _, k in entries)
         tcls = ' class="active"' if cur else ''
-        parts.append(f'<div class="nav-dropdown"><a href="#" {tcls}>{title} ▾</a>'
-                     f'<div class="nav-dropdown-content">')
-        for href, label, key in entries:
-            cls = ' class="active"' if key == active else ''
-            parts.append(f'<a href="{href}"{cls}>{label}</a>')
+        tap = f'href="{link}"' if link else 'href="#"'
+        # 滚动护栏（内联，不动各页 CSS）：策略下拉 ~20 行 ≈ 560px，
+        # 矮屏（1366×768）上不加会被屏幕裁掉、底部 Agent 几项点不到
+        parts.append(f'<div class="nav-dropdown"><a {tap}{tcls}>{title} ▾</a>'
+                     f'<div class="nav-dropdown-content" '
+                     f'style="max-height:70vh;overflow-y:auto">')
+        for i, (href, label, key) in enumerate(entries):
+            parts.append(_row(href, label, key, first=(i == 0)))
         parts.append('</div></div>')
     href, label, key = _NAV_TAIL
     cls = ' class="active"' if key == active else ''
@@ -720,6 +744,14 @@ class TradingSettingsBody(BaseModel):
     event_cooldown_minutes: float | None = None
     event_daily_max: int | None = None
     event_poll_seconds: float | None = None
+    # 美股/商品事件（独立库；抓取复用加密事件那条）
+    stock_event_enabled: bool | None = None
+    stock_event_trade_enabled: bool | None = None
+    stock_event_min_confidence: int | None = None
+    stock_event_fresh_minutes: float | None = None
+    stock_event_cooldown_minutes: float | None = None
+    stock_event_daily_max: int | None = None
+    stock_event_max_tickers: int | None = None
     supertrend_enabled: bool | None = None
     supertrend_sl_tolerance_pct: float | None = None
     supertrend_order_tolerance_pct: float | None = None
@@ -1166,7 +1198,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_max_notional", "alphafox_live_ratio", "alphafox_live_leverage"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "stock_event_enabled", "stock_event_trade_enabled", "stock_event_min_confidence", "stock_event_fresh_minutes", "stock_event_cooldown_minutes", "stock_event_daily_max", "stock_event_max_tickers", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_max_notional", "alphafox_live_ratio", "alphafox_live_leverage"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -4960,6 +4992,47 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   </div>
 
   <div class="strategy-block">
+    <div class="strategy-name">📈 美股/商品事件驱动（独立库；标的是美股个股+商品，不含指数/ETF）</div>
+    <div class="grid3">
+      <div>
+        <label>策略开关</label>
+        <select id="trade-stock-event-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>纸盘下单开关</label>
+        <select id="trade-stock-event-trade-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>置信度门槛（0-100，低于不开）</label>
+        <input id="trade-stock-event-min-confidence" type="number" min="0" max="100" step="1">
+      </div>
+      <div>
+        <label>事件新鲜度（分钟，超过不开）</label>
+        <input id="trade-stock-event-fresh-minutes" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>同标的冷却（分钟）</label>
+        <input id="trade-stock-event-cooldown-minutes" type="number" min="0" step="1">
+      </div>
+      <div>
+        <label>每日上限（笔）</label>
+        <input id="trade-stock-event-daily-max" type="number" min="1" step="1">
+      </div>
+      <div>
+        <label>每条消息最多标的（1-5）</label>
+        <input id="trade-stock-event-max-tickers" type="number" min="1" max="5" step="1">
+      </div>
+    </div>
+    <div style="color:var(--muted);font-size:11px;margin-top:4px">抓取复用加密事件那条（同一频道、只抓一次，两条管线互不拖累）；页面见 /stock-events 与 /stock-event-ai</div>
+  </div>
+
+  <div class="strategy-block">
     <div class="strategy-name">跟单雷达（alphofox 数据源）</div>
     <div class="grid3">
       <div>
@@ -5157,6 +5230,15 @@ async function loadSettings() {
     document.getElementById('trade-event-cooldown-minutes').value = s.event_cooldown_minutes ?? 30;
     document.getElementById('trade-event-daily-max').value = s.event_daily_max ?? 12;
     document.getElementById('trade-event-poll-seconds').value = s.event_poll_seconds ?? 60;
+    document.getElementById('trade-stock-event-switch').value =
+      (s.stock_event_enabled ?? true) ? 'true' : 'false';
+    document.getElementById('trade-stock-event-trade-switch').value =
+      (s.stock_event_trade_enabled ?? true) ? 'true' : 'false';
+    document.getElementById('trade-stock-event-min-confidence').value = s.stock_event_min_confidence ?? 75;
+    document.getElementById('trade-stock-event-fresh-minutes').value = s.stock_event_fresh_minutes ?? 15;
+    document.getElementById('trade-stock-event-cooldown-minutes').value = s.stock_event_cooldown_minutes ?? 120;
+    document.getElementById('trade-stock-event-daily-max').value = s.stock_event_daily_max ?? 6;
+    document.getElementById('trade-stock-event-max-tickers').value = s.stock_event_max_tickers ?? 3;
     document.getElementById('trade-alphafox-poll').value = s.alphafox_poll_seconds ?? 15;
     document.getElementById('trade-alphafox-trade-switch').value = s.alphafox_trade_enabled ?? true;
     document.getElementById('trade-alphafox-live-switch').value = s.alphafox_live_enabled ?? false;
@@ -5258,6 +5340,15 @@ async function saveTradingSettings() {
     event_cooldown_minutes: numOrUndef('trade-event-cooldown-minutes'),
     event_daily_max: numOrUndef('trade-event-daily-max'),
     event_poll_seconds: numOrUndef('trade-event-poll-seconds'),
+    stock_event_enabled: document.getElementById('trade-stock-event-switch').value === 'true',
+    stock_event_trade_enabled:
+      document.getElementById('trade-stock-event-trade-switch').value === 'true',
+    // 同样用 numOrUndef：清空输入框时 Number('') = 0 会把门槛静默改掉（M255 时代的教训）
+    stock_event_min_confidence: numOrUndef('trade-stock-event-min-confidence'),
+    stock_event_fresh_minutes: numOrUndef('trade-stock-event-fresh-minutes'),
+    stock_event_cooldown_minutes: numOrUndef('trade-stock-event-cooldown-minutes'),
+    stock_event_daily_max: numOrUndef('trade-stock-event-daily-max'),
+    stock_event_max_tickers: numOrUndef('trade-stock-event-max-tickers'),
     supertrend_leverage: Number(document.getElementById('trade-supertrend-leverage').value),
     strategy_initial_supertrend: Number(document.getElementById('trade-strategy-supertrend').value),
     alphafox_poll_seconds: Number(document.getElementById('trade-alphafox-poll').value),
@@ -5429,6 +5520,10 @@ def api_strategy_stats():
             "onchain": ts.get("onchain_strategy_enabled", True),
             "supertrend": ts.get("supertrend_enabled", True),
             "alphafox": ts.get("alphafox_trade_enabled", True),
+            # 事件两条管线也是"有仓才出现在列表里"的策略：开关要如实反映
+            # （不写进 map 的话 enabled_map.get(..., True) 会永远显示"启用"）
+            "crypto_event": ts.get("event_strategy_enabled", True),
+            "stock_event": ts.get("stock_event_enabled", True),
         }
         for s in strategies:
             s["running"] = enabled_map.get(s["strategy"], True)
@@ -6989,7 +7084,9 @@ def onchain_page():
 @app.get("/onchain/token/{token}", response_class=HTMLResponse)
 def cluster_page(token: str):
     return HTMLResponse(
-        content=CLUSTER_HTML.replace("{NAV}", _nav_html("cluster")),
+        # 钻取页（从 /onchain 点币名进来）：高亮父页「链上监控」——
+        # 传 "cluster" 的话导航里没有这个 key，整条导航会一个都不亮（导航检查抓到过）
+        content=CLUSTER_HTML.replace("{NAV}", _nav_html("onchain")),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
 
@@ -8142,6 +8239,7 @@ def _supertrend_overview_compute():
             "leverage": t.get("leverage"),
             "direction": t.get("direction") or "BOTH",
             "flip_market_open": t.get("flip_market_open") in (1, "1", True),
+            "close_on_reverse": t.get("close_on_reverse") in (1, "1", True),
             # 每币**原始值**（弹窗回填要用它）+ **生效值**（卡片显示用）
             "flip_market_tolerance_pct": t.get("flip_market_tolerance_pct"),
             "flip_tolerance_effective": _st_effective_tol(
@@ -8394,15 +8492,18 @@ def api_supertrend_set_token(body: dict):
         raise HTTPException(400, "方向只能是 BOTH / LONG_ONLY / SHORT_ONLY")
     flip = 1 if str(body.get("flip_market_open")).strip() in ("1", "true", "True") else 0
     flip_tol = _num(body.get("flip_market_tolerance_pct"), 0, 20, "反转市价容忍")
+    # 反转市价平仓：对任何方向都有意义（BOTH 币同样生效），不做 BOTH 清零
+    cor = 1 if str(body.get("close_on_reverse")).strip() in ("1", "true", "True") else 0
     if direction == "BOTH":
         flip = 0  # 反转市价开仅对方向限制的币有意义
     with storage.get_conn(config.SUPERTREND_DB) as conn:
         cur = conn.execute(
             "UPDATE supertrend_tokens SET notional_usd=?, sl_tolerance_pct=?, "
             "order_tolerance_pct=?, leverage=?, direction=?, flip_market_open=?, "
-            "flip_market_tolerance_pct=? "
+            "flip_market_tolerance_pct=?, close_on_reverse=? "
             "WHERE token=?",
-            (notional, sl_tol, order_tol, lev, direction, flip, flip_tol, token),
+            (notional, sl_tol, order_tol, lev, direction, flip, flip_tol,
+             cor, token),
         )
         if cur.rowcount == 0:
             raise HTTPException(404, "该币种未在监控列表中")
@@ -8619,6 +8720,14 @@ tr:hover { background: rgba(88,166,255,0.04); }
     <div style="color:var(--muted);font-size:11px;margin-top:-4px">
       &gt;0 时：现价超出「反转前趋势线 ×(1±容忍%)」→ 只挂单等回调，不追反转后的高点/低点
     </div>
+    <label>趋势反转后立即市价平仓</label>
+    <select id="set-cor">
+      <option value="0">否（等回踩冻结止损，原逻辑）</option>
+      <option value="1">是（方向与趋势相反 → 市价平仓并撤销逆势挂单）</option>
+    </select>
+    <div style="color:var(--muted);font-size:11px;margin-top:-4px">
+      状态型：每轮检查，持仓/挂单方向与最新闭合K线趋势相反即平；开启前已存在的逆势仓也会被补平
+    </div>
     <label>交易模式</label>
     <select id="set-live">
       <option value="0">纸盘（模拟）</option>
@@ -8717,6 +8826,7 @@ function openTokenModal(token) {
   document.getElementById('set-direction').value = c.direction || 'BOTH';
   document.getElementById('set-flip').value = c.flip_market_open ? '1' : '0';
   document.getElementById('set-flip-tol').value = c.flip_market_tolerance_pct != null ? c.flip_market_tolerance_pct : '';
+  document.getElementById('set-cor').value = c.close_on_reverse ? '1' : '0';
   document.getElementById('set-live').value = c.live_mode ? '1' : '0';
   toggleFlip();
   document.getElementById('tok-modal').classList.add('show');
@@ -8754,6 +8864,7 @@ function saveTokenSettings() {
     direction: document.getElementById('set-direction').value,
     flip_market_open: document.getElementById('set-flip').value,
     flip_market_tolerance_pct: document.getElementById('set-flip-tol').value,
+    close_on_reverse: document.getElementById('set-cor').value,
     live_mode: document.getElementById('set-live').value,
   };
   fetch('/api/supertrend/set-token', {
@@ -8914,6 +9025,7 @@ function renderCards(cards) {
     if (c.sl_tolerance_pct != null) cust.push('SL' + c.sl_tolerance_pct + '%');
     if (c.order_tolerance_pct != null) cust.push('挂单' + c.order_tolerance_pct + '%');
     if (c.leverage != null) cust.push(c.leverage + 'x');
+    if (c.close_on_reverse) cust.push('反转平仓');
     if (c.flip_market_open && (c.direction === 'LONG_ONLY' || c.direction === 'SHORT_ONLY')) {
       cust.push('反转市价开');
       // 显示**生效值**（每币有效值优先、否则全局）：只显示每币覆盖值时，用全局
@@ -9531,6 +9643,89 @@ def api_crypto_event_ai(limit: int = 20, offset: int = 0, impact: str = ""):
             "ai_configured": bool(getattr(config, "EVENT_AI_API_KEY", ""))}
 
 
+# ============================================================
+# 美股/商品事件（event_agent.py 第二条管线）：/stock-events + /stock-event-ai
+# 独立库 db/stock_event.db；标的=美股个股+商品（币安 TradFi 永续，不含指数/ETF）
+# ============================================================
+_ST_META_KEYS = ("ai_state", "last_poll_at", "last_ai_at", "watermark_msg_id",
+                 "unmatched_samples")
+# 判定档位：美股管线用"利好"（同义的"利多"也认——解析层收两种，下单只认"利好/利空"）
+_ST_IMPACTS = ("利好", "利空", "中性", "无关")
+
+
+@app.get("/api/stock-events")
+def api_stock_events(limit: int = 20, offset: int = 0):
+    """美股事件展览：原始快讯（分页）+ 运行状态 + 最近未识别样本（用来补别名）"""
+    import json as _json
+    limit = min(max(int(limit or 20), 1), 200)
+    offset = max(int(offset or 0), 0)
+    storage.init_stock_event_db()
+    with storage.get_conn(config.STOCK_EVENT_DB_PATH) as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, msg_id, ts, text, tickers FROM stock_event_raw "
+            "ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))]
+        total = c.execute("SELECT COUNT(*) n FROM stock_event_raw").fetchone()["n"]
+        meta = {k: storage.stock_event_meta_get(c, k) for k in _ST_META_KEYS}
+    for r in rows:
+        try:
+            r["tickers"] = _json.loads(r["tickers"] or "[]")
+        except Exception:
+            r["tickers"] = []
+        r["ts_local"] = _ev_local_ts(r["ts"])
+    try:
+        unmatched = _json.loads(meta.get("unmatched_samples") or "[]")
+    except Exception:
+        unmatched = []
+    return {"ok": True, "total": total, "list": rows, "meta": meta,
+            "unmatched": unmatched,
+            "ai_configured": bool(getattr(config, "EVENT_AI_API_KEY", ""))}
+
+
+@app.get("/api/stock-event-ai")
+def api_stock_event_ai(limit: int = 20, offset: int = 0, impact: str = ""):
+    """美股 AI 判定卡片：原文 + 利好/利空 + 依据 + 该判定开的仓（可平仓）。
+
+    事件库（stock_event.db）与主库（仓位）是两个文件 → 先取判定，再拿 position_id 回主库查。"""
+    import json as _json
+    limit = min(max(int(limit or 20), 1), 200)
+    offset = max(int(offset or 0), 0)
+    # "利好"与"利多"同义（模型偶尔按加密档位答）→ 筛选按组匹配，别把信号筛丢
+    _grp = {"利好": ("利好", "利多"), "利多": ("利好", "利多"),
+            "利空": ("利空",), "中性": ("中性",), "无关": ("无关",)}.get(impact)
+    where, args = "", []
+    if _grp:
+        where = " AND ai.impact IN (%s)" % ",".join("?" * len(_grp))
+        args = list(_grp)
+    storage.init_stock_event_db()
+    with storage.get_conn(config.STOCK_EVENT_DB_PATH) as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT ai.id, ai.event_id, ai.ticker, ai.impact, ai.reason, ai.confidence, "
+            "ai.status, ai.attempts, ai.analyzed_at, ai.traded, raw.ts, raw.text, "
+            "t.position_id, t.side trade_side, t.ok trade_ok, t.reason trade_reason "
+            "FROM stock_event_ai ai JOIN stock_event_raw raw ON raw.id=ai.event_id "
+            "LEFT JOIN stock_event_trade t ON t.event_id=ai.event_id AND t.ticker=ai.ticker "
+            "WHERE 1=1" + where + " ORDER BY raw.id DESC, ai.ticker LIMIT ? OFFSET ?",
+            (*args, limit, offset))]
+        total = c.execute("SELECT COUNT(*) n FROM stock_event_ai ai WHERE 1=1" + where,
+                          args).fetchone()["n"]
+        meta = {k: storage.stock_event_meta_get(c, k) for k in _ST_META_KEYS}
+    pids = [r["position_id"] for r in rows if r.get("position_id")]
+    pos_map = {}
+    if pids:
+        marks = ",".join("?" * len(pids))
+        with storage.get_conn() as conn:
+            for r in conn.execute(
+                    f"SELECT id, token, side, status, quantity, entry_price, "
+                    f"current_price, unrealized_pnl FROM trade_positions "
+                    f"WHERE id IN ({marks})", pids):
+                pos_map[r["id"]] = dict(r)
+    for r in rows:
+        r["ts_local"] = _ev_local_ts(r["ts"])
+        r["position"] = pos_map.get(r.get("position_id"))
+    return {"ok": True, "total": total, "list": rows, "meta": meta,
+            "ai_configured": bool(getattr(config, "EVENT_AI_API_KEY", ""))}
+
+
 _EV_CSS = """
 :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3;
         --muted:#8b949e; --accent:#1f6feb; --green:#3fb950; --red:#f85149; --yellow:#d29922; }
@@ -9723,6 +9918,181 @@ loadAI(); setInterval(loadAI, 60000);
 def page_crypto_event_ai():
     """AI 判定卡片：原文 + 利多/利空 + 依据 + 该事件开的仓（可平仓）"""
     return (CRYPTO_EVENT_AI_HTML.replace("{NAV}", _nav_html("crypto-event-ai"))
+            .replace("{EV_CSS}", _EV_CSS))
+
+
+STOCK_EVENTS_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>美股/商品事件展览 - BSM Agent</title>
+<style>{EV_CSS}</style></head><body>
+{NAV}
+<div class="panel">
+  <b>📈 美股/商品事件（金十快讯）</b>
+  <span class="muted" style="margin-left:8px;font-size:11px">只收录**明确了美股个股/商品标的**的消息（不含指数/ETF）</span>
+  <div id="se-banner"></div>
+  <div id="se-meta" class="muted" style="font-size:11px;margin:8px 0"></div>
+  <div id="se-table"><span class="muted">加载中...</span></div>
+  <div class="more" id="se-more"></div>
+</div>
+<div class="panel">
+  <b>🔍 最近未识别到标的的消息</b>
+  <span class="muted" style="margin-left:8px;font-size:11px">用来补 stock_coins.py 的别名表（这些消息没入库、也没花 AI）</span>
+  <div id="se-unmatched" class="muted" style="font-size:12px;margin-top:8px">—</div>
+</div>
+<script>
+""" """
+const SE_STEP = 20;
+let seLimit = SE_STEP, seTotal = 0;
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function seBanner(d) {
+  const b = document.getElementById('se-banner');
+  if (!d.ai_configured) { b.innerHTML = '<div class="banner warn">⚠ AI 未配置（EVENT_AI_API_KEY 为空）：只抓取入库，不做判定</div>'; return; }
+  const st = (d.meta && d.meta.ai_state) || '';
+  b.innerHTML = st && st.indexOf('失败') >= 0
+    ? '<div class="banner warn">⚠ ' + esc(st) + '</div>' : '';
+}
+function seMeta(d) {
+  const m = d.meta || {};
+  const ts = s => s ? String(s).replace('T',' ').replace('Z','') : '—';
+  document.getElementById('se-meta').textContent =
+    '水位消息 id ' + (m.watermark_msg_id || '—') + ' ｜ 上次抓取 ' + ts(m.last_poll_at)
+    + ' ｜ 上次 AI 分析 ' + ts(m.last_ai_at) + ' ｜ 共 ' + d.total + ' 条';
+  const un = d.unmatched || [];
+  document.getElementById('se-unmatched').innerHTML = un.length
+    ? un.map(t => '<div style="margin:4px 0">· ' + esc(t) + '</div>').join('')
+    : '—';
+}
+async function loadEvents() {
+  const r = await fetch('/api/stock-events?limit=' + seLimit);
+  const d = await r.json();
+  seTotal = d.total; seBanner(d); seMeta(d);
+  const el = document.getElementById('se-table');
+  if (!d.list.length) { el.innerHTML = '<span class="muted">还没有事件（等 event_agent 抓到含美股/商品标的的消息）</span>'; return; }
+  el.innerHTML = '<table><thead><tr><th style="width:130px">时间</th><th style="width:150px">标的</th><th>原文</th></tr></thead><tbody>'
+    + d.list.map(e => '<tr><td class="muted">' + esc(e.ts_local) + '</td>'
+        + '<td>' + (e.tickers.length ? e.tickers.map(c => '<span class="tag">' + esc(c) + '</span>').join('') : '<span class="muted">—</span>') + '</td>'
+        + '<td>' + esc(e.text) + '</td></tr>').join('')
+    + '</tbody></table>';
+  document.getElementById('se-more').innerHTML = d.list.length < seTotal
+    ? '<button class="btn" onclick="seMore()">加载更多（+' + SE_STEP + '）</button>' : '';
+}
+function seMore() { seLimit += SE_STEP; loadEvents(); }
+loadEvents(); setInterval(loadEvents, 60000);
+</script>
+</body></html>"""
+
+
+@app.get("/stock-events", response_class=HTMLResponse)
+def page_stock_events():
+    """美股/商品事件展览：金十快讯里**明确指向美股个股/商品**的那些"""
+    return (STOCK_EVENTS_HTML.replace("{NAV}", _nav_html("stock-events"))
+            .replace("{EV_CSS}", _EV_CSS))
+
+
+STOCK_EVENT_AI_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>美股 AI 判定 - BSM Agent</title>
+<style>{EV_CSS}</style></head><body>
+{NAV}
+<div class="panel">
+  <b>🤖 美股/商品 AI 判定</b>
+  <span id="sai-session" class="muted" style="margin-left:8px;font-size:11px"></span>
+  <div id="sai-banner"></div>
+  <div id="sai-meta" class="muted" style="font-size:11px;margin:8px 0"></div>
+  <div style="margin:8px 0">
+    <button class="btn" onclick="setImp('')">全部</button>
+    <button class="btn" onclick="setImp('利好')">🟢 利好</button>
+    <button class="btn" onclick="setImp('利空')">🔴 利空</button>
+    <button class="btn" onclick="setImp('中性')">⚪ 中性</button>
+  </div>
+  <div id="sai-list"><span class="muted">加载中...</span></div>
+  <div class="more" id="sai-more"></div>
+</div>
+<script>
+""" """
+const SAI_STEP = 20;
+let saiLimit = SAI_STEP, saiTotal = 0, saiImpact = '';
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const IMP_CLS = {'利好':'bull','利空':'bear','中性':'flat','无关':'void','利多':'bull'};
+function setImp(v) { saiImpact = v; saiLimit = SAI_STEP; loadAI(); }
+function aiBanner(d) {
+  const b = document.getElementById('sai-banner');
+  if (!d.ai_configured) { b.innerHTML = '<div class="banner warn">⚠ AI 未配置（EVENT_AI_API_KEY 为空）：事件只入库，不做判定、不下单</div>'; return; }
+  const st = (d.meta && d.meta.ai_state) || '';
+  b.innerHTML = st && st.indexOf('失败') >= 0 ? '<div class="banner warn">⚠ ' + esc(st) + '</div>' : '';
+}
+function aiMeta(d) {
+  const m = d.meta || {};
+  const ts = s => s ? String(s).replace('T',' ').replace('Z','') : '—';
+  document.getElementById('sai-meta').textContent =
+    '上次 AI 分析 ' + ts(m.last_ai_at) + ' ｜ 上一批状态 ' + (m.ai_state || '—') + ' ｜ 共 ' + d.total + ' 条判定';
+}
+// 美股盘中/休市提示：TradFi 永续 24h 可交易，但休市时段点差常变大（不是闸门，只是提示）
+function usSession() {
+  try {
+    const p = new Intl.DateTimeFormat('en-US', {timeZone:'America/New_York', hour12:false,
+      weekday:'short', hour:'2-digit', minute:'2-digit'}).formatToParts(new Date());
+    const o = {}; p.forEach(x => { o[x.type] = x.value; });
+    const mins = parseInt(o.hour, 10) * 60 + parseInt(o.minute, 10);
+    const wd = (o.weekday || '').slice(0, 3);
+    const open = ['Mon','Tue','Wed','Thu','Fri'].indexOf(wd) >= 0 && mins >= 570 && mins < 960;
+    document.getElementById('sai-session').textContent =
+      (open ? '🟢 美股盘中' : '⚪ 美股休市') + '（美东 ' + o.hour + ':' + o.minute + '）';
+  } catch (e) { document.getElementById('sai-session').textContent = ''; }
+}
+function posHtml(p) {
+  if (!p) return '';
+  const up = (p.unrealized_pnl || 0) >= 0;
+  return '<div style="margin-top:6px;padding-top:6px;border-top:1px dashed var(--border)">'
+    + '<span class="tag">持仓 #' + p.id + '</span> ' + esc(p.side) + ' ' + esc(p.quantity)
+    + ' @ ' + esc(p.entry_price) + ' ｜ 现价 ' + esc(p.current_price)
+    + ' ｜ 浮盈 <span style="color:' + (up ? 'var(--green)' : 'var(--red)') + '">' + esc(p.unrealized_pnl) + '</span>'
+    + ' <button class="btn danger" onclick="closePos(\\'' + esc(p.token) + '\\')">平仓</button></div>';
+}
+async function loadAI() {
+  const u = '/api/stock-event-ai?limit=' + saiLimit + (saiImpact ? '&impact=' + encodeURIComponent(saiImpact) : '');
+  const r = await fetch(u);
+  const d = await r.json();
+  saiTotal = d.total; aiBanner(d); aiMeta(d);
+  const el = document.getElementById('sai-list');
+  if (!d.list.length) { el.innerHTML = '<span class="muted">还没有判定结果</span>'; return; }
+  el.innerHTML = d.list.map(x => {
+    const imp = x.impact || (x.status === 'failed' ? '分析失败' : '分析中');
+    const cls = IMP_CLS[x.impact] || 'void';
+    const conf = x.confidence != null ? ' 置信度 ' + x.confidence : '';
+    return '<div class="card"><div>'
+      + '<span class="tag ' + cls + '">' + esc(imp) + '</span>'
+      + '<b>' + esc(x.ticker) + '</b><span class="muted" style="margin-left:8px;font-size:11px">'
+      + esc(x.ts_local) + conf + '</span></div>'
+      + '<div style="margin:6px 0">' + esc(x.text) + '</div>'
+      + (x.reason ? '<div class="muted" style="font-size:12px">依据：' + esc(x.reason) + '</div>' : '')
+      + (x.trade_reason ? '<div class="muted" style="font-size:11px">未下单：' + esc(x.trade_reason) + '</div>' : '')
+      + posHtml(x.position)
+      + '</div>';
+  }).join('');
+  document.getElementById('sai-more').innerHTML = d.list.length < saiTotal
+    ? '<button class="btn" onclick="aiMore()">加载更多（+' + SAI_STEP + '）</button>' : '';
+}
+function aiMore() { saiLimit += SAI_STEP; loadAI(); }
+async function closePos(tok) {
+  if (!confirm('按市价平掉 ' + tok + ' 的持仓？')) return;
+  const r = await fetch('/api/trade/market-close', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: tok})});
+  if (!r.ok) alert('平仓失败：' + (await r.text()).slice(0,120));
+  loadAI();
+}
+loadAI(); setInterval(loadAI, 60000);
+usSession(); setInterval(usSession, 60000);
+</script>
+</body></html>"""
+
+
+@app.get("/stock-event-ai", response_class=HTMLResponse)
+def page_stock_event_ai():
+    """美股/商品 AI 判定卡片：原文 + 利好/利空 + 依据 + 该事件开的仓（可平仓）"""
+    return (STOCK_EVENT_AI_HTML.replace("{NAV}", _nav_html("stock-event-ai"))
             .replace("{EV_CSS}", _EV_CSS))
 
 

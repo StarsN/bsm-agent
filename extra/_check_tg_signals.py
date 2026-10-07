@@ -107,6 +107,18 @@ sent.clear()
 tg_notify.send_alphafox_trader_actions(
     [{"action": "LEV", "executed": True, "label": "L", "symbol": "BTCUSDT"}])
 checks2.append(("只有 LEV → 不推（不在开/加/减/平里）", len(sent) == 0))
+# 抖动提醒（平台快照消失但成交流水没有平仓记录）：只提醒、不动仓位
+sent.clear()
+tg_notify.send_alphafox_jitter_alert("CL", "SHORT", 7)
+checks2.append(("抖动提醒：发出去了", len(sent) == 1))
+_txt = sent[0]["text"] if sent else ""
+checks2.append(("抖动提醒：带币种/方向/分钟",
+                "CL" in _txt and "空单" in _txt and "7 分钟" in _txt))
+checks2.append(("抖动提醒：说清「没有平仓记录 + 仓位未动 + 人工确认」",
+                "没有平仓记录" in _txt and "仓位未动" in _txt
+                and "手动平掉" in _txt))
+checks2.append(("抖动提醒：走跟单 bot（不是交易员动作 bot）",
+                bool(sent) and "test-token" in sent[0]["_url"]))
 
 for name, ok in checks2:
     print(("[PASS] " if ok else "[FAIL] ") + name)
