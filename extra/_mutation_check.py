@@ -3007,6 +3007,142 @@ const EV_STEP = 20;""",
         "script": "extra/test_supertrend_logic.py",
         "caught_by": "37 翻转轮同轮反手（市价开空+挂单并存）",
     },
+    {
+        "name": "M280 拆条编号必须前置空格（紧贴前文的编号拆不出去 → 漏条目）",
+        "module": "tech_stocks",
+        "old": """_MARK_RE = re.compile(r"(?<!\\d)\\d{1,2}[.、．](?!\\d)")""",
+        "new": """_MARK_RE = re.compile(r"(?<=[\\s。；;])\\d{1,2}[.、．](?!\\d)")  # MUT 必须前置空格""",
+        "script": "extra/test_tech_stocks.py",
+        "caught_by": "紧贴前文的编号可拆（答记者问2.）/ 混合格式拆出 12 条",
+    },
+    {
+        "name": "M281 AI 来源不过滤（编造的 sources 照收 → 图里挂假链接）",
+        "module": "event_agent",
+        "old": """    obj["sources"] = [x for x in (obj.get("sources") or [])
+                      if isinstance(x, dict) and x.get("url") in links][:6]""",
+        "new": """    obj["sources"] = (obj.get("sources") or [])[:6]  # MUT 不校验来源""",
+        "script": "extra/test_tech_news.py",
+        "caught_by": "编造的来源被剔除（只剩搜索里的那条）",
+    },
+    {
+        "name": "M282 搜索失败不退化（整条丢失不生成）",
+        "module": "event_agent",
+        "old": """            if got is None:
+                degrade = 1      # 搜索失败 → 退化为"仅金十原文"整理（功能不断档）
+            else:
+                res = got
+            summary = tech_summarize(item_text, r["stock_name"], res)""",
+        "new": """            if got is None:
+                continue  # MUT 搜索失败不退化（丢条目）
+            res = got
+            summary = tech_summarize(item_text, r["stock_name"], res)""",
+        "script": "extra/test_tech_news.py",
+        "caught_by": "搜索不可用仍生成 5 条（degrade=1）",
+    },
+    {
+        "name": "M283 首轮回填历史（几百条旧消息全灌进来）",
+        "module": "event_agent",
+        "old": """    if watermark is None:
+        with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+            storage.tech_news_meta_set(conn, "watermark_msg_id", newest)
+            storage.tech_news_meta_set(conn, "first_run_at", _now_iso())
+        _log(f"[tech] 首轮建立水位 msg_id={newest}（**不回填历史**）")
+        return 0""",
+        "new": """    if watermark is None:
+        watermark = 0  # MUT 首轮直接回填""",
+        "script": "extra/test_tech_news.py",
+        "caught_by": "首轮只记水位（返回 0 / raw 为空）",
+    },
+    {
+        "name": "M284 科技综合兜底层失效（只提泛科技词的消息又漏掉）",
+        "module": "tech_stocks",
+        "old": """    if any(_kw_hit(text, w) for w in MISC_WORDS):
+        return [dict(MISC_ENTRY)]""",
+        "new": """    if False:  # MUT 兜底层失效
+        return [dict(MISC_ENTRY)]""",
+        "script": "extra/test_tech_stocks.py",
+        "caught_by": "泛科技词 → @科技综合（兜底层）",
+    },
+    {
+        "name": "M285 行业层失效（CFM 报告类条目落入综合层、分类错挂）",
+        "module": "tech_stocks",
+        "old": """    for code, (name, cat, words) in INDUSTRY_MAP.items():
+        if any(_kw_hit(text, w) for w in words):
+            return [{"code": code, "name": name, "cat": cat}]""",
+        "new": """    for code, (name, cat, words) in INDUSTRY_MAP.items():
+        if False:  # MUT 行业层失效
+            return [{"code": code, "name": name, "cat": cat}]""",
+        "script": "extra/test_tech_stocks.py",
+        "caught_by": "⑦CFM 报告 → @存储 / 光刻机 → @设备",
+    },
+    {
+        "name": "M286 全角括号编号不拆（（1）（2）（3）排版整条不分解 → 漏条目）",
+        "module": "tech_stocks",
+        "old": """    spans = None
+    for rx in (_MARK_RE, _CIRC_RE, _PAREN_RE):
+        found = list(rx.finditer(text))
+        if len(found) >= 2:
+            spans = [(m.start(), m.end()) for m in found]
+            break""",
+        "new": """    spans = None
+    for rx in (_MARK_RE, _CIRC_RE):
+        found = list(rx.finditer(text))
+        if len(found) >= 2:
+            spans = [(m.start(), m.end()) for m in found]
+            break""",
+        "script": "extra/test_tech_stocks.py",
+        "caught_by": "全角括号编号（1）（2）（3）也能拆",
+    },
+    {
+        "name": "M287 图解 JSON 不整形（模型把数组答成字符串 → 页面按数组渲染崩）",
+        "module": "event_agent",
+        "old": """    # 结构整形：模型偶尔把数组/对象答成字符串等，页面按数组渲染会崩 → 统一强转
+    obj["headline"] = str(obj.get("headline"))
+    obj["tldr"] = str(obj.get("tldr") or "")
+    for k in ("points", "numbers"):
+        v = obj.get(k)
+        obj[k] = [str(x) for x in v] if isinstance(v, list) else []
+    imp = obj.get("impact")
+    imp = imp if isinstance(imp, dict) else {}
+    ben = imp.get("beneficiaries")
+    imp["beneficiaries"] = [str(x) for x in ben] if isinstance(ben, list) else []
+    imp["direction"] = str(imp.get("direction") or "")
+    imp["reason"] = str(imp.get("reason") or "")
+    obj["impact"] = imp
+    return obj""",
+        "new": """    return obj  # MUT 不整形""",
+        "script": "extra/test_tech_news.py",
+        "caught_by": "11 points/numbers 强转为数组 / impact 强转为对象",
+    },
+    {
+        "name": "M288 Moonshot 语境门失效（加密交易 app 被当成月之暗面）",
+        "module": "tech_stocks",
+        "old": """    "Moonshot": ["月之暗面", "AI", "模型", "大模型", "智能", "Kimi"],""",
+        "new": """    # MUT Moonshot 门失效""",
+        "script": "extra/test_tech_stocks.py",
+        "caught_by": "Moonshot 交易应用（加密语境）→ 不认月之暗面",
+    },
+    {
+        "name": "M289 联想语境门失效（「让人联想到」被当成联想集团）",
+        "module": "tech_stocks",
+        "old": """    "联想": ["手机", "PC", "电脑", "集团", "CEO", "杨元庆", "股价", "发布", "新品",
+             "平板", "笔记本", "摩托罗拉", "财报", "业绩", "服务器"],""",
+        "new": """    # MUT 联想门失效""",
+        "script": "extra/test_tech_stocks.py",
+        "caught_by": "联想到（常用词）→ 不认联想",
+    },
+    {
+        "name": "M290 抓取循环漏挂科技管线（入库静默不工作）",
+        "module": "event_agent",
+        "old": """    try:
+        _ingest_tech(msgs)
+    except Exception as e:
+        _log(f"[tech] 入库异常（不影响其他管线）: {type(e).__name__}: {e}")
+    return n""",
+        "new": """    return n  # MUT 漏挂科技管线""",
+        "script": "extra/test_tech_news.py",
+        "caught_by": "12 scrape_once 里调了科技管线",
+    },
 ]
 
 def run_one(m: dict) -> tuple:

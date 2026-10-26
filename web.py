@@ -33,6 +33,7 @@ from analyzer import compute_composite_scores, get_current_heat_scores
 from market import has_perpetual, get_market_snapshot, get_futures_symbols
 from signals import analyze as analyze_signals
 import kol_agent
+import tech_stocks
 # 顶层导入：把跟单镜像层的"进程启动时刻"(_STARTED_AT) 定在 web 启动瞬间，
 # 早于任何信号处理——否则首个 poll 里 process() 先写出的新仓可能被判成"存量仓"
 import alphafox_live
@@ -53,6 +54,7 @@ _NAV_DROPDOWNS = [
         ("/dashboard", "市场全景", "dashboard"),
         ("/crypto-events", "加密事件展览", "crypto-events"),
         ("/stock-events", "美股/商品事件展览", "stock-events"),
+        ("/tech-news", "科技股动态", "tech-news"),
     ]),
     ("🎯 策略", "/strategies", [
         ("-", "总览", ""),
@@ -752,6 +754,7 @@ class TradingSettingsBody(BaseModel):
     stock_event_cooldown_minutes: float | None = None
     stock_event_daily_max: int | None = None
     stock_event_max_tickers: int | None = None
+    tech_news_enabled: bool | None = None
     supertrend_enabled: bool | None = None
     supertrend_sl_tolerance_pct: float | None = None
     supertrend_order_tolerance_pct: float | None = None
@@ -1198,7 +1201,7 @@ def api_settings():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "stock_event_enabled", "stock_event_trade_enabled", "stock_event_min_confidence", "stock_event_fresh_minutes", "stock_event_cooldown_minutes", "stock_event_daily_max", "stock_event_max_tickers", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_max_notional", "alphafox_live_ratio", "alphafox_live_leverage"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "agent_short_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "agent_short_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "limit_order_timeout_seconds", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "strategy_initial_onchain", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "stock_event_enabled", "stock_event_trade_enabled", "stock_event_min_confidence", "stock_event_fresh_minutes", "stock_event_cooldown_minutes", "stock_event_daily_max", "stock_event_max_tickers", "tech_news_enabled", "alphafox_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_max_notional", "alphafox_live_ratio", "alphafox_live_leverage"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -5033,6 +5036,20 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   </div>
 
   <div class="strategy-block">
+    <div class="strategy-name">🔬 科技股动态（新闻雷达，不交易；独立库）</div>
+    <div class="grid3">
+      <div>
+        <label>总开关（关=不入库不生成）</label>
+        <select id="trade-tech-news-switch">
+          <option value="true">启用</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+    </div>
+    <div style="color:var(--muted);font-size:11px;margin-top:4px">金十消息→拆条→三层识别（公司/行业/科技综合）→Google News 搜索→AI 图解；页面见 /tech-news</div>
+  </div>
+
+  <div class="strategy-block">
     <div class="strategy-name">跟单雷达（alphofox 数据源）</div>
     <div class="grid3">
       <div>
@@ -5239,6 +5256,8 @@ async function loadSettings() {
     document.getElementById('trade-stock-event-cooldown-minutes').value = s.stock_event_cooldown_minutes ?? 120;
     document.getElementById('trade-stock-event-daily-max').value = s.stock_event_daily_max ?? 6;
     document.getElementById('trade-stock-event-max-tickers').value = s.stock_event_max_tickers ?? 3;
+    document.getElementById('trade-tech-news-switch').value =
+      (s.tech_news_enabled ?? true) ? 'true' : 'false';
     document.getElementById('trade-alphafox-poll').value = s.alphafox_poll_seconds ?? 15;
     document.getElementById('trade-alphafox-trade-switch').value = s.alphafox_trade_enabled ?? true;
     document.getElementById('trade-alphafox-live-switch').value = s.alphafox_live_enabled ?? false;
@@ -5349,6 +5368,7 @@ async function saveTradingSettings() {
     stock_event_cooldown_minutes: numOrUndef('trade-stock-event-cooldown-minutes'),
     stock_event_daily_max: numOrUndef('trade-stock-event-daily-max'),
     stock_event_max_tickers: numOrUndef('trade-stock-event-max-tickers'),
+    tech_news_enabled: document.getElementById('trade-tech-news-switch').value === 'true',
     supertrend_leverage: Number(document.getElementById('trade-supertrend-leverage').value),
     strategy_initial_supertrend: Number(document.getElementById('trade-strategy-supertrend').value),
     alphafox_poll_seconds: Number(document.getElementById('trade-alphafox-poll').value),
@@ -10093,6 +10113,336 @@ usSession(); setInterval(usSession, 60000);
 def page_stock_event_ai():
     """美股/商品 AI 判定卡片：原文 + 利好/利空 + 依据 + 该事件开的仓（可平仓）"""
     return (STOCK_EVENT_AI_HTML.replace("{NAV}", _nav_html("stock-event-ai"))
+            .replace("{EV_CSS}", _EV_CSS))
+
+
+# ============================================================
+# 科技股动态（event_agent.py 第三条管线，新闻雷达不交易）：/tech-news
+# 独立库 db/tech_news.db；三元组 (msg_id, item_no, stock_code) 为一条"动态图"
+# ============================================================
+_TN_META_KEYS = ("ai_state", "last_poll_at", "last_gen_at", "watermark_msg_id",
+                 "unmatched_samples", "backlog")
+
+
+@app.get("/api/tech-news")
+def api_tech_news(limit: int = 500):
+    """列表：已完成条目（轻量字段，最新在前）+ 运行统计 + 失败列表（可重试）。
+
+    图解 JSON 可能较大 → 不随列表下发，点开某条再拉 /api/tech-news/detail。"""
+    import json as _json
+    limit = min(max(int(limit or 500), 1), 2000)
+    storage.init_tech_news_db()
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT ai.msg_id, ai.item_no, ai.stock_code, ai.stock_name, ai.cat, "
+            "ai.degrade, ai.summary_json, raw.pub_ts "
+            "FROM tech_news_ai ai JOIN tech_news_raw raw ON raw.msg_id = ai.msg_id "
+            "WHERE ai.status=1 ORDER BY ai.msg_id DESC LIMIT ?", (limit,))]
+        failed = [dict(r) for r in c.execute(
+            "SELECT msg_id, item_no, stock_code, stock_name, cat FROM tech_news_ai "
+            "WHERE status=2 ORDER BY msg_id DESC LIMIT 100")]
+        pend_rows = [dict(r) for r in c.execute(
+            "SELECT ai.msg_id, ai.item_no, ai.stock_code, ai.stock_name, ai.cat, "
+            "raw.items_json, raw.pub_ts "
+            "FROM tech_news_ai ai JOIN tech_news_raw raw ON raw.msg_id = ai.msg_id "
+            "WHERE ai.status=0 ORDER BY ai.msg_id DESC LIMIT 200")]
+        stats = {
+            "done": c.execute("SELECT COUNT(*) n FROM tech_news_ai WHERE status=1"
+                              ).fetchone()["n"],
+            "pending": c.execute("SELECT COUNT(*) n FROM tech_news_ai WHERE status=0"
+                                 ).fetchone()["n"],
+            "failed": c.execute("SELECT COUNT(*) n FROM tech_news_ai WHERE status=2"
+                                ).fetchone()["n"],
+            "raw_msgs": c.execute("SELECT COUNT(*) n FROM tech_news_raw").fetchone()["n"],
+        }
+        meta = {k: storage.tech_news_meta_get(c, k) for k in _TN_META_KEYS}
+    out = []
+    for r in rows:
+        try:
+            sm = _json.loads(r.get("summary_json") or "{}")
+        except Exception:
+            sm = {}
+        imp = sm.get("impact") or {}
+        out.append({
+            "msg_id": r["msg_id"], "item_no": r["item_no"],
+            "code": r["stock_code"], "name": r["stock_name"], "cat": r["cat"],
+            "ts": _ev_local_ts(r["pub_ts"]),
+            "headline": sm.get("headline") or "", "tldr": sm.get("tldr") or "",
+            "direction": imp.get("direction") or "",
+            "degrade": int(r.get("degrade") or 0),
+        })
+    # 待生成条目也下发（页面灰显"生成中"）：新消息不用等生成完才出现在时间线
+    pending = []
+    for r in pend_rows:
+        text = ""
+        try:
+            for it in _json.loads(r["items_json"] or "[]"):
+                if int(it.get("no", 0)) == r["item_no"]:
+                    text = str(it.get("text") or "")
+                    break
+        except Exception:
+            pass
+        pending.append({"msg_id": r["msg_id"], "item_no": r["item_no"],
+                        "code": r["stock_code"], "name": r["stock_name"],
+                        "cat": r["cat"], "ts": _ev_local_ts(r["pub_ts"]),
+                        "text": text[:80]})
+    return {"ok": True, "list": out, "failed": failed, "pending": pending,
+            "stats": stats, "meta": meta,
+            "cats": tech_stocks.CATEGORIES,
+            "backlog_alert": int(getattr(config, "TECH_NEWS_BACKLOG_ALERT", 500)),
+            "ai_configured": bool(getattr(config, "EVENT_AI_API_KEY", ""))}
+
+
+@app.get("/api/tech-news/detail")
+def api_tech_news_detail(msg_id: int, item_no: int, stock_code: str):
+    """单条详情的图解数据（图解 JSON + 搜索原始结果 + 条目/消息原文）"""
+    import json as _json
+    storage.init_tech_news_db()
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as c:
+        row = c.execute(
+            "SELECT * FROM tech_news_ai WHERE msg_id=? AND item_no=? AND stock_code=?",
+            (msg_id, item_no, stock_code)).fetchone()
+        raw = c.execute(
+            "SELECT text, items_json, pub_ts FROM tech_news_raw WHERE msg_id=?",
+            (msg_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "记录不存在")
+    r = dict(row)
+    item_text, msg_text = "", ""
+    if raw:
+        msg_text = raw["text"]
+        try:
+            for it in _json.loads(raw["items_json"]):
+                if int(it.get("no", 0)) == int(item_no):
+                    item_text = it.get("text") or ""
+                    break
+        except Exception:
+            pass
+    try:
+        summary = _json.loads(r.get("summary_json") or "{}")
+    except Exception:
+        summary = {}
+    try:
+        search = _json.loads(r.get("search_json") or "[]")
+    except Exception:
+        search = []
+    return {"ok": True, "summary": summary, "search": search,
+            "item_text": item_text, "msg_text": msg_text,
+            "status": r.get("status"), "degrade": int(r.get("degrade") or 0),
+            "stock_name": r.get("stock_name"),
+            "ts": _ev_local_ts(raw["pub_ts"]) if raw else ""}
+
+
+@app.post("/api/tech-news/retry")
+def api_tech_news_retry(body: dict):
+    """失败条目一键重试：status=2 → 0、attempts 归零，重新入队"""
+    try:
+        msg_id = int(body.get("msg_id") or 0)
+        item_no = int(body.get("item_no") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "msg_id/item_no 必须是整数")
+    code = (body.get("stock_code") or "").strip()
+    if not (msg_id and item_no and code):
+        raise HTTPException(400, "缺少 msg_id/item_no/stock_code")
+    storage.init_tech_news_db()
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as c:
+        cur = c.execute(
+            "UPDATE tech_news_ai SET status=0, attempts=0, "
+            "updated_at=CURRENT_TIMESTAMP "
+            "WHERE msg_id=? AND item_no=? AND stock_code=? AND status=2",
+            (msg_id, item_no, code))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "该条不是失败状态（或不存在）")
+    return {"ok": True}
+
+
+TECH_NEWS_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>科技股动态 - BSM Agent</title>
+<style>{EV_CSS}
+.tn-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:10px; }
+.tn-card { border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+.tn-card h4 { font-size:13px; margin-bottom:6px; }
+.tn-card .code { color:var(--muted); font-size:11px; font-weight:400; margin-left:5px; }
+.tn-item { padding:6px 0; border-top:1px dashed var(--border); cursor:pointer; line-height:1.55; }
+.tn-item:hover { color:#79b8ff; }
+.tn-item.pending { cursor:default; color:var(--muted); }
+.tn-item.pending:hover { color:var(--muted); }
+.tn-item .t { color:var(--muted); font-size:11px; margin-right:6px; }
+.tn-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.62); z-index:50; align-items:center; justify-content:center; padding:18px; }
+.tn-modal.show { display:flex; }
+.tn-box { background:var(--panel); border:1px solid var(--border); border-radius:10px; max-width:640px; width:100%; max-height:85vh; overflow-y:auto; padding:18px 20px; }
+.chart-h { font-size:17px; font-weight:700; line-height:1.45; margin:6px 0; }
+.chart-tldr { opacity:.92; font-size:12.5px; margin-bottom:8px; line-height:1.6; }
+.chart-sec { margin-top:11px; font-size:12.5px; line-height:1.7; }
+.chart-sec b { color:var(--muted); font-weight:500; font-size:11px; display:block; margin-bottom:3px; letter-spacing:.5px; }
+.chart-num { display:inline-block; background:rgba(210,153,34,.15); color:var(--yellow); border:1px solid rgba(210,153,34,.4); border-radius:6px; padding:2px 8px; margin:2px 4px 2px 0; font-size:12px; }
+.src-link { display:block; font-size:11.5px; margin:3px 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tn-orig { margin-top:12px; font-size:11.5px; color:var(--muted); }
+.tn-orig summary { cursor:pointer; }
+</style></head><body>
+{NAV}
+<div class="panel">
+  <b>🔬 科技股动态</b>
+  <span class="muted" style="margin-left:8px;font-size:11px">金十消息 → 拆条（编号总结逐条分解）→ 三层识别 → Google News 搜索 → AI 图解（点开每条看"图"）</span>
+  <div id="tn-banner"></div>
+  <div id="tn-meta" class="muted" style="font-size:11px;margin:8px 0"></div>
+</div>
+<div id="tn-failed-panel" class="panel" style="display:none">
+  <b>⚠ 生成失败</b>
+  <span class="muted" style="margin-left:8px;font-size:11px">AI/搜索连续失败 3 次；点「重试」重新入队</span>
+  <div id="tn-failed" style="margin-top:8px"></div>
+</div>
+<div id="tn-body"><span class="muted">加载中...</span></div>
+<div class="tn-modal" id="tn-modal" onclick="if(event.target===this)tnClose()">
+  <div class="tn-box" id="tn-box"></div>
+</div>
+<script>
+const TN_ESC = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function tnDirTag(d) {
+  if (d === '偏多') return '<span class="tag bull">偏多</span> ';
+  if (d === '偏空') return '<span class="tag bear">偏空</span> ';
+  return d ? '<span class="tag flat">' + TN_ESC(d) + '</span> ' : '';
+}
+function tnBanner(d) {
+  let h = '';
+  if (!d.ai_configured) h += '<div class="banner warn">⚠ AI 未配置（EVENT_AI_API_KEY 为空）：只入库，不生成图解</div>';
+  const st = (d.meta && d.meta.ai_state) || '';
+  if (st && st.indexOf('失败') >= 0) h += '<div class="banner warn">⚠ ' + TN_ESC(st) + '</div>';
+  const backlog = parseInt((d.stats && d.stats.pending) || 0, 10);
+  const alertAt = d.backlog_alert || 500;
+  if (backlog > alertAt) h += '<div class="banner warn">⚠ 积压 ' + backlog + ' 条待生成（只排队、不丢消息）</div>';
+  document.getElementById('tn-banner').innerHTML = h;
+}
+function tnMeta(d) {
+  const m = d.meta || {}, s = d.stats || {};
+  const ts = v => v ? String(v).replace('T',' ').replace('Z','') : '—';
+  document.getElementById('tn-meta').textContent =
+    '已生成 ' + s.done + ' 条 ｜ 待生成 ' + s.pending + ' ｜ 失败 ' + s.failed
+    + ' ｜ 入库消息 ' + s.raw_msgs + ' 条 ｜ 上次抓取 ' + ts(m.last_poll_at)
+    + ' ｜ 上次生成 ' + ts(m.last_gen_at);
+}
+function tnRender(d) {
+  const body = document.getElementById('tn-body');
+  const fp = document.getElementById('tn-failed-panel');
+  if (d.failed && d.failed.length) {
+    fp.style.display = '';
+    document.getElementById('tn-failed').innerHTML = d.failed.map(f =>
+      '<div class="card" style="padding:8px 10px"><span class="muted" style="font-size:11px">'
+      + TN_ESC(f.cat) + ' · ' + TN_ESC(f.name) + ' · msg ' + f.msg_id + '#' + f.item_no
+      + '</span> <button class="btn tn-retry" data-msg="' + f.msg_id + '" data-item="' + f.item_no
+      + '" data-code="' + TN_ESC(f.stock_code) + '">重试</button></div>').join('');
+  } else {
+    fp.style.display = 'none';
+  }
+  if (!d.list.length && !(d.pending && d.pending.length)) {
+    body.innerHTML = '<div class="panel"><span class="muted">还没有图解（等金十出现科技股消息后自动生成）</span></div>';
+    return;
+  }
+  const all = d.list.concat((d.pending || []).map(p => ({...p, status: 0})));
+  all.sort((a, b) => b.msg_id - a.msg_id);
+  const byCat = {};
+  all.forEach(it => { (byCat[it.cat] = byCat[it.cat] || []).push(it); });
+  const cats = (d.cats || []).concat(Object.keys(byCat).filter(c => (d.cats || []).indexOf(c) < 0));
+  let html = '';
+  cats.forEach(cat => {
+    const items = byCat[cat];
+    if (!items || !items.length) return;
+    const byStock = {};
+    items.forEach(it => {
+      byStock[it.code] = byStock[it.code] || { name: it.name, items: [] };
+      byStock[it.code].items.push(it);
+    });
+    html += '<div class="panel"><b>' + TN_ESC(cat) + '</b><div class="tn-grid" style="margin-top:10px">';
+    Object.keys(byStock).forEach(code => {
+      const st = byStock[code];
+      html += '<div class="tn-card"><h4>' + TN_ESC(st.name)
+        + '<span class="code">' + TN_ESC(code) + '</span>'
+        + '<span class="muted" style="font-weight:400;font-size:11px"> · ' + st.items.length + ' 条</span></h4>';
+      st.items.forEach(it => {
+        if (it.status === 0) {
+          html += '<div class="tn-item pending"><span class="t">' + TN_ESC(it.ts) + '</span>'
+            + '<span class="tag void">生成中</span> '
+            + TN_ESC(it.text || '（待生成）') + '</div>';
+        } else {
+          html += '<div class="tn-item" data-msg="' + it.msg_id + '" data-item="' + it.item_no
+            + '" data-code="' + TN_ESC(it.code) + '">'
+            + '<span class="t">' + TN_ESC(it.ts) + '</span>' + tnDirTag(it.direction)
+            + (it.degrade ? '<span class="tag void">无来源</span> ' : '')
+            + '<span>' + TN_ESC(it.headline || it.tldr || '（无标题）') + '</span></div>';
+        }
+      });
+      html += '</div>';
+    });
+    html += '</div></div>';
+  });
+  body.innerHTML = html;
+}
+async function tnOpen(msgId, itemNo, code) {
+  const r = await fetch('/api/tech-news/detail?msg_id=' + msgId + '&item_no=' + itemNo
+    + '&stock_code=' + encodeURIComponent(code));
+  const d = await r.json();
+  if (!r.ok) { alert(d.detail || '加载失败'); return; }
+  const sm = d.summary || {}, imp = sm.impact || {};
+  let h = '';
+  if (d.degrade) h += '<div class="banner warn">⚠ 搜索不可用：本图仅基于金十快讯原文整理（无外部来源）</div>';
+  h += '<div class="muted" style="font-size:11px">' + TN_ESC(d.ts) + ' ｜ ' + TN_ESC(d.stock_name || code) + '</div>';
+  h += '<div class="chart-h">' + TN_ESC(sm.headline || '（无标题）') + '</div>';
+  if (sm.tldr) h += '<div class="chart-tldr">' + TN_ESC(sm.tldr) + '</div>';
+  if (imp.direction) {
+    const cls = imp.direction === '偏多' ? 'bull' : imp.direction === '偏空' ? 'bear' : 'flat';
+    h += '<div><span class="tag ' + cls + '">' + TN_ESC(imp.direction) + '</span> ' + TN_ESC(imp.reason || '') + '</div>';
+  }
+  const pts = sm.points || [];
+  if (pts.length) h += '<div class="chart-sec"><b>要点</b>' + pts.map((p, i) => '<div>' + (i + 1) + '. ' + TN_ESC(p) + '</div>').join('') + '</div>';
+  const nums = sm.numbers || [];
+  if (nums.length) h += '<div class="chart-sec"><b>关键数字</b>' + nums.map(n => '<span class="chart-num">' + TN_ESC(n) + '</span>').join('') + '</div>';
+  const ben = imp.beneficiaries || [];
+  if (ben.length) h += '<div class="chart-sec"><b>受影响标的</b>' + ben.map(b => '<span class="tag">' + TN_ESC(b) + '</span>').join('') + '</div>';
+  const srcs = sm.sources || [];
+  if (srcs.length) h += '<div class="chart-sec"><b>来源</b>' + srcs.map(s =>
+    '<a class="src-link" target="_blank" rel="noopener" href="' + TN_ESC(s.url || '#') + '">'
+    + TN_ESC((s.source ? s.source + ' · ' : '') + (s.title || s.url || '')) + ' ↗</a>').join('') + '</div>';
+  h += '<div class="tn-orig"><details><summary>金十快讯原文</summary>'
+    + '<div style="margin-top:6px;line-height:1.7">' + TN_ESC(d.item_text || '') + '</div>'
+    + ((d.msg_text && d.msg_text !== d.item_text)
+       ? '<div style="margin-top:8px">消息全文：</div><div style="line-height:1.7">' + TN_ESC(d.msg_text) + '</div>'
+       : '')
+    + '</details></div>';
+  h += '<div style="margin-top:14px;text-align:right"><button class="btn" onclick="tnClose()">关闭</button></div>';
+  document.getElementById('tn-box').innerHTML = h;
+  document.getElementById('tn-modal').classList.add('show');
+}
+function tnClose() { document.getElementById('tn-modal').classList.remove('show'); }
+async function tnRetry(msgId, itemNo, code) {
+  const r = await fetch('/api/tech-news/retry', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({msg_id: msgId, item_no: itemNo, stock_code: code})});
+  const d = await r.json();
+  if (!r.ok) { alert(d.detail || '重试失败'); return; }
+  loadTech();
+}
+async function loadTech() {
+  const r = await fetch('/api/tech-news');
+  const d = await r.json();
+  tnBanner(d); tnMeta(d); tnRender(d);
+}
+document.addEventListener('click', e => {
+  const it = e.target.closest('.tn-item');
+  if (it) { tnOpen(+it.dataset.msg, +it.dataset.item, it.dataset.code); return; }
+  const rt = e.target.closest('.tn-retry');
+  if (rt) { tnRetry(+rt.dataset.msg, +rt.dataset.item, rt.dataset.code); }
+});
+loadTech(); setInterval(loadTech, 60000);
+</script>
+</body></html>"""
+
+
+@app.get("/tech-news", response_class=HTMLResponse)
+def page_tech_news():
+    """科技股动态：分类 → 股票卡/行业卡/科技综合 → 动态倒序 → 点开看图解"""
+    return (TECH_NEWS_HTML.replace("{NAV}", _nav_html("tech-news"))
             .replace("{EV_CSS}", _EV_CSS))
 
 

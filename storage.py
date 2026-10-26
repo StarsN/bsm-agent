@@ -1128,6 +1128,63 @@ def stock_event_meta_set(conn, key: str, value) -> None:
                  (key, str(value)))
 
 
+# ---------- 科技股动态（独立库，2026-10-07）----------
+# 新闻雷达（不交易）：金十消息拆条 → 三层识别 → 每个 (消息,条目,标的) 三元组
+# 独立搜索+AI 成图解。主键即三元组，单条失败重试不影响同消息其他条目。
+_TECH_NEWS_DDL = """
+CREATE TABLE IF NOT EXISTS tech_news_raw (
+    msg_id     INTEGER PRIMARY KEY,          -- 金十消息 id
+    pub_ts     TEXT,                         -- 消息时间（原样字符串）
+    text       TEXT NOT NULL,                -- 消息全文（拆条前，防漏原文）
+    items_json TEXT NOT NULL DEFAULT '[]',   -- [{"no":1,"text":"…","stocks":[{code,name,cat}]}]
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_tn_raw_created ON tech_news_raw(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS tech_news_ai (
+    msg_id     INTEGER NOT NULL,
+    item_no    INTEGER NOT NULL,
+    stock_code TEXT NOT NULL,                -- 公司代码 / @存储 等行业码 / @科技综合
+    stock_name TEXT NOT NULL,
+    cat        TEXT NOT NULL,
+    status     INTEGER DEFAULT 0,            -- 0 待处理 / 1 完成 / 2 失败
+    attempts   INTEGER DEFAULT 0,
+    degrade    INTEGER DEFAULT 0,            -- 1=搜索失败，退化为金十原文整理
+    search_json TEXT,                        -- Google News 原始结果
+    summary_json TEXT,                       -- 图解 JSON（headline/tldr/points/numbers/impact/sources）
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (msg_id, item_no, stock_code)
+);
+CREATE INDEX IF NOT EXISTS idx_tn_ai_state ON tech_news_ai(status, msg_id);
+
+CREATE TABLE IF NOT EXISTS tech_news_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+
+def init_tech_news_db():
+    """初始化科技股动态独立 DB"""
+    with get_conn(config.TECH_NEWS_DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.executescript(_TECH_NEWS_DDL)
+
+
+def tech_news_meta_get(conn, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM tech_news_meta WHERE key=?",
+                       (key,)).fetchone()
+    return (row["value"] if row and row["value"] is not None else default)
+
+
+def tech_news_meta_set(conn, key: str, value) -> None:
+    conn.execute("INSERT INTO tech_news_meta (key, value) VALUES (?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, str(value)))
+
+
 def init_onchain_live_db():
     """初始化链上实盘独立 DB"""
     with get_conn(config.LIVE_DB_PATH) as conn:
@@ -1919,6 +1976,8 @@ def trading_settings_defaults() -> dict:
         "stock_event_daily_max": getattr(config, "STOCK_EVENT_DAILY_MAX", 6),
         "stock_event_max_tickers": getattr(config, "STOCK_EVENT_MAX_TICKERS", 3),
         "strategy_initial_stock_event": getattr(config, "STRATEGY_INITIAL_STOCK_EVENT", 1000),
+        # 科技股动态（新闻雷达，独立库；开关=入库/处理总闸）
+        "tech_news_enabled": getattr(config, "TECH_NEWS_ENABLED", True),
         "supertrend_sl_tolerance_pct": getattr(config, "SUPERTREND_SL_TOLERANCE_PCT", 1.0),
         "supertrend_order_tolerance_pct": getattr(config, "SUPERTREND_ORDER_TOLERANCE_PCT", 1.0),
         "supertrend_flip_tolerance_pct": getattr(config, "SUPERTREND_FLIP_TOLERANCE_PCT", 0.0),
@@ -1940,7 +1999,7 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled", "event_strategy_enabled", "stock_event_enabled", "stock_event_trade_enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "supertrend_enabled", "alphafox_trade_enabled", "alphafox_live_enabled", "event_strategy_enabled"}:
+        if row["key"] in {"enabled", "event_strategy_enabled", "stock_event_enabled", "stock_event_trade_enabled", "tech_news_enabled", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "kol_snapshot_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "agent_short_enabled", "okx_data_source_enabled", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "supertrend_enabled", "alphafox_trade_enabled", "alphafox_live_enabled", "event_strategy_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
         elif row["key"] in {"initial_balance", "leverage", "order_amount", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "limit_order_timeout_seconds", "kol_snapshot_min_confidence", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds",
             "stock_event_min_confidence", "stock_event_fresh_minutes", "stock_event_cooldown_minutes", "stock_event_daily_max", "stock_event_max_tickers", "strategy_initial_stock_event",
@@ -1963,7 +2022,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_exempt_paper_ids", "alphafox_live_notional", "alphafox_live_ratio", "alphafox_live_max_notional", "alphafox_live_leverage", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "stock_event_enabled", "stock_event_trade_enabled", "stock_event_min_confidence", "stock_event_fresh_minutes", "stock_event_cooldown_minutes", "stock_event_daily_max", "stock_event_max_tickers", "strategy_initial_stock_event"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "agent_collect_interval_minutes", "agent_trigger_interval", "strategy_initial_agent", "strategy_initial_heat_agent", "strategy_initial_heat_agent_lessons", "strategy_initial_system", "strategy_initial_manual", "strategy_initial_kol_agent", "strategy_initial_agent_no_lessons", "strategy_initial_agent_short", "kol_agent_interval_minutes", "nl_agent_interval_minutes", "heat_agent_lessons_trigger_interval", "ai_regime_interval_minutes", "kol_llm_provider", "kol_agent_min_confidence", "kol_token_cooldown_minutes", "agent_trade_enabled", "heat_agent_enabled", "kol_agent_enabled", "nl_agent_enabled", "heat_agent_lessons_enabled", "agent_short_enabled", "trading_daily_limit_enabled", "system_auto_trade_enabled", "limit_order_timeout_seconds", "kol_snapshot_enabled", "kol_snapshot_interval_minutes", "strategy_initial_kol_snapshot", "kol_snapshot_min_confidence", "kol_snapshot_llm_provider", "agent_short_interval_minutes", "okx_data_source_enabled", "onchain_scan_interval_hours", "onchain_divergence_fund_source_min", "onchain_surface_top10_max", "onchain_observation_max_days", "strategy_initial_onchain", "onchain_strategy_enabled", "onchain_scan_enabled", "onchain_cluster_enabled", "onchain_cluster_analysis_enabled", "onchain_cluster_analysis_interval", "onchain_cluster_top_addresses", "onchain_cluster_min_holding_pct", "onchain_cluster_keep_rounds", "onchain_live_mode", "supertrend_enabled", "supertrend_sl_tolerance_pct", "supertrend_order_tolerance_pct", "supertrend_flip_tolerance_pct", "supertrend_notional_usd", "supertrend_leverage", "strategy_initial_supertrend", "alphafox_poll_seconds", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "alphafox_trade_enabled", "alphafox_trade_budget", "alphafox_slippage_pct", "alphafox_fee_pct", "alphafox_live_enabled", "alphafox_live_exempt_paper_ids", "alphafox_live_notional", "alphafox_live_ratio", "alphafox_live_max_notional", "alphafox_live_leverage", "event_strategy_enabled", "event_min_confidence", "event_fresh_minutes", "event_cooldown_minutes", "event_daily_max", "event_poll_seconds", "stock_event_enabled", "stock_event_trade_enabled", "stock_event_min_confidence", "stock_event_fresh_minutes", "stock_event_cooldown_minutes", "stock_event_daily_max", "stock_event_max_tickers", "strategy_initial_stock_event", "tech_news_enabled"}
     rows = []
     for key, value in fields.items():
         if key in allowed:

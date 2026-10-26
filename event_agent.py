@@ -17,7 +17,9 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -26,6 +28,7 @@ import event_coins
 import event_scrape
 import stock_coins
 import storage
+import tech_stocks
 
 _lock = threading.Lock()
 
@@ -66,9 +69,9 @@ def tradable_set() -> set:
 
 # ---------------------------------------------------------------- ① 抓取
 def scrape_once() -> int:
-    """拉最新一页 → 两条管线各写自己的库（加密库 / 美股商品独立库）。
+    """拉最新一页 → 三条管线各写自己的库（加密 / 美股商品 / 科技股动态独立库）。
 
-    抓取只做一次（同一批消息），落库各自独立：美股那路失败不影响加密这路。
+    抓取只做一次（同一批消息），落库各自独立：任一路失败不影响其他路。
     返回**加密库**的新增条数（保持原返回值语义，测试/日志都按它）。"""
     msgs = event_scrape.parse_messages(event_scrape.fetch_page(config.EVENT_CHANNEL))
     if not msgs:
@@ -78,6 +81,10 @@ def scrape_once() -> int:
         _ingest_stock(msgs)
     except Exception as e:
         _log(f"[stock] 入库异常（不影响加密管线）: {type(e).__name__}: {e}")
+    try:
+        _ingest_tech(msgs)
+    except Exception as e:
+        _log(f"[tech] 入库异常（不影响其他管线）: {type(e).__name__}: {e}")
     return n
 
 
@@ -177,6 +184,77 @@ def _ingest_stock(msgs: list) -> int:
                 json.dumps(unmatched[-5:], ensure_ascii=False))
     _log(f"[stock] 本轮 {len(fresh)} 条新消息，识别到 {n} 条（未识别 {len(unmatched)}）")
     return n
+
+
+def _ingest_tech(msgs: list) -> int:
+    """科技股动态管线入库（**独立库、独立水位**）：拆条 → 逐条三层识别 → 三元组入队。
+
+    护栏理念=不丢消息：条目数/标的不设内容上限，识别出的全部入队（status=0）；
+    处理节奏由 tech_process_once 的批次/每日预算控制（超出只积压）。
+    未命中条目存 meta（最近 20 条）供补词；开关关闭时不推进水位（重开自动补上页面内的消息）。
+    """
+    if not tech_settings()["enabled"]:
+        return 0
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+        wm = storage.tech_news_meta_get(conn, "watermark_msg_id", "")
+    watermark = int(wm) if wm.isdigit() else None
+    newest = max(m["msg_id"] for m in msgs)
+    if watermark is None:
+        with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+            storage.tech_news_meta_set(conn, "watermark_msg_id", newest)
+            storage.tech_news_meta_set(conn, "first_run_at", _now_iso())
+        _log(f"[tech] 首轮建立水位 msg_id={newest}（**不回填历史**）")
+        return 0
+    fresh = [m for m in msgs if m["msg_id"] > watermark]
+    if not fresh:
+        return 0
+    n_items = 0
+    n_pairs = 0
+    unmatched: list = []
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+        for m in fresh:
+            try:
+                items = tech_stocks.split_items(m["text"])
+            except Exception as e:
+                _log(f"[tech] 拆条异常（按整条处理）: {type(e).__name__}: {e}")
+                items = [m["text"]]
+            rec_items = []
+            for no, it in enumerate(items, 1):
+                try:
+                    stocks = tech_stocks.identify(it)
+                except Exception as e:
+                    # 单条目识别异常不卡整条管线（边界数据必须防）
+                    _log(f"[tech] 识别异常（跳过该条目）: {type(e).__name__}: {e}")
+                    stocks = []
+                if not stocks:
+                    unmatched.append(it[:120])
+                    continue
+                rec_items.append({"no": no, "text": it, "stocks": stocks})
+            if not rec_items:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO tech_news_raw (msg_id, pub_ts, text, items_json) "
+                "VALUES (?,?,?,?)",
+                (m["msg_id"], m["ts"], m["text"],
+                 json.dumps(rec_items, ensure_ascii=False)))
+            for it in rec_items:
+                for s in it["stocks"]:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO tech_news_ai "
+                        "(msg_id, item_no, stock_code, stock_name, cat, status) "
+                        "VALUES (?,?,?,?,?,0)",
+                        (m["msg_id"], it["no"], s["code"], s["name"], s["cat"]))
+            n_items += len(rec_items)
+            n_pairs += sum(len(it["stocks"]) for it in rec_items)
+        storage.tech_news_meta_set(conn, "watermark_msg_id", newest)
+        storage.tech_news_meta_set(conn, "last_poll_at", _now_iso())
+        if unmatched:
+            storage.tech_news_meta_set(
+                conn, "unmatched_samples",
+                json.dumps(unmatched[-20:], ensure_ascii=False))
+    _log(f"[tech] 本轮 {len(fresh)} 条新消息 → {n_items} 条目 / {n_pairs} 个三元组待生成"
+         f"（未命中 {len(unmatched)} 条目）")
+    return n_pairs
 
 
 # ---------------------------------------------------------------- ② AI 分析
@@ -718,6 +796,205 @@ def stock_trade_once() -> int:
     return opened
 
 
+# ---------------------------------------------------------------- ④ 科技股动态（新闻雷达）
+def tech_settings() -> dict:
+    """科技股动态：每轮读一次设置（设置页开关，热生效）。"""
+    try:
+        with storage.get_conn() as conn:
+            st = storage.trading_settings_get(conn)
+    except Exception:
+        st = {}
+    return {"enabled": bool(st.get("tech_news_enabled", True))}
+
+
+_TECH_SEARCH_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+
+
+def _google_news_search(query: str, limit: int) -> list | None:
+    """Google News RSS 搜索（近 7 天）。两次尝试都失败 → None（调用方走退化路径）。"""
+    url = ("https://news.google.com/rss/search?q="
+           + urllib.parse.quote(f"{query} when:7d")
+           + "&hl=zh-CN&gl=CN&ceid=CN:zh-Hans")
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers=_TECH_SEARCH_UA)
+            with urllib.request.urlopen(req, timeout=config.TECH_NEWS_SEARCH_TIMEOUT) as resp:
+                body = resp.read()
+            root = ET.fromstring(body)
+            return [{"title": (it.findtext("title") or "").strip(),
+                     "source": (it.findtext("source") or "").strip(),
+                     "date": (it.findtext("pubDate") or "").strip(),
+                     "link": (it.findtext("link") or "").strip()}
+                    for it in root.findall("channel/item")[:limit]]
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            _log(f"[tech] 搜索失败（两次尝试后退化）: {type(e).__name__}: {e}")
+    return None
+
+
+def _tech_query(stock_name: str, code: str, item_text: str) -> str:
+    """搜索词：公司名 + 条目核心词；行业/综合码（@开头）用条目本身。"""
+    if code.startswith("@"):
+        return item_text[:50]
+    return f"{stock_name} {item_text[:40]}"
+
+
+def _tech_item_text(msg_id: int, item_no: int) -> str:
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+        row = conn.execute("SELECT items_json FROM tech_news_raw WHERE msg_id=?",
+                           (msg_id,)).fetchone()
+    if not row:
+        return ""
+    try:
+        items = json.loads(row["items_json"])
+    except Exception:
+        return ""
+    for it in items:
+        if int(it.get("no", 0)) == item_no:
+            return str(it.get("text") or "")
+    return ""
+
+
+_TECH_SYS = (
+    "你是科技股新闻图解整理器。根据给定的【金十快讯条目】和【搜索结果】（可能为空），"
+    "输出一张'一图看懂'所需的结构化数据。\n"
+    "硬规则：① 只能使用材料里出现的事实和数字，严禁编造；"
+    "② sources 只能从搜索结果里选（复制其链接），没有搜索结果就输出空数组；"
+    "③ 材料不足时 points 给 1~2 条即可，不要硬凑、不要重复标题。\n"
+    "只输出一行 JSON："
+    '{"headline":"不超过20字的新闻标题","tldr":"不超过50字的一句话",'
+    '"points":["要点1","要点2","要点3"],"numbers":["关键数字，没有就空数组"],'
+    '"impact":{"direction":"偏多|偏空|中性","reason":"不超过30字",'
+    '"beneficiaries":["受益或受影响的公司"]},'
+    '"sources":[{"title":"…","source":"…","url":"…"}]}，不要任何多余文字。'
+)
+
+
+def tech_summarize(item_text: str, stock_name: str, search_results: list) -> dict | None:
+    """金十条目 + 搜索结果 → 图解 JSON。失败返回 None（调用方计重试）。"""
+    if search_results:
+        sr = "\n".join(f"- ({r['source']}, {r['date'][:16]}) {r['title']} | {r['link']}"
+                       for r in search_results)
+    else:
+        sr = "（无搜索结果，只能基于快讯条目本身整理，sources 输出空数组）"
+    raw = _ai_chat(_TECH_SYS,
+                   f"标的：{stock_name}\n快讯条目：{item_text[:1500]}\n搜索结果：\n{sr}")
+    if raw is None:
+        return None
+    s = _strip_fence(raw)
+    obj = None
+    try:
+        obj = json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, re.S)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = None
+    if not isinstance(obj, dict) or not obj.get("headline"):
+        _log(f"[tech] AI 图解无法解析（前 120 字）：{(raw or '')[:120]!r}")
+        return None
+    # 防编造：sources 必须出自我们的搜索结果链接（模型自造的一律剔除）
+    links = {r["link"] for r in search_results}
+    obj["sources"] = [x for x in (obj.get("sources") or [])
+                      if isinstance(x, dict) and x.get("url") in links][:6]
+    # 结构整形：模型偶尔把数组/对象答成字符串等，页面按数组渲染会崩 → 统一强转
+    obj["headline"] = str(obj.get("headline"))
+    obj["tldr"] = str(obj.get("tldr") or "")
+    for k in ("points", "numbers"):
+        v = obj.get(k)
+        obj[k] = [str(x) for x in v] if isinstance(v, list) else []
+    imp = obj.get("impact")
+    imp = imp if isinstance(imp, dict) else {}
+    ben = imp.get("beneficiaries")
+    imp["beneficiaries"] = [str(x) for x in ben] if isinstance(ben, list) else []
+    imp["direction"] = str(imp.get("direction") or "")
+    imp["reason"] = str(imp.get("reason") or "")
+    obj["impact"] = imp
+    return obj
+
+
+_tech_budget_log_at = 0.0      # 预算用尽提醒节流（消费线程 15s 一轮，防日志刷屏）
+
+
+def tech_process_once() -> int:
+    """科技股动态：按节奏消费待处理三元组（搜索 → AI 图解）。返回本轮生成条数。
+
+    节奏控制（护栏只控速、不丢）：每轮 BATCH 条 + 每日预算；超出部分留在
+    status=0 队列里顺延；积压数写进 meta 供页面显示。"""
+    global _tech_budget_log_at
+    if not config.EVENT_AI_API_KEY:
+        with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+            storage.tech_news_meta_set(conn, "ai_state", "未配置 key（生成暂停）")
+        return 0
+    if not tech_settings()["enabled"]:
+        return 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    budget = int(getattr(config, "TECH_NEWS_DAILY_BUDGET", 200))
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+        used_raw = storage.tech_news_meta_get(conn, f"daily_used:{today}", "0")
+        used = int(used_raw) if str(used_raw).isdigit() else 0
+        backlog = conn.execute(
+            "SELECT COUNT(*) FROM tech_news_ai WHERE status=0").fetchone()[0]
+        if used >= budget:
+            storage.tech_news_meta_set(conn, "backlog", backlog)
+            # 预算用尽期间最多每小时提醒一次（本函数 15s 一轮，直打会刷屏）
+            if backlog and time.time() - _tech_budget_log_at > 3600:
+                _tech_budget_log_at = time.time()
+                _log(f"[tech] 今日预算用尽（{used}/{budget}），{backlog} 条积压顺延（不丢）")
+            return 0
+        limit = min(int(getattr(config, "TECH_NEWS_BATCH_PER_ROUND", 5)), budget - used)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM tech_news_ai WHERE status=0 AND attempts < 3 "
+            "ORDER BY msg_id, item_no LIMIT ?", (limit,))]
+    if not rows:
+        return 0
+    done = 0
+    for r in rows:
+        item_text = _tech_item_text(r["msg_id"], r["item_no"])
+        res, degrade, summary = [], 0, None
+        if item_text:
+            got = _google_news_search(
+                _tech_query(r["stock_name"], r["stock_code"], item_text),
+                int(getattr(config, "TECH_NEWS_SEARCH_LIMIT", 6)))
+            if got is None:
+                degrade = 1      # 搜索失败 → 退化为"仅金十原文"整理（功能不断档）
+            else:
+                res = got
+            summary = tech_summarize(item_text, r["stock_name"], res)
+        with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+            if summary is None:
+                conn.execute(
+                    "UPDATE tech_news_ai SET attempts=attempts+1, "
+                    "status=CASE WHEN attempts+1 >= 3 THEN 2 ELSE 0 END, "
+                    "updated_at=CURRENT_TIMESTAMP "
+                    "WHERE msg_id=? AND item_no=? AND stock_code=? AND status=0",
+                    (r["msg_id"], r["item_no"], r["stock_code"]))
+            else:
+                conn.execute(
+                    "UPDATE tech_news_ai SET status=1, attempts=attempts+1, degrade=?, "
+                    "search_json=?, summary_json=?, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE msg_id=? AND item_no=? AND stock_code=? AND status=0",
+                    (degrade, json.dumps(res, ensure_ascii=False),
+                     json.dumps(summary, ensure_ascii=False),
+                     r["msg_id"], r["item_no"], r["stock_code"]))
+                done += 1
+            used += 1
+            storage.tech_news_meta_set(conn, f"daily_used:{today}", used)
+            storage.tech_news_meta_set(conn, "last_gen_at", _now_iso())
+        time.sleep(1.2)          # 搜索礼仪：串行 + 间隔
+    with storage.get_conn(config.TECH_NEWS_DB_PATH) as conn:
+        backlog = conn.execute(
+            "SELECT COUNT(*) FROM tech_news_ai WHERE status=0").fetchone()[0]
+        storage.tech_news_meta_set(conn, "backlog", backlog)
+    _log(f"[tech] 本轮生成 {done}/{len(rows)}（今日 {used}/{budget}），积压 {backlog}")
+    return done
+
+
 # ---------------------------------------------------------------- 主循环
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -749,6 +1026,7 @@ def _scrape_loop():
 def main():
     storage.init_event_db()
     storage.init_stock_event_db()      # 美股/商品独立库（同进程、独立表）
+    storage.init_tech_news_db()        # 科技股动态独立库（同进程、独立表）
     tradable_set()          # 启动先拿一次可交易集合（认英文 ticker 用）
     n = tradable_set()
     _log(f"启动：频道={config.EVENT_CHANNEL} 轮询={config.EVENT_POLL_SECONDS}s "
@@ -756,6 +1034,8 @@ def main():
          f" 可交易币={len(n)}")
     _log(f"[stock] 美股/商品事件已启用（独立库 {config.STOCK_EVENT_DB_PATH}，"
          f"标的=美股个股+商品，不含指数/ETF）")
+    _log(f"[tech] 科技股动态已启用（独立库 {config.TECH_NEWS_DB_PATH}，"
+         f"拆条+三层识别+Google搜索图解；护栏只控节奏不丢消息）")
     if not config.EVENT_AI_API_KEY:
         _log("⚠ EVENT_AI_API_KEY 为空 → 只抓取入库、不做 AI 分析（页面会提示）")
     threading.Thread(target=_scrape_loop, daemon=True).start()
@@ -765,6 +1045,9 @@ def main():
     threading.Thread(target=_loop, args=("股票分析", stock_analyze_once, 5),
                      daemon=True).start()
     threading.Thread(target=_loop, args=("股票交易", stock_trade_once, 10),
+                     daemon=True).start()
+    # 科技股动态管线：独立线程（生成较慢，间隔长些）
+    threading.Thread(target=_loop, args=("科技股生成", tech_process_once, 15),
                      daemon=True).start()
     while True:
         time.sleep(3600)

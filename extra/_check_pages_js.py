@@ -59,6 +59,7 @@ const store = {};
 const listeners = [];
 function el(id) {
   if (!store[id]) store[id] = {innerHTML: '', textContent: '', dataset: {},
+                               style: {},
                                addEventListener() {}, getAttribute() { return null; }};
   return store[id];
 }
@@ -69,13 +70,16 @@ global.fetch = () => Promise.resolve({
   json: () => Promise.resolve(JSON.parse(fs.readFileSync(payloadPath, 'utf8')))});
 global.setInterval = () => 0;
 eval(fs.readFileSync(jsPath, 'utf8'));
-const want = ['acct', 'stats', 'tk-wrap', 'pos-wrap', 'his-wrap', 'log-wrap',
-              'trd-wrap', 'ts-wrap', 'ts-chips',
-              'his-more', 'log-more', 'his-cnt', 'log-cnt'];
+// 容器列表/等待容器可定制（默认=趋势实盘页）；其他页面经 env 透传
+const want = process.env.RENDER_WANT ? JSON.parse(process.env.RENDER_WANT)
+  : ['acct', 'stats', 'tk-wrap', 'pos-wrap', 'his-wrap', 'log-wrap',
+     'trd-wrap', 'ts-wrap', 'ts-chips',
+     'his-more', 'log-more', 'his-cnt', 'log-cnt'];
+const waitId = process.env.RENDER_WAIT || 'acct';
 let tries = 0;
 (function poll() {
   tries += 1;
-  if ((store.acct && store.acct.innerHTML) || tries > 50) {
+  if ((store[waitId] && store[waitId].innerHTML) || tries > 50) {
     const out = {};
     for (const k of want) {
       out[k] = store[k] ? store[k].innerHTML : '';
@@ -195,18 +199,52 @@ ALPHAFOX_PAYLOAD = {
 # 事件四页（加密/美股 × 展览/AI）同样是静态页：JS 里 getElementById 打错字必须拦下
 HARD_PAGES = {"SUPERTREND_LIVE_HTML", "ALPHAFOX_LIVE_HTML",
               "CRYPTO_EVENTS_HTML", "CRYPTO_EVENT_AI_HTML",
-              "STOCK_EVENTS_HTML", "STOCK_EVENT_AI_HTML"}
+              "STOCK_EVENTS_HTML", "STOCK_EVENT_AI_HTML",
+              "TECH_NEWS_HTML"}
 
 
 # 短列表变体（历史/日志都空）→ 验证"不到一页不显示加载更多"
 ALPHAFOX_PAYLOAD_SHORT = {**ALPHAFOX_PAYLOAD, "history": [], "trades": []}
 
 
-def render_smoke(html: str, payload: dict):
-    """跑一遍页面 JS 的渲染管线，返回 {容器id: 渲染出的 HTML}"""
+# 科技股动态页载荷：分类分组 / 偏多+无来源标签 / 待生成灰显 / 失败重试
+TECH_RENDER_PAYLOAD = {
+    "ok": True, "ai_configured": True, "backlog_alert": 500,
+    "cats": ["存储/内存", "芯片设计", "科技综合"],
+    "stats": {"done": 2, "pending": 1, "failed": 1, "raw_msgs": 1},
+    "meta": {"last_poll_at": "2026-10-07T03:00:00Z",
+             "last_gen_at": "2026-10-07T03:05:00Z"},
+    "list": [
+        {"msg_id": 238210, "item_no": 1, "code": "NANYA", "name": "南亚科",
+         "cat": "存储/内存", "ts": "2026-10-07 11:00:00",
+         "headline": "DRAM 合约价大涨 20%", "tldr": "南亚科再度上调报价",
+         "direction": "偏多", "degrade": 0},
+        {"msg_id": 238210, "item_no": 7, "code": "@存储", "name": "存储行业",
+         "cat": "存储/内存", "ts": "2026-10-07 11:09:00",
+         "headline": "存储价格继续上涨", "tldr": "", "direction": "", "degrade": 1},
+    ],
+    "pending": [
+        {"msg_id": 238216, "item_no": 1, "code": "AAPL", "name": "苹果",
+         "cat": "消费电子/终端", "ts": "2026-10-07 12:11:00",
+         "text": "欧盟拟向美国大型科技公司征税…"},
+    ],
+    "failed": [{"msg_id": 238205, "item_no": 1, "stock_code": "NANYA",
+                "stock_name": "南亚科", "cat": "存储/内存"}],
+}
+
+
+def render_smoke(html: str, payload: dict, want: list | None = None,
+                 wait_id: str = "acct"):
+    """跑一遍页面 JS 的渲染管线，返回 {容器id: 渲染出的 HTML}
+
+    want / wait_id 可定制（默认 = 趋势实盘页的容器）；经 env 透传给桩。"""
     js = "\n;\n".join(scripts_of(html))
     if not js:
         return None, "页面没有 <script> 段"
+    env = dict(os.environ)
+    env["RENDER_WAIT"] = wait_id
+    if want:
+        env["RENDER_WANT"] = json.dumps(want)
     paths = []
     try:
         for content, suffix in ((RENDER_HARNESS, ".js"), (js, ".js"),
@@ -217,7 +255,7 @@ def render_smoke(html: str, payload: dict):
                 paths.append(f.name)
         r = subprocess.run(["node", paths[0], paths[1], paths[2]],
                            capture_output=True, text=True, encoding="utf-8",
-                           timeout=60)
+                           timeout=60, env=env)
     except Exception as e:
         return None, f"node 执行失败: {e}"
     finally:
@@ -410,6 +448,41 @@ def main() -> int:
         rc2("⑤⑥ 短列表（0 条）时不显示「加载更多」",
             "加载更多" not in out3["his-more"] and "加载更多" not in out3["log-more"],
             out3["his-more"][:80] + " | " + out3["log-more"][:80])
+
+    # ---- 渲染冒烟：科技股动态页（列表分组 / 生成中 / 失败重试）----
+    print("\n== 科技股动态页渲染冒烟（桩 DOM + 真列表载荷）==")
+    out4, err4 = render_smoke(
+        consts.get("TECH_NEWS_HTML", ""), TECH_RENDER_PAYLOAD,
+        want=["tn-banner", "tn-meta", "tn-body", "tn-failed", "tn-failed-panel"],
+        wait_id="tn-body")
+    if out4 is None:
+        fails.append(("TECH_NEWS_HTML(render)", err4))
+        print(f"[FAIL] 渲染报错: {err4}")
+    else:
+        def rc4(name, cond, extra=""):
+            if cond:
+                print(f"[OK  ] {name}")
+            else:
+                fails.append((name, "渲染产物里没有期望内容"))
+                print(f"[FAIL] {name} {extra}")
+
+        body = out4["tn-body"]
+        rc4("分类分组 + 股票卡（存储/内存 → 南亚科）",
+            "存储/内存" in body and "南亚科" in body and "NANYA" in body, body[:200])
+        rc4("图解标题 + 偏多标签 + 无来源标签（@存储 行业卡）",
+            "DRAM 合约价大涨 20%" in body and "偏多" in body
+            and "无来源" in body and "@存储" in body, body[:400])
+        rc4("待生成条目灰显「生成中」+ 原文前缀 + 未列分类自动补组",
+            "生成中" in body and "欧盟拟向美国大型科技公司征税" in body
+            and "消费电子/终端" in body, body[-400:])
+        rc4("失败区有「重试」按钮（data-code=NANYA）",
+            "重试" in out4["tn-failed"] and 'data-code="NANYA"' in out4["tn-failed"],
+            out4["tn-failed"][:200])
+        rc4("状态条统计正确（已生成 2 条 / 待生成 1）",
+            "已生成 2 条" in out4.get("tn-meta_text", "")
+            and "待生成 1" in out4.get("tn-meta_text", ""),
+            out4.get("tn-meta_text", ""))
+
     print(f"\n页面 JS 检查: {len(consts) - len([f for f in fails if f[0] in consts])}"
           f"/{len(consts)} 语法通过")
     return 1 if fails else 0

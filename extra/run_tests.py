@@ -48,7 +48,9 @@ GROUPS = {
     "market": ["extra/test_market_symbols.py"],
     # 加密事件：币种识别（中英文）/ 金十预览页解析（真样本夹具）/ 事件独立 DB
     # + 美股/商品事件（独立库、同一抓取、另一条管线）
-    "event": ["extra/test_crypto_event.py", "extra/test_stock_event.py"],
+    # + 科技股动态（拆条+三层识别 / 三元组管线，真样本夹具）
+    "event": ["extra/test_crypto_event.py", "extra/test_stock_event.py",
+              "extra/test_tech_stocks.py", "extra/test_tech_news.py"],
     # 全新库/换库/恢复备份的前置检查（init_db 不炸 + managed 列自动创建 + 幂等）
     "storage": ["extra/_check_storage_init.py"],
 }
@@ -71,6 +73,8 @@ MODULE_GROUPS = {
     "event_coins.py": ["event"],
     "event_scrape.py": ["event"],
     "stock_coins.py": ["event"],
+    # 科技股动态识别（三条管线共用抓取，改它跑 event 组）
+    "tech_stocks.py": ["event"],
     # storage 改动跑"全新库 init"检查 + 跟单相关组（用户要求：不要自动升级为全量；
     # 真要大范围回归，部署前单独跑 all）
     "storage.py": ["storage", "alphafox_live", "alphafox_trade", "e2e"],

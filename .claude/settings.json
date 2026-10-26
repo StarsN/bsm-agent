@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(grep:*)",
+      "Bash(git:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(python:*)",
+      "Bash(sqlite3:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(find:*)",
+      "Bash(echo:*)",
+      "Bash(which:*)",
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "PowerShell(Get-ChildItem:*)",
+      "PowerShell(Test-Path:*)",
+      "PowerShell(gc:*)",
+      "PowerShell(diff:*)"
+    ]
+  }
+}
